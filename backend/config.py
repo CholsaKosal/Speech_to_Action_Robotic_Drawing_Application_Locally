@@ -9,6 +9,10 @@ REAL_ROBOT_PORT = 1025          # Your actual robot port
 # Set True to use real robot, False for simulation
 USE_REAL_ROBOT = False
 
+# --- QR Code Upload Settings ---
+QR_UPLOAD_FOLDER = 'qr_uploads' # Relative to the backend directory
+
+
 # --- Robot Predefined Positions ---
 # These are (X, Z, Y) tuples as sent from Python
 # Z is typically the pen height/depth axis for drawing.

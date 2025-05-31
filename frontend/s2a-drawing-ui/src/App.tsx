@@ -1,19 +1,25 @@
 // frontend/s2a-drawing-ui/src/App.tsx
 import { useState, useEffect } from 'react';
 import { io, Socket } from 'socket.io-client';
-import './App.css';
+import './App.css'; // Your existing or new styles
 
-const PYTHON_BACKEND_URL = 'http://localhost:5555'; 
+const PYTHON_BACKEND_URL = 'http://localhost:5555';
 
 let socket: Socket;
 
 function App() {
   const [isConnectedToBackend, setIsConnectedToBackend] = useState(false);
   const [backendMessage, setBackendMessage] = useState('');
-  
+
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [robotStatusMessage, setRobotStatusMessage] = useState('Robot: Not connected');
   const [lastCommandResponse, setLastCommandResponse] = useState('');
+
+  const [qrCodeImage, setQrCodeImage] = useState<string | null>(null);
+  const [qrUploadUrl, setQrUploadUrl] = useState<string>('');
+  const [lastUploadedImageInfo, setLastUploadedImageInfo] = useState<string>('');
+  const [uploadedFilePathFromBackend, setUploadedFilePathFromBackend] = useState<string | null>(null);
+
 
   useEffect(() => {
     console.log('Attempting to connect to WebSocket server...');
@@ -25,85 +31,116 @@ function App() {
       console.log('Connected to Python backend via Socket.IO!');
       setIsConnectedToBackend(true);
       setBackendMessage('Connected to Python Backend!');
-      // Request initial robot status when backend connects
-      // (The backend now sends this on its 'connect' event)
     });
 
     socket.on('disconnect', () => {
       console.log('Disconnected from Python backend.');
       setIsConnectedToBackend(false);
       setBackendMessage('Disconnected from Python Backend.');
-      setIsRobotConnected(false); // Assume robot connection is lost if backend disconnects
+      setIsRobotConnected(false);
       setRobotStatusMessage('Robot: Disconnected (backend offline)');
     });
 
     socket.on('response', (data: { data: string }) => {
-      console.log('Message from server (response):', data);
       setBackendMessage(data.data);
     });
-    
+
     socket.on('robot_connection_status', (data: { success: boolean, message: string }) => {
-      console.log('Robot connection status update:', data);
       setIsRobotConnected(data.success);
       setRobotStatusMessage(`Robot: ${data.message}`);
     });
 
     socket.on('command_response', (data: { success: boolean, message: string, command_sent?: string }) => {
-      console.log('Command response:', data);
       setLastCommandResponse(
-        `Cmd: ${data.command_sent || 'N/A'} -> Response: ${data.message} (Success: ${data.success})`
+        `Cmd: ${data.command_sent || 'N/A'} -> Resp: ${data.message} (Success: ${data.success})`
       );
-      // If a command fails and causes disconnect, robot_connection_status should update
+    });
+
+    socket.on('qr_code_data', (data: { qr_image_base64: string, upload_url: string }) => {
+      console.log('Received QR Code data');
+      setQrCodeImage(`data:image/png;base64,${data.qr_image_base64}`);
+      setQrUploadUrl(data.upload_url);
+      setLastUploadedImageInfo(''); 
+      setUploadedFilePathFromBackend(null);
+    });
+
+    socket.on('qr_image_received', (data: { success: boolean, message: string, filename?: string, filepath?: string}) => {
+      console.log('Image received via QR:', data);
+      if (data.success && data.filepath) {
+        setLastUploadedImageInfo(`Received: ${data.filename || 'image'}. Ready for processing.`);
+        setUploadedFilePathFromBackend(data.filepath); // Store the filepath
+        setQrCodeImage(null); 
+        setQrUploadUrl('');
+      } else {
+        setLastUploadedImageInfo(`Upload Error: ${data.message}`);
+        setUploadedFilePathFromBackend(null);
+      }
     });
 
     return () => {
       if (socket) {
-        console.log('Disconnecting socket...');
         socket.disconnect();
       }
     };
   }, []);
 
-  const handleConnectRobot = () => {
-    if (socket && isConnectedToBackend) {
-      setRobotStatusMessage('Robot: Sending connect request...');
-      socket.emit('robot_connect_request', { data: 'please connect to robot' });
-    }
-  };
+  const handleConnectRobot = () => socket.emit('robot_connect_request', {});
+  const handleDisconnectRobot = () => socket.emit('robot_disconnect_request', {});
+  const sendGoHomeCommand = () => socket.emit('send_robot_command', { type: 'go_home' });
+  const sendSafeCenterCommand = () => socket.emit('send_robot_command', { type: 'move_to_safe_center' });
   
-  const handleDisconnectRobot = () => {
+  const requestQrCode = () => {
     if (socket && isConnectedToBackend) {
-      setRobotStatusMessage('Robot: Sending disconnect request (graceful)...');
-      socket.emit('robot_disconnect_request', { data: 'please disconnect robot gracefully' });
+      setQrCodeImage(null); 
+      setQrUploadUrl('Requesting QR Code...');
+      setLastUploadedImageInfo('');
+      setUploadedFilePathFromBackend(null);
+      socket.emit('request_qr_code', {});
     }
   };
 
-  const sendGoHomeCommand = () => {
-    if (socket && isConnectedToBackend) {
-      setLastCommandResponse('Sending command: Go Home');
-      socket.emit('send_robot_command', { type: 'go_home' });
-    }
-  };
-  
-  const sendSafeCenterCommand = () => {
-    if (socket && isConnectedToBackend) {
-      setLastCommandResponse('Sending command: Move to Safe Center');
-      socket.emit('send_robot_command', { type: 'move_to_safe_center' });
+  // Placeholder for actually drawing the uploaded image
+  const handleProcessAndDrawUploadedImage = () => {
+    if (uploadedFilePathFromBackend) { 
+        console.log("Requesting to draw image: ", uploadedFilePathFromBackend);
+        // Emit an event to the backend to process this specific file path
+        socket.emit('process_image_for_drawing', { filepath: uploadedFilePathFromBackend });
+        setLastCommandResponse(`Sent request to process: ${uploadedFilePathFromBackend.split(/[/\\]/).pop()}`);
+    } else {
+        alert("No image uploaded or ready for processing via QR yet.");
+        setLastCommandResponse("Error: No image path available to process.");
     }
   };
 
   return (
-    <>
+    <div className="App">
       <h1>S2A Robotic Drawing Control</h1>
       <p>Backend Connection: {isConnectedToBackend ? 'Connected' : 'Disconnected'}</p>
       <p>Backend Message: {backendMessage}</p>
+      <hr />
+      
+      <h2>Image Input</h2>
+      <button onClick={requestQrCode} disabled={!isConnectedToBackend}>
+        Upload Image via QR Code
+      </button>
+      {qrUploadUrl && <p><small>Scan to upload. URL (for debugging): {qrUploadUrl}</small></p>}
+      {qrCodeImage && <img src={qrCodeImage} alt="QR Code for Upload" style={{border: "1px solid #ccc", marginTop:"10px"}} />}
+      {lastUploadedImageInfo && <p style={{color: "green"}}>{lastUploadedImageInfo}</p>}
+      
+      {/* Button to trigger drawing of the uploaded image */}
+      {uploadedFilePathFromBackend && (
+        <button onClick={handleProcessAndDrawUploadedImage} style={{marginTop: "10px"}}>
+          Process & Draw Uploaded Image
+        </button>
+      )}
+
       <hr />
       <h2>Robot Control</h2>
       <button onClick={handleConnectRobot} disabled={!isConnectedToBackend || isRobotConnected}>
         Connect to Robot
       </button>
       <button onClick={handleDisconnectRobot} disabled={!isConnectedToBackend || !isRobotConnected}>
-        Disconnect from Robot (Graceful)
+        Disconnect (Graceful)
       </button>
       <br />
       <button onClick={sendGoHomeCommand} disabled={!isConnectedToBackend || !isRobotConnected}>
@@ -113,8 +150,8 @@ function App() {
         Send to Safe Center
       </button>
       <p>{robotStatusMessage}</p>
-      <p>Last Command Response: {lastCommandResponse}</p>
-    </>
+      <p>Last Command: {lastCommandResponse}</p>
+    </div>
   );
 }
 
