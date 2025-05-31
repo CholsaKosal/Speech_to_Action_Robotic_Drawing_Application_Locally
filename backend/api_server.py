@@ -7,17 +7,24 @@ import os
 import uuid
 import qrcode
 from io import BytesIO
-import base64
+import base64 # Make sure base64 is imported
 import socket
 import time # For potential delays between commands
 from image_processing_engine import process_image_to_robot_commands_pipeline
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_very_secret_key_here!'
+# Ensure UPLOAD_FOLDER is correctly joined from the config and this file's directory
+# The config.QR_UPLOAD_FOLDER is relative to the backend directory,
+# and api_server.py is in the backend directory.
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), config.QR_UPLOAD_FOLDER)
 
 if not os.path.exists(app.config['UPLOAD_FOLDER']):
     os.makedirs(app.config['UPLOAD_FOLDER'])
+    print(f"Created upload folder at: {app.config['UPLOAD_FOLDER']}")
+else:
+    print(f"Upload folder already exists at: {app.config['UPLOAD_FOLDER']}")
+
 
 socketio = SocketIO(app, cors_allowed_origins="*")
 robot = RobotInterface() # Single instance of RobotInterface
@@ -93,22 +100,33 @@ def handle_qr_upload_page(session_id):
         file = request.files['image']
         if file.filename == '': return jsonify({"error": "No selected file"}), 400
         if file:
-            _, f_ext = os.path.splitext(file.filename)
+            original_filename = file.filename
+            _, f_ext = os.path.splitext(original_filename)
+            # Sanitize filename for safety, or use UUID without extension if preferred
+            # For now, just ensure it's a valid extension and generate a unique name
+            if f_ext.lower() not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+                 return jsonify({"error": "Invalid file type."}), 400
+
             filename_on_server = str(uuid.uuid4()) + f_ext
             filepath_on_server = os.path.join(app.config['UPLOAD_FOLDER'], filename_on_server)
             try:
                 file.save(filepath_on_server)
                 print(f"Image received via QR and saved: {filepath_on_server}")
-                socketio.emit('qr_image_received', {
+                socketio.emit('qr_image_received', { # This event name is handled by frontend
                     'success': True,
-                    'message': f"Image '{file.filename}' uploaded.",
-                    'original_filename': file.filename,
+                    'message': f"Image '{original_filename}' uploaded via QR.",
+                    'original_filename': original_filename,
                     'filepath_on_server': filepath_on_server
                 })
-                current_upload_session_id = None
-                return jsonify({"message": f"Image '{file.filename}' uploaded successfully!"}), 200
+                current_upload_session_id = None # Invalidate session after successful upload
+                return jsonify({"message": f"Image '{original_filename}' uploaded successfully!"}), 200
             except Exception as e:
                 print(f"Error saving uploaded file: {e}")
+                socketio.emit('qr_image_received', {
+                    'success': False,
+                    'message': f"Error saving '{original_filename}' on server.",
+                    'original_filename': original_filename
+                })
                 return jsonify({"error": "Failed to save file on server."}), 500
     return render_template_string(UPLOAD_PAGE_TEMPLATE)
 
@@ -157,7 +175,7 @@ def handle_send_robot_command(json_data):
     command_str = json_data.get('command_str') # For raw commands
     print(f"Received '{command_type}' command event. Data: {json_data}")
 
-    if not robot.is_connected and command_type not in ['go_home']:
+    if not robot.is_connected and command_type not in ['go_home']: # Allow go_home to attempt connection
         conn_success, conn_message = robot.connect_robot()
         if not conn_success:
             emit('command_response', {'success': False, 'message': f'Robot not connected & connection failed: {conn_message}', 'command_sent': command_type})
@@ -201,12 +219,81 @@ def handle_request_qr_code(data):
             s.settimeout(0.1); s.connect(("8.8.8.8", 80)); host_ip = s.getsockname()[0]; s.close()
         except Exception as e:
             print(f"Could not determine non-loopback IP, using 127.0.0.1. Error: {e}"); host_ip = '127.0.0.1'
-    server_port = app.config.get('SERVER_PORT', 5555)
+    
+    # Get server port from app config if available, otherwise default
+    server_port = app.config.get('SERVER_PORT', 5555) 
+    
     upload_url = f"http://{host_ip}:{server_port}/qr_upload_page/{current_upload_session_id}"
     print(f"Generated QR code URL for session {current_upload_session_id}: {upload_url}")
     qr_img = qrcode.make(upload_url); img_io = BytesIO(); qr_img.save(img_io, 'PNG'); img_io.seek(0)
     img_base64 = base64.b64encode(img_io.getvalue()).decode('utf-8')
     emit('qr_code_data', {'qr_image_base64': img_base64, 'upload_url': upload_url})
+
+@socketio.on('direct_image_upload')
+def handle_direct_image_upload(data):
+    """Handles images uploaded directly from the desktop app (e.g., drag & drop, file select)."""
+    global is_drawing_active
+    if is_drawing_active:
+        emit('direct_image_upload_response', {
+            'success': False,
+            'message': 'Cannot upload image while drawing is active.'
+        })
+        return
+
+    original_filename = data.get('filename')
+    base64_data = data.get('fileData')
+
+    if not original_filename or not base64_data:
+        emit('direct_image_upload_response', {
+            'success': False,
+            'message': 'Missing filename or file data for direct upload.'
+        })
+        return
+
+    print(f"Received direct image upload request for: {original_filename}")
+
+    try:
+        # Decode base64 data
+        image_data = base64.b64decode(base64_data)
+        
+        _, f_ext = os.path.splitext(original_filename)
+        if f_ext.lower() not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+            emit('direct_image_upload_response', {
+                'success': False,
+                'message': f"Invalid file type: {f_ext}",
+                'original_filename': original_filename
+            })
+            return
+
+        filename_on_server = str(uuid.uuid4()) + f_ext
+        filepath_on_server = os.path.join(app.config['UPLOAD_FOLDER'], filename_on_server)
+        
+        with open(filepath_on_server, 'wb') as f:
+            f.write(image_data)
+        
+        print(f"Image '{original_filename}' (saved as {filename_on_server}) received via direct upload and saved to: {filepath_on_server}")
+        emit('direct_image_upload_response', {
+            'success': True,
+            'message': f"Image '{original_filename}' uploaded directly.",
+            'original_filename': original_filename,
+            'filepath_on_server': filepath_on_server
+        })
+
+    except base64.binascii.Error as b64_error:
+        print(f"Base64 decoding error for {original_filename}: {b64_error}")
+        emit('direct_image_upload_response', {
+            'success': False,
+            'message': f"Error decoding image data for '{original_filename}'.",
+            'original_filename': original_filename
+        })
+    except Exception as e:
+        print(f"Error saving directly uploaded file '{original_filename}': {e}")
+        emit('direct_image_upload_response', {
+            'success': False,
+            'message': f"Failed to save '{original_filename}' on server.",
+            'original_filename': original_filename
+        })
+
 
 @socketio.on('process_image_for_drawing')
 def handle_process_image_for_drawing(data):
@@ -226,7 +313,7 @@ def handle_process_image_for_drawing(data):
     emit('drawing_status_update', {'active': True, 'message': f"Processing '{original_filename}'..."})
     is_drawing_active = True
     
-    canny_t1 = data.get('canny_t1', config.DEFAULT_CANNY_THRESHOLD1) # Allow frontend to send thresholds later
+    canny_t1 = data.get('canny_t1', config.DEFAULT_CANNY_THRESHOLD1) 
     canny_t2 = data.get('canny_t2', config.DEFAULT_CANNY_THRESHOLD2)
     
     try:
@@ -239,7 +326,7 @@ def handle_process_image_for_drawing(data):
         if not robot_commands_tuples:
             print(f"No drawing commands generated for {original_filename}.")
             emit('command_response', {'success': False, 'message': f"No drawing commands generated for '{original_filename}'.", 'command_sent': f'process_image: {original_filename}'})
-            is_drawing_active = False
+            is_drawing_active = False # Reset flag
             emit('drawing_status_update', {'active': False, 'message': f"Failed to process '{original_filename}'."})
             return
 
@@ -247,7 +334,6 @@ def handle_process_image_for_drawing(data):
         print(f"Successfully generated {num_cmds} drawing commands for {original_filename}.")
         emit('drawing_status_update', {'active': True, 'message': f"Generated {num_cmds} commands. Preparing to draw '{original_filename}'..."})
         
-        # Ensure robot is connected before drawing
         if not robot.is_connected:
             conn_success, conn_msg = robot.connect_robot()
             if not conn_success:
@@ -257,14 +343,13 @@ def handle_process_image_for_drawing(data):
                 return
             emit('robot_connection_status', {'success': True, 'message': conn_msg})
 
-        # Send commands to robot
         for i, cmd_tuple in enumerate(robot_commands_tuples):
             x_py, z_py, y_py = cmd_tuple
             formatted_cmd_str = robot._format_command(x_py, z_py, y_py)
             
             progress_message = f"Drawing '{original_filename}': Sending command {i+1} of {num_cmds} ({formatted_cmd_str})"
             print(progress_message)
-            emit('drawing_status_update', {'active': True, 'message': progress_message})
+            emit('drawing_status_update', {'active': True, 'message': progress_message, 'progress': (i+1)/num_cmds * 100}) # Optional progress percentage
             
             success, msg = robot.send_command_raw(formatted_cmd_str)
             
@@ -273,13 +358,11 @@ def handle_process_image_for_drawing(data):
                 print(error_message)
                 emit('command_response', {'success': False, 'message': error_message, 'command_sent': formatted_cmd_str})
                 emit('drawing_status_update', {'active': False, 'message': f"Drawing '{original_filename}' aborted due to error."})
-                # Optionally try to send robot home on error
                 robot.go_home() 
                 is_drawing_active = False
-                return # Stop sending further commands
+                return 
             
-            # Small delay between commands if needed, RAPID R/D should handle flow control
-            socketio.sleep(0.05) # Use socketio.sleep for async environments if not using eventlet/gevent with monkey_patch
+            socketio.sleep(0.05) 
 
         print(f"Finished sending all drawing commands for {original_filename}.")
         emit('command_response', {'success': True, 'message': f"Successfully sent all {num_cmds} drawing commands for '{original_filename}'.", 'command_sent': f'draw_image: {original_filename}'})
@@ -291,5 +374,26 @@ def handle_process_image_for_drawing(data):
         emit('command_response', {'success': False, 'message': error_msg_exc, 'command_sent': f'process_image: {original_filename}'})
         emit('drawing_status_update', {'active': False, 'message': f"Error processing/drawing '{original_filename}'."})
     finally:
-        is_drawing_active = False # Ensure flag is reset
+        is_drawing_active = False
+        # Optionally, attempt to move robot to a safe position after drawing or error
+        # if robot.is_connected:
+        #     safe_x, safe_z, safe_y = config.SAFE_ABOVE_CENTER_PY
+        #     robot.move_to_position_py(safe_x, safe_z, safe_y)
+        #     print("Moved robot to safe center after drawing operation.")
 
+
+if __name__ == '__main__':
+    server_port = 5555 
+    app.config['SERVER_PORT'] = server_port 
+
+    print(f"Starting Python backend server (SocketIO with Flask) on port {server_port}...")
+    print(f"Frontend should connect to ws://localhost:{server_port} (or your machine's IP on the network)")
+    print(f"QR code upload page will be accessible via http://<YOUR_LOCAL_IP>:{server_port}/qr_upload_page/<session_id>")
+    
+    # Consider using 'gevent' or 'gevent_websocket' for production with SocketIO if 'eventlet' causes issues.
+    # For development, 'eventlet' or the default Flask dev server (with polling) is often fine.
+    # If using Flask's default dev server (socketio.run(app, host='0.0.0.0', port=server_port, debug=True)), 
+    # ensure WebSocket transport is supported or use long-polling.
+    # Eventlet is generally good for SocketIO.
+    socketio.run(app, host='0.0.0.0', port=server_port, debug=True, use_reloader=False, async_mode='eventlet')
+    # use_reloader=False is often good with eventlet/gevent to avoid issues.
