@@ -6,12 +6,13 @@ import config
 import os
 import uuid
 import qrcode
-from io import BytesIO # To serve QR code image from memory
+from io import BytesIO 
 import base64
-import socket # <<< --- ADDED IMPORT --- >>>
+import socket
+from image_processing_engine import process_image_to_robot_commands_pipeline # <<<--- IMPORT
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your_very_secret_key_here!' # Change this!
+app.config['SECRET_KEY'] = 'your_very_secret_key_here!' 
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), config.QR_UPLOAD_FOLDER)
 
 if not os.path.exists(app.config['UPLOAD_FOLDER']):
@@ -21,9 +22,9 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 robot = RobotInterface()
 
 current_upload_session_id = None
-# latest_uploaded_image_path = None # We'll pass this directly to frontend or handle via new event
+# latest_uploaded_image_path = None # Not storing globally anymore
 
-# HTML template for the phone's upload page (same as before)
+# HTML template for the phone's upload page
 UPLOAD_PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -57,16 +58,10 @@ UPLOAD_PAGE_TEMPLATE = """
             const messageDiv = document.getElementById('message');
             const submitButton = this.querySelector('button[type="submit"]');
             const fileInput = this.querySelector('input[type="file"]');
-
             messageDiv.textContent = 'Uploading...';
-            submitButton.disabled = true;
-            fileInput.disabled = true;
-
+            submitButton.disabled = true; fileInput.disabled = true;
             try {
-                const response = await fetch(window.location.href, {
-                    method: 'POST',
-                    body: formData
-                });
+                const response = await fetch(window.location.href, { method: 'POST', body: formData });
                 const result = await response.json();
                 if (response.ok) {
                     messageDiv.textContent = 'Success: ' + result.message + '. You can close this page.';
@@ -74,14 +69,12 @@ UPLOAD_PAGE_TEMPLATE = """
                 } else {
                     messageDiv.textContent = 'Error: ' + (result.error || 'Upload failed. Please try again.');
                     messageDiv.style.color = 'red';
-                    submitButton.disabled = false;
-                    fileInput.disabled = false;
+                    submitButton.disabled = false; fileInput.disabled = false;
                 }
             } catch (error) {
                 messageDiv.textContent = 'Network Error: ' + error.message + '. Please try again.';
                 messageDiv.style.color = 'red';
-                submitButton.disabled = false;
-                fileInput.disabled = false;
+                submitButton.disabled = false; fileInput.disabled = false;
             }
         });
     </script>
@@ -91,35 +84,32 @@ UPLOAD_PAGE_TEMPLATE = """
 
 @app.route('/qr_upload_page/<session_id>', methods=['GET', 'POST'])
 def handle_qr_upload_page(session_id):
-    global current_upload_session_id #, latest_uploaded_image_path (removed global as we emit path)
+    global current_upload_session_id
     if session_id != current_upload_session_id:
         return "Invalid or expired upload session.", 403
 
     if request.method == 'POST':
-        if 'image' not in request.files:
-            return jsonify({"error": "No image file part"}), 400
+        if 'image' not in request.files: return jsonify({"error": "No image file part"}), 400
         file = request.files['image']
-        if file.filename == '':
-            return jsonify({"error": "No selected file"}), 400
+        if file.filename == '': return jsonify({"error": "No selected file"}), 400
         if file:
             _, f_ext = os.path.splitext(file.filename)
-            filename = str(uuid.uuid4()) + f_ext
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            filename_on_server = str(uuid.uuid4()) + f_ext # Unique name on server
+            filepath_on_server = os.path.join(app.config['UPLOAD_FOLDER'], filename_on_server)
             try:
-                file.save(filepath)
-                print(f"Image received via QR and saved: {filepath}")
+                file.save(filepath_on_server)
+                print(f"Image received via QR and saved: {filepath_on_server}")
                 socketio.emit('qr_image_received', {
                     'success': True, 
                     'message': f"Image '{file.filename}' uploaded.", 
-                    'filename': file.filename, # Send original filename for display
-                    'filepath': filepath # Send the actual server path
+                    'original_filename': file.filename, 
+                    'filepath_on_server': filepath_on_server 
                 })
                 current_upload_session_id = None 
                 return jsonify({"message": f"Image '{file.filename}' uploaded successfully!"}), 200
             except Exception as e:
                 print(f"Error saving uploaded file: {e}")
                 return jsonify({"error": "Failed to save file on server."}), 500
-    
     return render_template_string(UPLOAD_PAGE_TEMPLATE)
 
 @socketio.on('connect')
@@ -135,13 +125,11 @@ def handle_disconnect():
 
 @socketio.on('robot_connect_request')
 def handle_robot_connect_request(json_data):
-    print('Received robot_connect_request:', json_data)
     success, message = robot.connect_robot()
     emit('robot_connection_status', {'success': success, 'message': message})
 
 @socketio.on('robot_disconnect_request')
 def handle_robot_disconnect_request(json_data):
-    print('Received robot_disconnect_request:', json_data)
     success, message = robot.disconnect_robot(graceful=True) 
     emit('robot_connection_status', {'success': robot.is_connected, 'message': message if success else "Failed to disconnect"})
 
@@ -184,62 +172,73 @@ def handle_send_robot_command(json_data):
 def handle_request_qr_code(data):
     global current_upload_session_id
     current_upload_session_id = str(uuid.uuid4())
-    
     host_ip = request.host.split(':')[0] 
     if host_ip == '127.0.0.1' or host_ip == 'localhost':
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0.1) # Prevent indefinite blocking
-            s.connect(("8.8.8.8", 80)) 
-            host_ip = s.getsockname()[0]
-            s.close()
+            s.settimeout(0.1); s.connect(("8.8.8.8", 80)); host_ip = s.getsockname()[0]; s.close()
         except Exception as e:
-            print(f"Could not determine non-loopback IP, using 127.0.0.1. Error: {e}")
-            host_ip = '127.0.0.1' 
-
+            print(f"Could not determine non-loopback IP, using 127.0.0.1. Error: {e}"); host_ip = '127.0.0.1' 
     server_port = app.config.get('SERVER_PORT', 5555)
     upload_url = f"http://{host_ip}:{server_port}/qr_upload_page/{current_upload_session_id}"
     print(f"Generated QR code URL for session {current_upload_session_id}: {upload_url}")
-
-    qr_img = qrcode.make(upload_url)
-    img_io = BytesIO()
-    qr_img.save(img_io, 'PNG')
-    img_io.seek(0)
-    
+    qr_img = qrcode.make(upload_url); img_io = BytesIO(); qr_img.save(img_io, 'PNG'); img_io.seek(0)
     img_base64 = base64.b64encode(img_io.getvalue()).decode('utf-8')
-    
     emit('qr_code_data', {'qr_image_base64': img_base64, 'upload_url': upload_url})
 
-# --- New event handler for processing the image ---
 @socketio.on('process_image_for_drawing')
 def handle_process_image_for_drawing(data):
-    filepath = data.get('filepath')
-    if not filepath or not os.path.exists(filepath):
-        emit('command_response', {'success': False, 'message': f"File not found or path invalid: {filepath}", 'command_sent': 'process_image'})
+    filepath_on_server = data.get('filepath') # This is the path on the server
+    original_filename = data.get('original_filename', os.path.basename(filepath_on_server or "unknown_image"))
+
+    if not filepath_on_server or not os.path.exists(filepath_on_server):
+        emit('command_response', {
+            'success': False, 
+            'message': f"File not found on server or path invalid: {filepath_on_server}", 
+            'command_sent': f'process_image: {original_filename}'
+        })
         return
 
-    print(f"Received request to process image: {filepath}")
-    # Here, you would call your image_processing_engine.py functions
-    # and then potentially the robot_interface.py to send drawing commands.
-    # This is a placeholder for that complex logic.
+    print(f"Received request to process image: {filepath_on_server} (Original: {original_filename})")
     
-    # Example:
-    # from image_processing_engine import process_image_to_robot_commands
-    # robot_commands = process_image_to_robot_commands(filepath, selected_threshold_option) # Need threshold too
-    # if robot_commands:
-    #     for cmd in robot_commands:
-    #         # This needs more robust handling, queueing, progress updates etc.
-    #         # For now, just a conceptual print
-    #         print(f"Would send drawing command: {cmd}") 
-    #         # robot.send_command_raw(robot._format_command(cmd[0], cmd[1], cmd[2])) # Example
-    #         # time.sleep(0.1) # Small delay between drawing commands
-    #     emit('command_response', {'success': True, 'message': f"Image '{os.path.basename(filepath)}' processing started (conceptual).", 'command_sent': 'process_image'})
-    # else:
-    #     emit('command_response', {'success': False, 'message': f"Failed to generate commands for '{os.path.basename(filepath)}'.", 'command_sent': 'process_image'})
+    # Get Canny thresholds (for now, use defaults, later from UI)
+    canny_t1 = config.DEFAULT_CANNY_THRESHOLD1
+    canny_t2 = config.DEFAULT_CANNY_THRESHOLD2
+    
+    try:
+        robot_commands = process_image_to_robot_commands_pipeline(
+            filepath_on_server,
+            canny_thresh1=canny_t1,
+            canny_thresh2=canny_t2
+        )
 
-    emit('command_response', {
-        'success': True, # For now, just acknowledge receipt
-        'message': f"Placeholder: Received request to process '{os.path.basename(filepath)}'. Actual drawing logic not yet implemented.",
-        'command_sent': f'process_image: {os.path.basename(filepath)}'
-    })
+        if robot_commands:
+            num_cmds = len(robot_commands)
+            print(f"Successfully generated {num_cmds} drawing commands for {original_filename}.")
+            # For now, just confirm processing. We'll add sending to robot later.
+            # Store these commands somewhere or prepare to stream them.
+            # For this step, let's just send a success message.
+            emit('command_response', {
+                'success': True, 
+                'message': f"Successfully processed '{original_filename}' into {num_cmds} drawing commands. Ready to draw (not implemented yet).", 
+                'command_sent': f'process_image: {original_filename}',
+                'num_drawing_commands': num_cmds 
+                # 'drawing_commands': robot_commands # Optionally send all commands if small, or stream later
+            })
+            # TODO: Add logic here to actually start sending these commands to the robot
+            # e.g., start_drawing_sequence(robot_commands)
+        else:
+            print(f"Failed to generate drawing commands for {original_filename}.")
+            emit('command_response', {
+                'success': False, 
+                'message': f"Failed to generate drawing commands for '{original_filename}'. No contours or error.", 
+                'command_sent': f'process_image: {original_filename}'
+            })
+    except Exception as e:
+        print(f"Error during image processing pipeline for {original_filename}: {e}")
+        emit('command_response', {
+            'success': False, 
+            'message': f"Error processing '{original_filename}': {e}", 
+            'command_sent': f'process_image: {original_filename}'
+        })
 
