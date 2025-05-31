@@ -47,8 +47,9 @@ dmypy.json
 *.spec
 
 # User-specific uploads and models (uncomment if you decide not to track them)
-# backend/qr_uploads/
-# backend/models/
+backend/qr_uploads/
+backend/models/
+backend/audio_tmp/ # Ignore temporary audio files
 
 # Log files
 *.log

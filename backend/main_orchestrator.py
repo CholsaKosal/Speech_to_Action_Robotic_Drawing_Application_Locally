@@ -17,10 +17,10 @@ if __name__ == '__main__':
     # For simplicity in this print, we'll just remind the user it's their local IP.
     print(f"QR code upload page will be accessible via http://<YOUR_LOCAL_IP>:{server_port}/qr_upload_page/<session_id>")
 
-    # The key fix: add use_reloader=False when debug=True and async_mode='eventlet'
+    # The async_mode='eventlet' should be set during SocketIO instantiation in api_server.py
+    # The use_reloader=False is important when debug=True with eventlet.
     socketio.run(app, 
                  host='0.0.0.0', 
                  port=server_port, 
                  debug=True, 
-                 use_reloader=False,  # Add this line
-                 async_mode='eventlet')
+                 use_reloader=False) # Removed async_mode='eventlet' from here
