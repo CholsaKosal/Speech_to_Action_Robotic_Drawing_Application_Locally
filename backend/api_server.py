@@ -6,25 +6,26 @@ import config
 import os
 import uuid
 import qrcode
-from io import BytesIO 
+from io import BytesIO
 import base64
 import socket
-from image_processing_engine import process_image_to_robot_commands_pipeline # <<<--- IMPORT
+import time # For potential delays between commands
+from image_processing_engine import process_image_to_robot_commands_pipeline
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your_very_secret_key_here!' 
+app.config['SECRET_KEY'] = 'your_very_secret_key_here!'
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), config.QR_UPLOAD_FOLDER)
 
 if not os.path.exists(app.config['UPLOAD_FOLDER']):
     os.makedirs(app.config['UPLOAD_FOLDER'])
 
 socketio = SocketIO(app, cors_allowed_origins="*")
-robot = RobotInterface()
+robot = RobotInterface() # Single instance of RobotInterface
 
 current_upload_session_id = None
-# latest_uploaded_image_path = None # Not storing globally anymore
+is_drawing_active = False # Global flag to prevent concurrent drawing tasks
 
-# HTML template for the phone's upload page
+# HTML template for the phone's upload page (remains the same)
 UPLOAD_PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -87,56 +88,73 @@ def handle_qr_upload_page(session_id):
     global current_upload_session_id
     if session_id != current_upload_session_id:
         return "Invalid or expired upload session.", 403
-
     if request.method == 'POST':
         if 'image' not in request.files: return jsonify({"error": "No image file part"}), 400
         file = request.files['image']
         if file.filename == '': return jsonify({"error": "No selected file"}), 400
         if file:
             _, f_ext = os.path.splitext(file.filename)
-            filename_on_server = str(uuid.uuid4()) + f_ext # Unique name on server
+            filename_on_server = str(uuid.uuid4()) + f_ext
             filepath_on_server = os.path.join(app.config['UPLOAD_FOLDER'], filename_on_server)
             try:
                 file.save(filepath_on_server)
                 print(f"Image received via QR and saved: {filepath_on_server}")
                 socketio.emit('qr_image_received', {
-                    'success': True, 
-                    'message': f"Image '{file.filename}' uploaded.", 
-                    'original_filename': file.filename, 
-                    'filepath_on_server': filepath_on_server 
+                    'success': True,
+                    'message': f"Image '{file.filename}' uploaded.",
+                    'original_filename': file.filename,
+                    'filepath_on_server': filepath_on_server
                 })
-                current_upload_session_id = None 
+                current_upload_session_id = None
                 return jsonify({"message": f"Image '{file.filename}' uploaded successfully!"}), 200
             except Exception as e:
                 print(f"Error saving uploaded file: {e}")
                 return jsonify({"error": "Failed to save file on server."}), 500
     return render_template_string(UPLOAD_PAGE_TEMPLATE)
 
+# --- SocketIO Event Handlers ---
 @socketio.on('connect')
 def handle_connect():
-    print('Client connected')
+    print('Client connected to backend SocketIO')
     emit('response', {'data': 'Connected to Python backend!'})
-    emit('robot_connection_status', {'success': robot.is_connected, 
+    emit('robot_connection_status', {'success': robot.is_connected,
                                      'message': 'Connected to robot' if robot.is_connected else 'Not connected to robot'})
+    emit('drawing_status_update', {'active': is_drawing_active, 'message': 'Drawing in progress' if is_drawing_active else 'Idle'})
+
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    print('Client disconnected from backend')
+    print('Client disconnected from backend SocketIO')
 
 @socketio.on('robot_connect_request')
 def handle_robot_connect_request(json_data):
+    global is_drawing_active
+    if is_drawing_active:
+        emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'})
+        return
+    print('Received robot_connect_request:', json_data)
     success, message = robot.connect_robot()
     emit('robot_connection_status', {'success': success, 'message': message})
 
 @socketio.on('robot_disconnect_request')
 def handle_robot_disconnect_request(json_data):
-    success, message = robot.disconnect_robot(graceful=True) 
+    global is_drawing_active
+    if is_drawing_active:
+        emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'})
+        return
+    print('Received robot_disconnect_request:', json_data)
+    success, message = robot.disconnect_robot(graceful=True)
     emit('robot_connection_status', {'success': robot.is_connected, 'message': message if success else "Failed to disconnect"})
 
-@socketio.on('send_robot_command')
+@socketio.on('send_robot_command') # Generic commands like go_home, move_to_safe_center
 def handle_send_robot_command(json_data):
-    command_str = json_data.get('command_str') 
-    command_type = json_data.get('type', 'raw') 
+    global is_drawing_active
+    if is_drawing_active:
+        emit('command_response', {'success': False, 'message': 'Cannot send manual commands while drawing is active.', 'command_sent': json_data.get('type', 'N/A')})
+        return
+
+    command_type = json_data.get('type', 'raw')
+    command_str = json_data.get('command_str') # For raw commands
     print(f"Received '{command_type}' command event. Data: {json_data}")
 
     if not robot.is_connected and command_type not in ['go_home']:
@@ -165,20 +183,24 @@ def handle_send_robot_command(json_data):
         actual_command_sent = "N/A"
         
     emit('command_response', {'success': success, 'message': message, 'command_sent': actual_command_sent})
-    if not robot.is_connected:
+    if not robot.is_connected: # If command caused disconnect
          emit('robot_connection_status', {'success': False, 'message': 'Disconnected (possibly due to command error/timeout)'})
 
 @socketio.on('request_qr_code')
 def handle_request_qr_code(data):
-    global current_upload_session_id
+    global current_upload_session_id, is_drawing_active
+    if is_drawing_active:
+        emit('qr_code_data', {'error': 'Drawing is currently active. Cannot generate new QR code.'})
+        return
+
     current_upload_session_id = str(uuid.uuid4())
-    host_ip = request.host.split(':')[0] 
+    host_ip = request.host.split(':')[0]
     if host_ip == '127.0.0.1' or host_ip == 'localhost':
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0.1); s.connect(("8.8.8.8", 80)); host_ip = s.getsockname()[0]; s.close()
         except Exception as e:
-            print(f"Could not determine non-loopback IP, using 127.0.0.1. Error: {e}"); host_ip = '127.0.0.1' 
+            print(f"Could not determine non-loopback IP, using 127.0.0.1. Error: {e}"); host_ip = '127.0.0.1'
     server_port = app.config.get('SERVER_PORT', 5555)
     upload_url = f"http://{host_ip}:{server_port}/qr_upload_page/{current_upload_session_id}"
     print(f"Generated QR code URL for session {current_upload_session_id}: {upload_url}")
@@ -188,57 +210,86 @@ def handle_request_qr_code(data):
 
 @socketio.on('process_image_for_drawing')
 def handle_process_image_for_drawing(data):
-    filepath_on_server = data.get('filepath') # This is the path on the server
+    global is_drawing_active
+    if is_drawing_active:
+        emit('command_response', {'success': False, 'message': "Another drawing is already in progress.", 'command_sent': 'process_image'})
+        return
+
+    filepath_on_server = data.get('filepath')
     original_filename = data.get('original_filename', os.path.basename(filepath_on_server or "unknown_image"))
 
     if not filepath_on_server or not os.path.exists(filepath_on_server):
-        emit('command_response', {
-            'success': False, 
-            'message': f"File not found on server or path invalid: {filepath_on_server}", 
-            'command_sent': f'process_image: {original_filename}'
-        })
+        emit('command_response', {'success': False, 'message': f"File not found or path invalid: {filepath_on_server}", 'command_sent': f'process_image: {original_filename}'})
         return
 
     print(f"Received request to process image: {filepath_on_server} (Original: {original_filename})")
+    emit('drawing_status_update', {'active': True, 'message': f"Processing '{original_filename}'..."})
+    is_drawing_active = True
     
-    # Get Canny thresholds (for now, use defaults, later from UI)
-    canny_t1 = config.DEFAULT_CANNY_THRESHOLD1
-    canny_t2 = config.DEFAULT_CANNY_THRESHOLD2
+    canny_t1 = data.get('canny_t1', config.DEFAULT_CANNY_THRESHOLD1) # Allow frontend to send thresholds later
+    canny_t2 = data.get('canny_t2', config.DEFAULT_CANNY_THRESHOLD2)
     
     try:
-        robot_commands = process_image_to_robot_commands_pipeline(
+        robot_commands_tuples = process_image_to_robot_commands_pipeline(
             filepath_on_server,
             canny_thresh1=canny_t1,
             canny_thresh2=canny_t2
         )
 
-        if robot_commands:
-            num_cmds = len(robot_commands)
-            print(f"Successfully generated {num_cmds} drawing commands for {original_filename}.")
-            # For now, just confirm processing. We'll add sending to robot later.
-            # Store these commands somewhere or prepare to stream them.
-            # For this step, let's just send a success message.
-            emit('command_response', {
-                'success': True, 
-                'message': f"Successfully processed '{original_filename}' into {num_cmds} drawing commands. Ready to draw (not implemented yet).", 
-                'command_sent': f'process_image: {original_filename}',
-                'num_drawing_commands': num_cmds 
-                # 'drawing_commands': robot_commands # Optionally send all commands if small, or stream later
-            })
-            # TODO: Add logic here to actually start sending these commands to the robot
-            # e.g., start_drawing_sequence(robot_commands)
-        else:
-            print(f"Failed to generate drawing commands for {original_filename}.")
-            emit('command_response', {
-                'success': False, 
-                'message': f"Failed to generate drawing commands for '{original_filename}'. No contours or error.", 
-                'command_sent': f'process_image: {original_filename}'
-            })
+        if not robot_commands_tuples:
+            print(f"No drawing commands generated for {original_filename}.")
+            emit('command_response', {'success': False, 'message': f"No drawing commands generated for '{original_filename}'.", 'command_sent': f'process_image: {original_filename}'})
+            is_drawing_active = False
+            emit('drawing_status_update', {'active': False, 'message': f"Failed to process '{original_filename}'."})
+            return
+
+        num_cmds = len(robot_commands_tuples)
+        print(f"Successfully generated {num_cmds} drawing commands for {original_filename}.")
+        emit('drawing_status_update', {'active': True, 'message': f"Generated {num_cmds} commands. Preparing to draw '{original_filename}'..."})
+        
+        # Ensure robot is connected before drawing
+        if not robot.is_connected:
+            conn_success, conn_msg = robot.connect_robot()
+            if not conn_success:
+                emit('command_response', {'success': False, 'message': f"Cannot start drawing. Robot connection failed: {conn_msg}", 'command_sent': f'draw_image: {original_filename}'})
+                is_drawing_active = False
+                emit('drawing_status_update', {'active': False, 'message': f"Drawing '{original_filename}' failed (robot connection)."})
+                return
+            emit('robot_connection_status', {'success': True, 'message': conn_msg})
+
+        # Send commands to robot
+        for i, cmd_tuple in enumerate(robot_commands_tuples):
+            x_py, z_py, y_py = cmd_tuple
+            formatted_cmd_str = robot._format_command(x_py, z_py, y_py)
+            
+            progress_message = f"Drawing '{original_filename}': Sending command {i+1} of {num_cmds} ({formatted_cmd_str})"
+            print(progress_message)
+            emit('drawing_status_update', {'active': True, 'message': progress_message})
+            
+            success, msg = robot.send_command_raw(formatted_cmd_str)
+            
+            if not success:
+                error_message = f"Error sending command {i+1} ({formatted_cmd_str}): {msg}. Drawing aborted."
+                print(error_message)
+                emit('command_response', {'success': False, 'message': error_message, 'command_sent': formatted_cmd_str})
+                emit('drawing_status_update', {'active': False, 'message': f"Drawing '{original_filename}' aborted due to error."})
+                # Optionally try to send robot home on error
+                robot.go_home() 
+                is_drawing_active = False
+                return # Stop sending further commands
+            
+            # Small delay between commands if needed, RAPID R/D should handle flow control
+            socketio.sleep(0.05) # Use socketio.sleep for async environments if not using eventlet/gevent with monkey_patch
+
+        print(f"Finished sending all drawing commands for {original_filename}.")
+        emit('command_response', {'success': True, 'message': f"Successfully sent all {num_cmds} drawing commands for '{original_filename}'.", 'command_sent': f'draw_image: {original_filename}'})
+        emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete."})
+
     except Exception as e:
-        print(f"Error during image processing pipeline for {original_filename}: {e}")
-        emit('command_response', {
-            'success': False, 
-            'message': f"Error processing '{original_filename}': {e}", 
-            'command_sent': f'process_image: {original_filename}'
-        })
+        error_msg_exc = f"Error during image processing/drawing pipeline for {original_filename}: {e}"
+        print(error_msg_exc)
+        emit('command_response', {'success': False, 'message': error_msg_exc, 'command_sent': f'process_image: {original_filename}'})
+        emit('drawing_status_update', {'active': False, 'message': f"Error processing/drawing '{original_filename}'."})
+    finally:
+        is_drawing_active = False # Ensure flag is reset
 
