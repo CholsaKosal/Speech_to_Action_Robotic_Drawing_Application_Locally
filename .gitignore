@@ -1,49 +1,107 @@
-# Byte-compiled / optimized / DLL files 
-__pycache__/ 
-*.py[cod] 
-*$py.class 
- 
-# C extensions 
-*.so 
- 
-# Distribution / packaging 
-.Python 
-build/ 
-develop-eggs/ 
-dist/ 
-downloads/ 
-eggs/ 
-.eggs/ 
-lib/ 
-lib6022/ 
-parts/ 
-sdist/ 
-var/ 
-wheels/ 
-*.egg-info/ 
-.installed.cfg 
-*.egg 
-MANIFEST 
- 
-# Python Virtual Environment 
-backend/venv/ 
- 
-# Project specific uploads/models (optional - decide if you want to track these) 
-# backend/qr_uploads/ 
-# backend/models/ 
- 
-# Node.js / Electron / Tauri 
-frontend/node_modules/ 
-frontend/dist/ 
-frontend/out/ 
-frontend/.DS_Store 
-frontend/npm-debug.log* 
-frontend/yarn-debug.log* 
-frontend/yarn-error.log* 
-frontend/.vite/ 
-frontend/.electron/ 
-frontend/src-tauri/target/ 
- 
-# IDE / Editor specific 
-.vscode/ 
-.idea/ 
+# Python
+################################################################################
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib6022/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Python Virtual Environment
+backend/venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Mypy cache
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# PyInstaller
+# Usually these files are written by a CI, but they pollute the project root if not
+*.manifest
+*.spec
+
+# User-specific uploads and models (uncomment if you decide not to track them)
+# backend/qr_uploads/
+# backend/models/
+
+# Log files
+*.log
+logs/
+
+# Frontend (Electron/Vite project located at frontend/s2a-drawing-ui/)
+################################################################################
+frontend/s2a-drawing-ui/node_modules/
+frontend/s2a-drawing-ui/dist/
+frontend/s2a-drawing-ui/dist-electron/ # Electron-vite specific build output for main/preload
+frontend/s2a-drawing-ui/out/           # Often used by electron-builder
+frontend/s2a-drawing-ui/release/       # Often used by electron-builder for packaged app
+frontend/s2a-drawing-ui/.vite/
+frontend/s2a-drawing-ui/.electron/
+frontend/s2a-drawing-ui/coverage/
+frontend/s2a-drawing-ui/npm-debug.log*
+frontend/s2a-drawing-ui/yarn-debug.log*
+frontend/s2a-drawing-ui/yarn-error.log*
+frontend/s2a-drawing-ui/pnpm-debug.log*
+frontend/s2a-drawing-ui/lerna-debug.log*
+frontend/s2a-drawing-ui/*.local
+
+# If you decide to use Tauri in the future for the frontend
+# frontend/s2a-drawing-ui/src-tauri/target/
+# frontend/s2a-drawing-ui/src-tauri/Cargo.lock
+
+# IDE / Editor specific
+################################################################################
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS specific
+################################################################################
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary script files (if any, from your generate_code_base.sh)
+# temp_all_contents.txt
+# filter_rules.sed
+# code_base.txt # Usually you don't commit the output of this script
+
+# Firebase (if you were to use it later)
+# .firebase/
+# firebase-debug.log
+# firebase.json # Only if it doesn't contain sensitive project IDs you want public
+# .firebaserc   # Only if it doesn't contain sensitive project IDs you want public
