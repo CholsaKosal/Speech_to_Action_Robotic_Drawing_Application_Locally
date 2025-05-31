@@ -1,12 +1,12 @@
 # backend/main_orchestrator.py
-from api_server import app, socketio
+from api_server import app, socketio # app is the Flask app instance
 
 if __name__ == '__main__':
-    print("Starting Python backend server (SocketIO with Flask)...")
-    print("Frontend should connect to ws://localhost:5555 (or your machine's IP on the network)")
-    # Use eventlet or gevent for production with Flask-SocketIO
-    # For development, Werkzeug development server can be used but might need allow_unsafe_werkzeug=True
-    # Or, more simply for development without extra dependencies if eventlet/gevent are tricky:
-    socketio.run(app, host='0.0.0.0', port=5555, debug=True, use_reloader=False, allow_unsafe_werkzeug=True)
-    # Ensure eventlet is installed if you want to use it: pip install eventlet
-    # socketio.run(app, host='0.0.0.0', port=5555, debug=True) # This will try to use eventlet or gevent if installed
+    server_port = 5555 # Define the port
+    app.config['SERVER_PORT'] = server_port # Make it available for URL generation in api_server
+
+    print(f"Starting Python backend server (SocketIO with Flask) on port {server_port}...")
+    print(f"Frontend should connect to ws://localhost:{server_port} (or your machine's IP on the network)")
+    print(f"QR code upload page will be accessible via http://<YOUR_LOCAL_IP>:{server_port}/qr_upload_page/<session_id>")
+
+    socketio.run(app, host='0.0.0.0', port=server_port, debug=True, use_reloader=False, allow_unsafe_werkzeug=True)

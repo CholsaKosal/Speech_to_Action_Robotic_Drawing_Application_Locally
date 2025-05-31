@@ -170,6 +170,28 @@ The frontend is located in `frontend/s2a-drawing-ui/`.
 
 ## 3\. Run and Test Application (Steps and Scripts)
 
+### 3.0. Network Configuration for QR Code Image Upload (Current Method)
+Important: For the QR code image upload feature (from phone to PC) to work with the current setup, your PC and your phone must be on the same local network, and that network must allow direct device-to-device communication. Guest networks or networks with "Client Isolation" / "AP Isolation" enabled will likely not work.
+
+Using a Mobile Hotspot (Recommended & Tested):
+
+Enable the mobile hotspot feature on your phone.
+
+Connect your development PC to this mobile hotspot Wi-Fi network.
+
+When the Python backend server starts, it will attempt to generate a QR code URL using the PC's IP address on this hotspot network (e.g., 192.168.43.x).
+
+Scanning the QR code with the phone (which is the hotspot provider) will then allow it to connect to the PC.
+
+Using a Private Wi-Fi Network:
+
+If using a home/private Wi-Fi router, ensure both devices are connected to it.
+
+Crucially, ensure that "AP Isolation," "Client Isolation," or similar features (which prevent connected devices from communicating with each other) are disabled on your router.
+
+This direct local network approach is for the current development phase. Future updates might explore other methods for image uploads.
+
+
 ### 3.1. Running the Python Backend
 
 1.  Ensure your Python virtual environment is activated in the `backend` directory:
