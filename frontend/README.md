@@ -1,1 +1,1 @@
-# JavaScript/TypeScript frontend 
+# JavaScript/TypeScript frontend React framework
