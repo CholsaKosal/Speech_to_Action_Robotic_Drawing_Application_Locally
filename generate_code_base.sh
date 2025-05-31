@@ -28,7 +28,7 @@ EXCLUDE_PATTERNS=(
     "$TEMP_ALL_CONTENTS"     # Temporary file for all content
     "$SED_SCRIPT_FILE"       # Temporary sed script
     "$SCRIPT_FILENAME"       # The script itself
-    "$EXCLUDE_CONFIG_FILE"   # The exclusion config file itself
+    # "$EXCLUDE_CONFIG_FILE"   # The exclusion config file itself
 )
 
 # Read additional patterns from the user's config file, if it exists
