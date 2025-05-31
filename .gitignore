@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files 
+__pycache__/ 
+*.py[cod] 
+*$py.class 
+ 
+# C extensions 
+*.so 
+ 
+# Distribution / packaging 
+.Python 
+build/ 
+develop-eggs/ 
+dist/ 
+downloads/ 
+eggs/ 
+.eggs/ 
+lib/ 
+lib6022/ 
+parts/ 
+sdist/ 
+var/ 
+wheels/ 
+*.egg-info/ 
+.installed.cfg 
+*.egg 
+MANIFEST 
+ 
+# Python Virtual Environment 
+backend/venv/ 
+ 
+# Project specific uploads/models (optional - decide if you want to track these) 
+# backend/qr_uploads/ 
+# backend/models/ 
+ 
+# Node.js / Electron / Tauri 
+frontend/node_modules/ 
+frontend/dist/ 
+frontend/out/ 
+frontend/.DS_Store 
+frontend/npm-debug.log* 
+frontend/yarn-debug.log* 
+frontend/yarn-error.log* 
+frontend/.vite/ 
+frontend/.electron/ 
+frontend/src-tauri/target/ 
+ 
+# IDE / Editor specific 
+.vscode/ 
+.idea/ 
