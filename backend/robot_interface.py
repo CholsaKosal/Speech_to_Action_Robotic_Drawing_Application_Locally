@@ -46,11 +46,9 @@ class RobotInterface:
                     print(f"Warning: Failed to go home before disconnecting: {home_msg}")
                 else:
                     print("Successfully moved to home position.")
-                
-                # <<< --- ADDED DELAY --- >>>
-                print("Waiting for 3 seconds before closing socket...")
-                time.sleep(3)
-                # <<< --- END ADDED DELAY --- >>>
+                    print("Waiting for 3 seconds before closing socket...")
+                    time.sleep(3)
+
             else: # This case means go_home was called when not connected AND it failed to connect.
                 print(f"Cannot complete graceful disconnect (go home) as robot is not connected: {home_msg}")
 

@@ -3,8 +3,8 @@
 # --- Robot Connection Settings ---
 SIMULATION_HOST = '127.0.0.1'
 SIMULATION_PORT = 55000
-# REAL_ROBOT_HOST = '192.168.125.1' # Your actual robot IP
-# REAL_ROBOT_PORT = 1025          # Your actual robot port
+REAL_ROBOT_HOST = '192.168.125.1' # Your actual robot IP
+REAL_ROBOT_PORT = 1025          # Your actual robot port
 
 # Set True to use real robot, False for simulation
 USE_REAL_ROBOT = False
