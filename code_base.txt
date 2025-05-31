@@ -6,6 +6,7 @@
 │   ├── config.py
 │   ├── image_processing_engine.py
 │   ├── main_orchestrator.py
+│   ├── rapid_code_for_controlling_the_robot_movement.txt
 │   ├── requirements.txt
 │   ├── robot_interface.py
 │   └── voice_assistant.py
@@ -14,6 +15,9 @@
     ├── README.md
     └── s2a-drawing-ui
         ├── README.md
+        ├── dist-electron
+        │   ├── main.js
+        │   └── preload.mjs
         ├── electron
         │   ├── electron-env.d.ts
         │   ├── main.ts
@@ -37,7 +41,7 @@
         ├── tsconfig.node.json
         └── vite.config.ts
 
-8 directories, 30 files
+9 directories, 33 files
 
 
 =======================================
@@ -155,21 +159,677 @@ Desktop.ini
 
 --- END OF FILE: .gitignore ---
 --- START OF FILE: backend/api_server.py ---
-# API and WebSocket server 
+# backend/api_server.py
+from flask import Flask, request, render_template_string, jsonify, send_file
+from flask_socketio import SocketIO, emit
+from robot_interface import RobotInterface
+import config
+import os
+import uuid
+import qrcode
+from io import BytesIO 
+import base64
+import socket
+from image_processing_engine import process_image_to_robot_commands_pipeline # <<<--- IMPORT
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your_very_secret_key_here!' 
+app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), config.QR_UPLOAD_FOLDER)
+
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
+
+socketio = SocketIO(app, cors_allowed_origins="*")
+robot = RobotInterface()
+
+current_upload_session_id = None
+# latest_uploaded_image_path = None # Not storing globally anymore
+
+# HTML template for the phone's upload page
+UPLOAD_PAGE_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Image</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #f0f0f0; }
+        .container { background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); text-align: center; }
+        input[type="file"] { margin-bottom: 15px; display: block; margin-left: auto; margin-right: auto; }
+        button { padding: 10px 15px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 1em; }
+        button:hover { background-color: #0056b3; }
+        #message { margin-top: 15px; font-weight: bold; }
+        h2 { margin-top: 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Select Image to Upload</h2>
+        <form id="uploadForm" method="post" enctype="multipart/form-data">
+            <input type="file" name="image" id="imageFile" accept="image/*" required>
+            <button type="submit">Upload</button>
+        </form>
+        <div id="message"></div>
+    </div>
+    <script>
+        document.getElementById('uploadForm').addEventListener('submit', async function(event) {
+            event.preventDefault();
+            const formData = new FormData(this);
+            const messageDiv = document.getElementById('message');
+            const submitButton = this.querySelector('button[type="submit"]');
+            const fileInput = this.querySelector('input[type="file"]');
+            messageDiv.textContent = 'Uploading...';
+            submitButton.disabled = true; fileInput.disabled = true;
+            try {
+                const response = await fetch(window.location.href, { method: 'POST', body: formData });
+                const result = await response.json();
+                if (response.ok) {
+                    messageDiv.textContent = 'Success: ' + result.message + '. You can close this page.';
+                    messageDiv.style.color = 'green';
+                } else {
+                    messageDiv.textContent = 'Error: ' + (result.error || 'Upload failed. Please try again.');
+                    messageDiv.style.color = 'red';
+                    submitButton.disabled = false; fileInput.disabled = false;
+                }
+            } catch (error) {
+                messageDiv.textContent = 'Network Error: ' + error.message + '. Please try again.';
+                messageDiv.style.color = 'red';
+                submitButton.disabled = false; fileInput.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/qr_upload_page/<session_id>', methods=['GET', 'POST'])
+def handle_qr_upload_page(session_id):
+    global current_upload_session_id
+    if session_id != current_upload_session_id:
+        return "Invalid or expired upload session.", 403
+
+    if request.method == 'POST':
+        if 'image' not in request.files: return jsonify({"error": "No image file part"}), 400
+        file = request.files['image']
+        if file.filename == '': return jsonify({"error": "No selected file"}), 400
+        if file:
+            _, f_ext = os.path.splitext(file.filename)
+            filename_on_server = str(uuid.uuid4()) + f_ext # Unique name on server
+            filepath_on_server = os.path.join(app.config['UPLOAD_FOLDER'], filename_on_server)
+            try:
+                file.save(filepath_on_server)
+                print(f"Image received via QR and saved: {filepath_on_server}")
+                socketio.emit('qr_image_received', {
+                    'success': True, 
+                    'message': f"Image '{file.filename}' uploaded.", 
+                    'original_filename': file.filename, 
+                    'filepath_on_server': filepath_on_server 
+                })
+                current_upload_session_id = None 
+                return jsonify({"message": f"Image '{file.filename}' uploaded successfully!"}), 200
+            except Exception as e:
+                print(f"Error saving uploaded file: {e}")
+                return jsonify({"error": "Failed to save file on server."}), 500
+    return render_template_string(UPLOAD_PAGE_TEMPLATE)
+
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+    emit('response', {'data': 'Connected to Python backend!'})
+    emit('robot_connection_status', {'success': robot.is_connected, 
+                                     'message': 'Connected to robot' if robot.is_connected else 'Not connected to robot'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected from backend')
+
+@socketio.on('robot_connect_request')
+def handle_robot_connect_request(json_data):
+    success, message = robot.connect_robot()
+    emit('robot_connection_status', {'success': success, 'message': message})
+
+@socketio.on('robot_disconnect_request')
+def handle_robot_disconnect_request(json_data):
+    success, message = robot.disconnect_robot(graceful=True) 
+    emit('robot_connection_status', {'success': robot.is_connected, 'message': message if success else "Failed to disconnect"})
+
+@socketio.on('send_robot_command')
+def handle_send_robot_command(json_data):
+    command_str = json_data.get('command_str') 
+    command_type = json_data.get('type', 'raw') 
+    print(f"Received '{command_type}' command event. Data: {json_data}")
+
+    if not robot.is_connected and command_type not in ['go_home']:
+        conn_success, conn_message = robot.connect_robot()
+        if not conn_success:
+            emit('command_response', {'success': False, 'message': f'Robot not connected & connection failed: {conn_message}', 'command_sent': command_type})
+            return
+        emit('robot_connection_status', {'success': True, 'message': conn_message})
+
+    success, message = False, "Invalid command type"
+    actual_command_sent = command_type
+
+    if command_type == 'go_home':
+        success, message = robot.go_home()
+        x_h, z_h, y_h = config.ROBOT_HOME_POSITION_PY
+        actual_command_sent = robot._format_command(x_h, z_h, y_h) + " (Home)"
+    elif command_type == 'move_to_safe_center':
+        x_s, z_s, y_s = config.SAFE_ABOVE_CENTER_PY
+        success, message = robot.move_to_position_py(x_s, z_s, y_s)
+        actual_command_sent = robot._format_command(x_s, z_s, y_s) + " (Safe Center)"
+    elif command_type == 'raw' and command_str:
+        success, message = robot.send_command_raw(command_str)
+        actual_command_sent = command_str
+    elif command_type == 'raw' and not command_str:
+        message = "No command_str provided for raw command."
+        actual_command_sent = "N/A"
+        
+    emit('command_response', {'success': success, 'message': message, 'command_sent': actual_command_sent})
+    if not robot.is_connected:
+         emit('robot_connection_status', {'success': False, 'message': 'Disconnected (possibly due to command error/timeout)'})
+
+@socketio.on('request_qr_code')
+def handle_request_qr_code(data):
+    global current_upload_session_id
+    current_upload_session_id = str(uuid.uuid4())
+    host_ip = request.host.split(':')[0] 
+    if host_ip == '127.0.0.1' or host_ip == 'localhost':
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.1); s.connect(("8.8.8.8", 80)); host_ip = s.getsockname()[0]; s.close()
+        except Exception as e:
+            print(f"Could not determine non-loopback IP, using 127.0.0.1. Error: {e}"); host_ip = '127.0.0.1' 
+    server_port = app.config.get('SERVER_PORT', 5555)
+    upload_url = f"http://{host_ip}:{server_port}/qr_upload_page/{current_upload_session_id}"
+    print(f"Generated QR code URL for session {current_upload_session_id}: {upload_url}")
+    qr_img = qrcode.make(upload_url); img_io = BytesIO(); qr_img.save(img_io, 'PNG'); img_io.seek(0)
+    img_base64 = base64.b64encode(img_io.getvalue()).decode('utf-8')
+    emit('qr_code_data', {'qr_image_base64': img_base64, 'upload_url': upload_url})
+
+@socketio.on('process_image_for_drawing')
+def handle_process_image_for_drawing(data):
+    filepath_on_server = data.get('filepath') # This is the path on the server
+    original_filename = data.get('original_filename', os.path.basename(filepath_on_server or "unknown_image"))
+
+    if not filepath_on_server or not os.path.exists(filepath_on_server):
+        emit('command_response', {
+            'success': False, 
+            'message': f"File not found on server or path invalid: {filepath_on_server}", 
+            'command_sent': f'process_image: {original_filename}'
+        })
+        return
+
+    print(f"Received request to process image: {filepath_on_server} (Original: {original_filename})")
+    
+    # Get Canny thresholds (for now, use defaults, later from UI)
+    canny_t1 = config.DEFAULT_CANNY_THRESHOLD1
+    canny_t2 = config.DEFAULT_CANNY_THRESHOLD2
+    
+    try:
+        robot_commands = process_image_to_robot_commands_pipeline(
+            filepath_on_server,
+            canny_thresh1=canny_t1,
+            canny_thresh2=canny_t2
+        )
+
+        if robot_commands:
+            num_cmds = len(robot_commands)
+            print(f"Successfully generated {num_cmds} drawing commands for {original_filename}.")
+            # For now, just confirm processing. We'll add sending to robot later.
+            # Store these commands somewhere or prepare to stream them.
+            # For this step, let's just send a success message.
+            emit('command_response', {
+                'success': True, 
+                'message': f"Successfully processed '{original_filename}' into {num_cmds} drawing commands. Ready to draw (not implemented yet).", 
+                'command_sent': f'process_image: {original_filename}',
+                'num_drawing_commands': num_cmds 
+                # 'drawing_commands': robot_commands # Optionally send all commands if small, or stream later
+            })
+            # TODO: Add logic here to actually start sending these commands to the robot
+            # e.g., start_drawing_sequence(robot_commands)
+        else:
+            print(f"Failed to generate drawing commands for {original_filename}.")
+            emit('command_response', {
+                'success': False, 
+                'message': f"Failed to generate drawing commands for '{original_filename}'. No contours or error.", 
+                'command_sent': f'process_image: {original_filename}'
+            })
+    except Exception as e:
+        print(f"Error during image processing pipeline for {original_filename}: {e}")
+        emit('command_response', {
+            'success': False, 
+            'message': f"Error processing '{original_filename}': {e}", 
+            'command_sent': f'process_image: {original_filename}'
+        })
+
 
 --- END OF FILE: backend/api_server.py ---
 --- START OF FILE: backend/config.py ---
-# Configuration 
+# backend/config.py
+
+# --- Robot Connection Settings ---
+SIMULATION_HOST = '127.0.0.1'
+SIMULATION_PORT = 55000
+REAL_ROBOT_HOST = '192.168.125.1' # Your actual robot IP
+REAL_ROBOT_PORT = 1025          # Your actual robot port
+
+# Set True to use real robot, False for simulation
+USE_REAL_ROBOT = False
+
+# --- QR Code Upload Settings ---
+QR_UPLOAD_FOLDER = 'qr_uploads' # Relative to the backend directory
+
+
+# --- Robot Predefined Positions ---
+# These are (X, Z_depth, Y_left_right) tuples as sent from Python
+# Z is typically the pen height/depth axis for drawing.
+# Y is typically the left/right axis on the paper for drawing.
+
+ROBOT_HOME_POSITION_PY = (409.328464947, -350.922061873, 30.699294352)
+SAFE_ABOVE_CENTER_PY = (0.00, -150.0, 0.00)
+
+# --- Drawing Constants (adapted from original main.py) ---
+# These define the target drawing area in mm for scaling.
+# The (X,Y,Z) offsets sent to the robot are relative to WorkSpaceCenter1 in RAPID.
+# The Python (X_py, Y_py) from image processing will map to RAPID (x_offset, z_offset).
+# The Python Z_py (pen height) will map to RAPID y_offset.
+
+A4_DRAWING_AREA_WIDTH_MM = 180  # Effective drawing width for scaling image contours
+A4_DRAWING_AREA_HEIGHT_MM = 217 # Effective drawing height for scaling image contours
+
+# Python Z-values for pen height, these will be sent as the 'Z' in the "X,Z,Y" string
+# which corresponds to the 'y' offset in the RAPID MoveL Offs(WorkSpaceCenter1, x, y, z)
+PEN_UP_Z_PY = -15.0  # Pen up position (e.g., -15mm from WorkSpaceCenter1's XY plane along its Y-axis)
+PEN_DOWN_Z_PY = -7.0 # Pen down position (e.g., -7mm from WorkSpaceCenter1's XY plane along its Y-axis)
+
+MIN_CONTOUR_LENGTH_PX = 50 # Minimum contour length in pixels to consider from image processing
+
+# Default Canny edge detection thresholds
+DEFAULT_CANNY_THRESHOLD1 = 50
+DEFAULT_CANNY_THRESHOLD2 = 150
+
+# --- QR Code Upload Settings ---
+QR_UPLOAD_FOLDER = 'qr_uploads' # Relative to the backend directory
 
 --- END OF FILE: backend/config.py ---
 --- START OF FILE: backend/image_processing_engine.py ---
-# Image processing 
+# backend/image_processing_engine.py
+import cv2
+import numpy as np
+import math
+import os # For path joining if saving temp edge images
+import config # Import our configuration
+
+# --- Helper Function (from original main.py) ---
+def calculate_distance(p1, p2):
+    """Calculates Euclidean distance between two points (x, y)."""
+    if p1 is None or p2 is None: return float('inf')
+    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+# --- Core Image Processing Functions (adapted from original main.py) ---
+def get_image_contours(image_path, threshold1, threshold2, save_edge_path_prefix=None):
+    """
+    Convert image to contours using specific thresholds.
+    :param image_path: Path to the input image.
+    :param threshold1: Lower threshold for Canny edge detection.
+    :param threshold2: Upper threshold for Canny edge detection.
+    :param save_edge_path_prefix: Optional prefix to save the edge image for preview (e.g., "temp_edges").
+    :return: List of contours (pixel coordinates), image_width, image_height, or (None, 0, 0) on failure.
+    """
+    if not os.path.exists(image_path):
+        print(f"Error: Image path does not exist: {image_path}")
+        return None, 0, 0
+
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        print(f"Error: Could not read image at {image_path}")
+        return None, 0, 0
+
+    image_height, image_width = image.shape[:2]
+    if image_height == 0 or image_width == 0:
+         print("Error: Invalid image dimensions.")
+         return None, 0, 0
+
+    blurred = cv2.GaussianBlur(image, (5, 5), 0)
+    edges = cv2.Canny(blurred, threshold1, threshold2)
+
+    if save_edge_path_prefix:
+        try:
+            # Ensure the directory for saved edges exists if it's part of the prefix
+            edge_save_dir = os.path.dirname(save_edge_path_prefix)
+            if edge_save_dir and not os.path.exists(edge_save_dir):
+                os.makedirs(edge_save_dir, exist_ok=True)
+            
+            # Construct a unique filename for the edge image
+            base, ext = os.path.splitext(os.path.basename(image_path))
+            edge_filename = f"{save_edge_path_prefix}_{base}_t{threshold1}-{threshold2}.png"
+            cv2.imwrite(edge_filename, edges)
+            print(f"Edge image saved to {edge_filename}")
+        except Exception as e:
+            print(f"Failed to save edge image: {e}")
+
+    contours_cv, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Filter contours by length and convert to list of (x,y) tuples
+    contours_xy = []
+    for contour in contours_cv:
+        if cv2.arcLength(contour, closed=False) > config.MIN_CONTOUR_LENGTH_PX:
+            points = contour.squeeze().tolist()
+            if not isinstance(points, list) or not points: continue
+            if isinstance(points[0], int): # Handle single point contour
+                points = [points]
+            
+            # Ensure points are valid pairs and add to list
+            current_contour_points = []
+            for p_arr in points:
+                if isinstance(p_arr, (list, tuple)) and len(p_arr) == 2:
+                    current_contour_points.append(tuple(p_arr))
+                elif isinstance(p_arr, np.ndarray) and p_arr.shape == (2,): # Handle numpy array points
+                    current_contour_points.append(tuple(p_arr.tolist()))
+
+            if current_contour_points: # Only add if we have valid points
+                contours_xy.append(current_contour_points)
+                
+    return contours_xy, image_width, image_height
+
+def scale_contour_point(point_xy, image_width, image_height, target_width_mm, target_height_mm):
+    """ Scales and transforms a single (x, y) pixel coordinate to centered target (mm)."""
+    x_pixel, y_pixel = point_xy
+    
+    # Determine overall scale factor to fit within target dimensions while maintaining aspect ratio
+    scale_x_factor = target_width_mm / image_width
+    scale_y_factor = target_height_mm / image_height
+    scale_factor = min(scale_x_factor, scale_y_factor)
+
+    # Calculate offsets to center the scaled image within the target area
+    scaled_img_width = image_width * scale_factor
+    scaled_img_height = image_height * scale_factor
+    offset_x_mm = (target_width_mm - scaled_img_width) / 2
+    offset_y_mm = (target_height_mm - scaled_img_height) / 2
+    
+    # Transform pixel coordinates to scaled mm, centered
+    # Image origin (0,0) is top-left. Robot drawing origin (0,0) for offsets is center.
+    # Python X (image width) maps to RAPID X offset
+    # Python Y (image height) maps to RAPID Z offset (left/right on paper)
+    
+    # Scale pixel to mm relative to image top-left
+    x_mm_from_origin = x_pixel * scale_factor
+    y_mm_from_origin = y_pixel * scale_factor
+
+    # Center it: For robot X (maps to image X), 0 is center of paper.
+    # For robot Z (maps to image Y), 0 is center of paper.
+    # RAPID X = (scaled_x_pixel - scaled_image_width/2)
+    # RAPID Z = -(scaled_y_pixel - scaled_image_height/2) (invert Y because image Y is down, paper Z might be up/right)
+    # However, your RAPID code uses Offs(WorkSpaceCenter1, x, y, z)
+    # where Python X -> RAPID x, Python Z_depth -> RAPID y, Python Y -> RAPID z.
+    # Let's assume WorkSpaceCenter1 is the center of the A4 paper.
+    # The output X_py, Y_py from this function will be the offsets for RAPID x and z.
+
+    # Convert pixel x to be relative to the center of the image
+    x_centered_pixel = x_pixel - (image_width / 2)
+    # Convert pixel y to be relative to the center of the image, and invert (image y is down)
+    y_centered_pixel = (image_height / 2) - y_pixel 
+
+    x_py_offset = x_centered_pixel * scale_factor
+    y_py_offset = y_centered_pixel * scale_factor # This will be used as the Y-coordinate in the Python (X,Z,Y) tuple
+
+    return (x_py_offset, y_py_offset)
+
+
+def generate_robot_drawing_commands(contours_xy, image_width, image_height, optimize_paths=True):
+    """ 
+    Takes list of contours (pixel coordinates), scales them, creates drawing paths (X_py, Z_py, Y_py).
+    Z_py is the pen height (config.PEN_UP_Z_PY or config.PEN_DOWN_Z_PY).
+    X_py and Y_py are the planar coordinates for drawing.
+    """
+    if not contours_xy or image_width <= 0 or image_height <= 0:
+        return []
+
+    scaled_contours = []
+    for contour in contours_xy:
+        if not contour: continue
+        scaled_contour_points = [
+            scale_contour_point(p, image_width, image_height, 
+                                config.A4_DRAWING_AREA_WIDTH_MM, config.A4_DRAWING_AREA_HEIGHT_MM)
+            for p in contour
+        ]
+        if len(scaled_contour_points) >= 1: # Allow single points to be drawn
+            scaled_contours.append(scaled_contour_points)
+
+    if not scaled_contours:
+        return []
+
+    # Path Optimization (simplified from original, can be enhanced)
+    ordered_contours = []
+    if optimize_paths and scaled_contours:
+        remaining_contours = list(scaled_contours)
+        current_point = (0,0) # Assume starting near center or last point of previous operation
+
+        while remaining_contours:
+            best_contour_idx = -1
+            min_dist = float('inf')
+            reverse_needed = False
+
+            for i, contour_to_check in enumerate(remaining_contours):
+                start_pt = contour_to_check[0]
+                end_pt = contour_to_check[-1]
+                
+                dist_to_start = calculate_distance(current_point, start_pt)
+                dist_to_end = calculate_distance(current_point, end_pt)
+
+                if dist_to_start < min_dist:
+                    min_dist = dist_to_start
+                    best_contour_idx = i
+                    reverse_needed = False
+                
+                if dist_to_end < min_dist: # Check if starting from the end is better
+                    min_dist = dist_to_end
+                    best_contour_idx = i
+                    reverse_needed = True
+            
+            if best_contour_idx != -1:
+                next_contour = remaining_contours.pop(best_contour_idx)
+                if reverse_needed:
+                    next_contour.reverse()
+                ordered_contours.append(next_contour)
+                current_point = next_contour[-1] # Update current point for next iteration
+            else:
+                break # Should not happen if remaining_contours is not empty
+        processed_contours = ordered_contours
+    else:
+        processed_contours = scaled_contours
+
+    robot_commands_xyz_py = [] # List of (X_py, Z_depth_py, Y_py) tuples
+    for contour_points in processed_contours:
+        if not contour_points: continue
+        
+        start_x_py, start_y_py = contour_points[0]
+        # Move pen up to the start of the contour
+        robot_commands_xyz_py.append((start_x_py, config.PEN_UP_Z_PY, start_y_py))
+        # Move pen down at the start of the contour
+        robot_commands_xyz_py.append((start_x_py, config.PEN_DOWN_Z_PY, start_y_py))
+
+        # Draw the rest of the contour
+        for i in range(len(contour_points)): # Iterate through all points including start
+            pt_x_py, pt_y_py = contour_points[i]
+            # Add point with pen down (if it's not the very first point already added)
+            if i > 0 or len(contour_points) == 1: # For single point contours, ensure it's drawn
+                 robot_commands_xyz_py.append((pt_x_py, config.PEN_DOWN_Z_PY, pt_y_py))
+
+        # Lift pen at the end of the contour
+        end_x_py, end_y_py = contour_points[-1]
+        robot_commands_xyz_py.append((end_x_py, config.PEN_UP_Z_PY, end_y_py))
+        
+    return robot_commands_xyz_py
+
+
+def process_image_to_robot_commands_pipeline(image_filepath, 
+                                             canny_thresh1=config.DEFAULT_CANNY_THRESHOLD1, 
+                                             canny_thresh2=config.DEFAULT_CANNY_THRESHOLD2,
+                                             optimize=True):
+    """
+    Main pipeline function to take an image path and return a list of robot drawing commands.
+    Each command is a tuple (X_py, Z_depth_py, Y_py).
+    """
+    print(f"Processing image: {image_filepath} with Canny thresholds: {canny_thresh1}, {canny_thresh2}")
+    
+    # Define a path prefix if you want to save intermediate edge images for debugging
+    # For example, in the qr_uploads directory or a dedicated 'debug_edges' directory.
+    # Ensure this directory exists if you use it.
+    # debug_edge_save_prefix = os.path.join(os.path.dirname(image_filepath), "edge_previews", os.path.basename(image_filepath))
+    debug_edge_save_prefix = None # Disable saving edge images by default
+
+    contours, img_w, img_h = get_image_contours(image_filepath, canny_thresh1, canny_thresh2, save_edge_path_prefix=debug_edge_save_prefix)
+
+    if contours is None or not contours:
+        print("No contours found or error in contour extraction.")
+        return []
+
+    print(f"Found {len(contours)} contours. Image dimensions: {img_w}x{img_h}")
+    
+    robot_drawing_cmds = generate_robot_drawing_commands(contours, img_w, img_h, optimize_paths=optimize)
+    
+    print(f"Generated {len(robot_drawing_cmds)} robot drawing commands.")
+    return robot_drawing_cmds
+
+if __name__ == '__main__':
+    # Test the pipeline
+    # Create a dummy image for testing if you don't have one readily available
+    # For this test, ensure you have an image in your project, e.g., 'backend/qr_uploads/test_image.png'
+    # Or use an absolute path to an image.
+    
+    # Make sure qr_uploads directory exists for the test
+    if not os.path.exists(config.QR_UPLOAD_FOLDER):
+        os.makedirs(config.QR_UPLOAD_FOLDER)
+
+    # Create a simple test image
+    test_image_name = "test_square.png"
+    test_image_path = os.path.join(config.QR_UPLOAD_FOLDER, test_image_name)
+    if not os.path.exists(test_image_path):
+        img = np.zeros((200, 200, 1), dtype="uint8")
+        cv2.rectangle(img, (50, 50), (150, 150), (255), thickness=3) # White square on black
+        cv2.imwrite(test_image_path, img)
+        print(f"Created dummy test image: {test_image_path}")
+
+    if os.path.exists(test_image_path):
+        print(f"\n--- Testing image processing pipeline with {test_image_path} ---")
+        commands = process_image_to_robot_commands_pipeline(test_image_path)
+        if commands:
+            print(f"\nFirst 5 generated commands (X_py, Z_depth_py, Y_py):")
+            for cmd in commands[:5]:
+                print(cmd)
+            print("...")
+            print(f"Last 5 generated commands (X_py, Z_depth_py, Y_py):")
+            for cmd in commands[-5:]:
+                print(cmd)
+        else:
+            print("No commands generated.")
+    else:
+        print(f"Test image not found: {test_image_path}. Skipping pipeline test.")
+
 
 --- END OF FILE: backend/image_processing_engine.py ---
 --- START OF FILE: backend/main_orchestrator.py ---
-# Main backend orchestrator 
+# backend/main_orchestrator.py
+from api_server import app, socketio # app is the Flask app instance
 
+if __name__ == '__main__':
+    server_port = 5555 # Define the port
+    app.config['SERVER_PORT'] = server_port # Make it available for URL generation in api_server
+
+    print(f"Starting Python backend server (SocketIO with Flask) on port {server_port}...")
+    print(f"Frontend should connect to ws://localhost:{server_port} (or your machine's IP on the network)")
+    print(f"QR code upload page will be accessible via http://<YOUR_LOCAL_IP>:{server_port}/qr_upload_page/<session_id>")
+
+    socketio.run(app, host='0.0.0.0', port=server_port, debug=True, use_reloader=False, allow_unsafe_werkzeug=True)
 --- END OF FILE: backend/main_orchestrator.py ---
+--- START OF FILE: backend/rapid_code_for_controlling_the_robot_movement.txt ---
+MODULE InputDrawing
+    VAR num x;
+    VAR num y;
+    VAR num z;
+    VAR robtarget Object_Target;
+    VAR pos p1;
+    VAR num target;
+    VAR string data;
+    VAR socketdev client_socket;
+    VAR socketdev temp_socket;
+    VAR robtarget targetRobTarget;
+    VAR string tempX;
+    VAR string tempY;
+    VAR string tempZ;
+    VAR num idx0;
+    VAR num idx1;
+    VAR num idx2;
+    VAR bool success;
+    CONST robtarget home1:=[[409.328464947,30.699294352,-350.922061873],[0.999898286,-0.005230998,0.00469865,0.012408784],[0,-1,1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget WorkSpaceCenter1:=[[75.78,312.76,9.799641871],[0.988089954,-0.00592235,0.00373461,-0.153717993],[0,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    TASK PERS wobjdata Wobj_1:=[FALSE,TRUE,"",[[87.974520519,-126.434467699,0],[0,0.707106781,0.707106781,0]],[[0,0,0],[1,0,0,0]]];
+
+    PROC main()
+        MoveJ home1,v1000,z100,tool2\WObj:=Wobj_1;
+        SocketConnect;
+
+        WHILE TRUE DO
+            ! socket sent in "x,z,y"
+            IF SocketGetStatus(client_socket)=SOCKET_CONNECTED THEN
+                SocketReceive client_socket\Str:=data,\Time:=WAIT_MAX;
+                SocketSend client_socket\Str:="R";
+                ConvertSocketStrToPose(data);
+                ! Wait until ConvertSocketStrToPose completes
+                IF success THEN
+                    MoveL Offs(WorkSpaceCenter1,x,y,z),v1000,z100,tool2\WObj:=Wobj_1;                
+                    SocketSend client_socket\Str:="D";
+                ENDIF
+            ENDIF
+        ENDWHILE
+    ENDPROC
+
+    ! for real life robot station
+!    PROC SocketConnect()
+!        SocketCreate temp_socket;
+!        SocketBind temp_socket,"192.168.125.1",1025;
+!        SocketListen temp_socket;
+!        SocketAccept temp_socket,client_socket,\Time:=WAIT_MAX;
+!        TPWrite "Socket connection established.";
+!    ENDPROC
+
+    ! for simulation station
+    
+    PROC SocketConnect()
+        ! Create, bind, listen, and accept the socket connection
+        SocketCreate temp_socket;
+        SocketBind temp_socket,"127.0.0.1",55000;
+        SocketListen temp_socket;
+        SocketAccept temp_socket,client_socket,\Time:=WAIT_MAX;
+        TPWrite "Socket connection established.";
+    ENDPROC    
+    PROC ConvertSocketStrToPose(string data)
+        ! Find indices of the commas
+        idx1:=StrFind(data,1,",");
+        idx2:=StrFind(data,idx1+1,",");
+
+        ! Ensure all indices are valid
+        IF idx1>0 AND idx2>0 THEN
+            ! Extract substrings for x, y, and z
+            tempX:=StrPart(data,1,idx1-1);
+            tempZ:=StrPart(data,idx1+1,idx2-idx1-1);
+            tempY:=StrPart(data,idx2+1,StrLen(data)-idx2);
+            ! Convert strings to numeric values
+            success := FALSE;
+            IF StrToVal(tempX,x) AND
+                           StrToVal(tempZ,z) AND
+                           StrToVal(tempY,y) THEN
+                success := TRUE;
+            ENDIF
+        ELSE
+            success := FALSE;
+        ENDIF
+    ENDPROC
+
+ENDMODULE
+--- END OF FILE: backend/rapid_code_for_controlling_the_robot_movement.txt ---
 --- START OF FILE: backend/README.md ---
 # Python backend 
 
@@ -198,8 +858,135 @@ numpy
 # bitsandbytes
 --- END OF FILE: backend/requirements.txt ---
 --- START OF FILE: backend/robot_interface.py ---
-# Robot communication 
+# backend/robot_interface.py
+import socket
+import time # Make sure time is imported (it likely already is)
+import config
 
+class RobotInterface:
+    def __init__(self):
+        self.robot_socket = None
+        self.is_connected = False
+        self.target_host = config.REAL_ROBOT_HOST if config.USE_REAL_ROBOT else config.SIMULATION_HOST
+        self.target_port = config.REAL_ROBOT_PORT if config.USE_REAL_ROBOT else config.SIMULATION_PORT
+
+    def _format_command(self, x, z, y):
+        return f"{x:.2f},{z:.2f},{y:.2f}"
+
+    def connect_robot(self):
+        if self.is_connected:
+            print("Robot already connected.")
+            return True, "Already connected"
+        try:
+            self.robot_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.robot_socket.settimeout(5)
+            print(f"Attempting to connect to robot at {self.target_host}:{self.target_port}...")
+            self.robot_socket.connect((self.target_host, self.target_port))
+            self.robot_socket.settimeout(None)
+            self.is_connected = True
+            print("Successfully connected to the robot/simulator.")
+            return True, "Successfully connected"
+        except socket.error as e:
+            self.robot_socket = None
+            self.is_connected = False
+            print(f"Error connecting to robot: {e}")
+            return False, f"Error connecting: {e}"
+
+    def disconnect_robot(self, graceful=True):
+        if not self.is_connected:
+            print("Robot is not connected.")
+            return True, "Was not connected."
+
+        if graceful:
+            print("Attempting graceful disconnect (going home first)...")
+            home_success, home_msg = self.go_home() # go_home now attempts to connect if not connected.
+                                                 # We should only call it if already connected for disconnect.
+            if self.is_connected: # Check again, as go_home might have connected if it wasn't
+                if not home_success:
+                    print(f"Warning: Failed to go home before disconnecting: {home_msg}")
+                else:
+                    print("Successfully moved to home position.")
+                    print("Waiting for 3 seconds before closing socket...")
+                    time.sleep(3)
+
+            else: # This case means go_home was called when not connected AND it failed to connect.
+                print(f"Cannot complete graceful disconnect (go home) as robot is not connected: {home_msg}")
+
+
+        if self.robot_socket:
+            try:
+                self.robot_socket.close()
+            except socket.error as e:
+                print(f"Error closing socket: {e}")
+            finally:
+                self.robot_socket = None
+                self.is_connected = False
+                print("Socket closed. Disconnected from robot.")
+        else: # If robot_socket is None but is_connected was somehow true (should not happen with current logic)
+            self.is_connected = False 
+            print("No active socket to close. Marked as disconnected.")
+            
+        return True, "Disconnected from robot."
+
+    def send_command_raw(self, command_str):
+        if not self.is_connected or not self.robot_socket:
+            return False, "Not connected"
+        try:
+            print(f"Sending command: {command_str}")
+            self.robot_socket.sendall(command_str.encode('utf-8'))
+            
+            response_r = self.robot_socket.recv(1024).decode('utf-8').strip()
+            print(f"Received R-phase: '{response_r}'")
+            if response_r.upper() != "R":
+                return False, f"Robot did not acknowledge (R). Got: {response_r}"
+
+            response_d_or_e = self.robot_socket.recv(1024).decode('utf-8').strip()
+            print(f"Received D/E-phase: '{response_d_or_e}'")
+            if response_d_or_e.upper() == "D":
+                return True, f"Command '{command_str}' successful."
+            elif response_d_or_e.upper() == "E":
+                return False, f"Command '{command_str}' failed: Robot reported error (E)."
+            else:
+                return False, f"Robot did not signal done (D) or error (E). Got: {response_d_or_e}"
+                
+        except socket.timeout:
+            print(f"Socket timeout during send/recv for command: {command_str}")
+            self.is_connected = False 
+            self.robot_socket = None
+            return False, "Socket timeout"
+        except socket.error as e:
+            print(f"Socket error during send/recv: {e}")
+            self.is_connected = False
+            self.robot_socket = None
+            return False, f"Socket error: {e}"
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            self.is_connected = False
+            self.robot_socket = None
+            return False, f"Unexpected error: {e}"
+
+    def go_home(self):
+        if not self.is_connected:
+            conn_success, conn_msg = self.connect_robot()
+            if not conn_success:
+                return False, f"Cannot go home. Connection failed: {conn_msg}"
+        
+        print("Sending robot to home position...")
+        x, z, y = config.ROBOT_HOME_POSITION_PY
+        cmd_str = self._format_command(x, z, y)
+        return self.send_command_raw(cmd_str)
+
+    def move_to_position_py(self, x_py, z_py, y_py):
+        if not self.is_connected:
+            conn_success, conn_msg = self.connect_robot()
+            if not conn_success:
+                return False, f"Cannot move. Connection failed: {conn_msg}"
+
+        cmd_str = self._format_command(x_py, z_py, y_py)
+        return self.send_command_raw(cmd_str)
+
+# Main guard for direct testing (if __name__ == '__main__') remains the same
+# ... (previous if __name__ == '__main__' block)
 --- END OF FILE: backend/robot_interface.py ---
 --- START OF FILE: backend/voice_assistant.py ---
 # Voice processing 
@@ -257,6 +1044,79 @@ dist-ssr
 *.sw?
 
 --- END OF FILE: frontend/s2a-drawing-ui/.gitignore ---
+--- START OF FILE: frontend/s2a-drawing-ui/dist-electron/main.js ---
+import { app, BrowserWindow } from "electron";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+process.env.APP_ROOT = path.join(__dirname, "..");
+const VITE_DEV_SERVER_URL = process.env["VITE_DEV_SERVER_URL"];
+const MAIN_DIST = path.join(process.env.APP_ROOT, "dist-electron");
+const RENDERER_DIST = path.join(process.env.APP_ROOT, "dist");
+process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? path.join(process.env.APP_ROOT, "public") : RENDERER_DIST;
+let win;
+function createWindow() {
+  win = new BrowserWindow({
+    icon: path.join(process.env.VITE_PUBLIC, "electron-vite.svg"),
+    webPreferences: {
+      preload: path.join(__dirname, "preload.mjs")
+    }
+  });
+  win.webContents.on("did-finish-load", () => {
+    win == null ? void 0 : win.webContents.send("main-process-message", (/* @__PURE__ */ new Date()).toLocaleString());
+  });
+  if (VITE_DEV_SERVER_URL) {
+    win.loadURL(VITE_DEV_SERVER_URL);
+  } else {
+    win.loadFile(path.join(RENDERER_DIST, "index.html"));
+  }
+}
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") {
+    app.quit();
+    win = null;
+  }
+});
+app.on("activate", () => {
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createWindow();
+  }
+});
+app.whenReady().then(createWindow);
+export {
+  MAIN_DIST,
+  RENDERER_DIST,
+  VITE_DEV_SERVER_URL
+};
+
+--- END OF FILE: frontend/s2a-drawing-ui/dist-electron/main.js ---
+--- START OF FILE: frontend/s2a-drawing-ui/dist-electron/preload.mjs ---
+"use strict";
+const electron = require("electron");
+electron.contextBridge.exposeInMainWorld("ipcRenderer", {
+  on(...args) {
+    const [channel, listener] = args;
+    return electron.ipcRenderer.on(channel, (event, ...args2) => listener(event, ...args2));
+  },
+  off(...args) {
+    const [channel, ...omit] = args;
+    return electron.ipcRenderer.off(channel, ...omit);
+  },
+  send(...args) {
+    const [channel, ...omit] = args;
+    return electron.ipcRenderer.send(channel, ...omit);
+  },
+  invoke(...args) {
+    const [channel, ...omit] = args;
+    return electron.ipcRenderer.invoke(channel, ...omit);
+  }
+  // You can expose other APTs you need here.
+  // ...
+});
+
+--- END OF FILE: frontend/s2a-drawing-ui/dist-electron/preload.mjs ---
 --- START OF FILE: frontend/s2a-drawing-ui/electron/electron-env.d.ts ---
 /// <reference types="vite-plugin-electron/electron-env" />
 
@@ -461,7 +1321,8 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
   },
   "dependencies": {
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "socket.io-client": "^4.8.1"
   },
   "devDependencies": {
     "@types/react": "^18.2.64",
@@ -631,41 +1492,164 @@ export default {
 
 --- END OF FILE: frontend/s2a-drawing-ui/src/App.css ---
 --- START OF FILE: frontend/s2a-drawing-ui/src/App.tsx ---
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/electron-vite.animate.svg'
-import './App.css'
+// frontend/s2a-drawing-ui/src/App.tsx
+import { useState, useEffect } from 'react';
+import { io, Socket } from 'socket.io-client';
+import './App.css'; // Your existing or new styles
+
+const PYTHON_BACKEND_URL = 'http://localhost:5555';
+
+let socket: Socket;
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [isConnectedToBackend, setIsConnectedToBackend] = useState(false);
+  const [backendMessage, setBackendMessage] = useState('');
+
+  const [isRobotConnected, setIsRobotConnected] = useState(false);
+  const [robotStatusMessage, setRobotStatusMessage] = useState('Robot: Not connected');
+  const [lastCommandResponse, setLastCommandResponse] = useState('');
+
+  const [qrCodeImage, setQrCodeImage] = useState<string | null>(null);
+  const [qrUploadUrl, setQrUploadUrl] = useState<string>('');
+  const [lastUploadedImageInfo, setLastUploadedImageInfo] = useState<string>('');
+  const [uploadedFilePathFromBackend, setUploadedFilePathFromBackend] = useState<string | null>(null);
+
+
+  useEffect(() => {
+    console.log('Attempting to connect to WebSocket server...');
+    socket = io(PYTHON_BACKEND_URL, {
+      transports: ['websocket'],
+    });
+
+    socket.on('connect', () => {
+      console.log('Connected to Python backend via Socket.IO!');
+      setIsConnectedToBackend(true);
+      setBackendMessage('Connected to Python Backend!');
+    });
+
+    socket.on('disconnect', () => {
+      console.log('Disconnected from Python backend.');
+      setIsConnectedToBackend(false);
+      setBackendMessage('Disconnected from Python Backend.');
+      setIsRobotConnected(false);
+      setRobotStatusMessage('Robot: Disconnected (backend offline)');
+    });
+
+    socket.on('response', (data: { data: string }) => {
+      setBackendMessage(data.data);
+    });
+
+    socket.on('robot_connection_status', (data: { success: boolean, message: string }) => {
+      setIsRobotConnected(data.success);
+      setRobotStatusMessage(`Robot: ${data.message}`);
+    });
+
+    socket.on('command_response', (data: { success: boolean, message: string, command_sent?: string }) => {
+      setLastCommandResponse(
+        `Cmd: ${data.command_sent || 'N/A'} -> Resp: ${data.message} (Success: ${data.success})`
+      );
+    });
+
+    socket.on('qr_code_data', (data: { qr_image_base64: string, upload_url: string }) => {
+      console.log('Received QR Code data');
+      setQrCodeImage(`data:image/png;base64,${data.qr_image_base64}`);
+      setQrUploadUrl(data.upload_url);
+      setLastUploadedImageInfo(''); 
+      setUploadedFilePathFromBackend(null);
+    });
+
+    socket.on('qr_image_received', (data: { success: boolean, message: string, filename?: string, filepath?: string}) => {
+      console.log('Image received via QR:', data);
+      if (data.success && data.filepath) {
+        setLastUploadedImageInfo(`Received: ${data.filename || 'image'}. Ready for processing.`);
+        setUploadedFilePathFromBackend(data.filepath); // Store the filepath
+        setQrCodeImage(null); 
+        setQrUploadUrl('');
+      } else {
+        setLastUploadedImageInfo(`Upload Error: ${data.message}`);
+        setUploadedFilePathFromBackend(null);
+      }
+    });
+
+    return () => {
+      if (socket) {
+        socket.disconnect();
+      }
+    };
+  }, []);
+
+  const handleConnectRobot = () => socket.emit('robot_connect_request', {});
+  const handleDisconnectRobot = () => socket.emit('robot_disconnect_request', {});
+  const sendGoHomeCommand = () => socket.emit('send_robot_command', { type: 'go_home' });
+  const sendSafeCenterCommand = () => socket.emit('send_robot_command', { type: 'move_to_safe_center' });
+  
+  const requestQrCode = () => {
+    if (socket && isConnectedToBackend) {
+      setQrCodeImage(null); 
+      setQrUploadUrl('Requesting QR Code...');
+      setLastUploadedImageInfo('');
+      setUploadedFilePathFromBackend(null);
+      socket.emit('request_qr_code', {});
+    }
+  };
+
+  // Placeholder for actually drawing the uploaded image
+  const handleProcessAndDrawUploadedImage = () => {
+    if (uploadedFilePathFromBackend) { 
+        console.log("Requesting to draw image: ", uploadedFilePathFromBackend);
+        // Emit an event to the backend to process this specific file path
+        socket.emit('process_image_for_drawing', { filepath: uploadedFilePathFromBackend });
+        setLastCommandResponse(`Sent request to process: ${uploadedFilePathFromBackend.split(/[/\\]/).pop()}`);
+    } else {
+        alert("No image uploaded or ready for processing via QR yet.");
+        setLastCommandResponse("Error: No image path available to process.");
+    }
+  };
 
   return (
-    <>
-      <div>
-        <a href="https://electron-vite.github.io" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
+    <div className="App">
+      <h1>S2A Robotic Drawing Control</h1>
+      <p>Backend Connection: {isConnectedToBackend ? 'Connected' : 'Disconnected'}</p>
+      <p>Backend Message: {backendMessage}</p>
+      <hr />
+      
+      <h2>Image Input</h2>
+      <button onClick={requestQrCode} disabled={!isConnectedToBackend}>
+        Upload Image via QR Code
+      </button>
+      {qrUploadUrl && <p><small>Scan to upload. URL (for debugging): {qrUploadUrl}</small></p>}
+      {qrCodeImage && <img src={qrCodeImage} alt="QR Code for Upload" style={{border: "1px solid #ccc", marginTop:"10px"}} />}
+      {lastUploadedImageInfo && <p style={{color: "green"}}>{lastUploadedImageInfo}</p>}
+      
+      {/* Button to trigger drawing of the uploaded image */}
+      {uploadedFilePathFromBackend && (
+        <button onClick={handleProcessAndDrawUploadedImage} style={{marginTop: "10px"}}>
+          Process & Draw Uploaded Image
         </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
+      )}
+
+      <hr />
+      <h2>Robot Control</h2>
+      <button onClick={handleConnectRobot} disabled={!isConnectedToBackend || isRobotConnected}>
+        Connect to Robot
+      </button>
+      <button onClick={handleDisconnectRobot} disabled={!isConnectedToBackend || !isRobotConnected}>
+        Disconnect (Graceful)
+      </button>
+      <br />
+      <button onClick={sendGoHomeCommand} disabled={!isConnectedToBackend || !isRobotConnected}>
+        Send Robot to Home
+      </button>
+      <button onClick={sendSafeCenterCommand} disabled={!isConnectedToBackend || !isRobotConnected}>
+        Send to Safe Center
+      </button>
+      <p>{robotStatusMessage}</p>
+      <p>Last Command: {lastCommandResponse}</p>
+    </div>
+  );
 }
 
-export default App
+export default App;
 
 --- END OF FILE: frontend/s2a-drawing-ui/src/App.tsx ---
 --- START OF FILE: frontend/s2a-drawing-ui/src/assets/react.svg ---
@@ -1010,6 +1994,28 @@ The frontend is located in `frontend/s2a-drawing-ui/`.
         Be cautious with `npm audit fix --force` as it might introduce breaking changes.
 
 ## 3\. Run and Test Application (Steps and Scripts)
+
+### 3.0. Network Configuration for QR Code Image Upload (Current Method)
+Important: For the QR code image upload feature (from phone to PC) to work with the current setup, your PC and your phone must be on the same local network, and that network must allow direct device-to-device communication. Guest networks or networks with "Client Isolation" / "AP Isolation" enabled will likely not work.
+
+Using a Mobile Hotspot (Recommended & Tested):
+
+Enable the mobile hotspot feature on your phone.
+
+Connect your development PC to this mobile hotspot Wi-Fi network.
+
+When the Python backend server starts, it will attempt to generate a QR code URL using the PC's IP address on this hotspot network (e.g., 192.168.43.x).
+
+Scanning the QR code with the phone (which is the hotspot provider) will then allow it to connect to the PC.
+
+Using a Private Wi-Fi Network:
+
+If using a home/private Wi-Fi router, ensure both devices are connected to it.
+
+Crucially, ensure that "AP Isolation," "Client Isolation," or similar features (which prevent connected devices from communicating with each other) are disabled on your router.
+
+This direct local network approach is for the current development phase. Future updates might explore other methods for image uploads.
+
 
 ### 3.1. Running the Python Backend
 
