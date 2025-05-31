@@ -41,5 +41,5 @@ MIN_CONTOUR_LENGTH_PX = 50 # Minimum contour length in pixels to consider from i
 DEFAULT_CANNY_THRESHOLD1 = 50
 DEFAULT_CANNY_THRESHOLD2 = 150
 
-# --- QR Code Upload Settings ---
-QR_UPLOAD_FOLDER = 'qr_uploads' # Relative to the backend directory
+# --- Temporary Audio File Settings ---
+AUDIO_TEMP_FOLDER = 'audio_tmp' # Relative to the backend directory for storing temporary audio files

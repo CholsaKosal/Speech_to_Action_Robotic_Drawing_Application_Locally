@@ -361,8 +361,8 @@ def handle_process_image_for_drawing(data):
                 robot.go_home() 
                 is_drawing_active = False
                 return 
-            
-            socketio.sleep(0.05) 
+            #smoothness of the drawing and connection is depeding on this
+            socketio.sleep(0.0001) 
 
         print(f"Finished sending all drawing commands for {original_filename}.")
         emit('command_response', {'success': True, 'message': f"Successfully sent all {num_cmds} drawing commands for '{original_filename}'.", 'command_sent': f'draw_image: {original_filename}'})
