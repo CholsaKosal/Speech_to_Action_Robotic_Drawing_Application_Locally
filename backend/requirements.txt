@@ -1,0 +1,21 @@
+Flask
+python-socketio
+Flask-SocketIO
+eventlet
+# or instead of Flask-SocketIO and eventlet, use:
+# websockets
+# if using FastAPI:
+# fastapi
+# uvicorn[standard]
+
+opencv-python
+Pillow
+qrcode[pil]
+numpy
+# Add AI/ML libraries later, e.g.:
+# openai-whisper
+# llama-cpp-python
+# transformers
+# torch
+# accelerate
+# bitsandbytes
