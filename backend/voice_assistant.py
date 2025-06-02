@@ -85,17 +85,16 @@ def load_llm_model():
     logging.info("LLM model already loaded.")
     return llm_instance
 
-def process_command_with_llm(text_input):
+def process_command_with_llm_stream(text_input):
     """
-    Processes the transcribed text with the LLM to get a response or action.
+    Processes the transcribed text with the LLM and yields response chunks (streaming).
     """
-    global llm_instance, llm_chat_history # Ensure we're using the global instance
+    global llm_instance, llm_chat_history 
     if llm_instance is None:
         logging.error("LLM model (llm_instance) is not loaded. Cannot process command.")
-        # Attempt to load it now as a fallback, though it should be loaded at startup
-        if load_llm_model() is None: # This will try to set the global llm_instance
-             return {"error": "LLM not available (failed to load)."}
-        # If load_llm_model() succeeded, llm_instance is now set.
+        if load_llm_model() is None: 
+            yield {"error": "LLM not available (failed to load).", "done": True}
+            return # Important to return after yielding the error
 
     MAX_HISTORY_TURNS = 4 
     if len(llm_chat_history) > MAX_HISTORY_TURNS * 2:
@@ -103,45 +102,66 @@ def process_command_with_llm(text_input):
 
     llm_chat_history.append({"role": "user", "content": text_input})
     
+    system_prompt = (
+        "You are 'Robotist', the intelligent AI controlling a robotic drawing arm. Your primary functions are to:\n" # Updated name
+        "1.  Understand and execute drawing commands (e.g., 'Draw a house', 'Sketch a flower').\n"
+        "2.  Understand and execute robot movement commands (e.g., 'Go home', 'Move to the center').\n"
+        "3.  Engage in helpful and friendly conversation with the user about your capabilities, drawing tasks, or general topics.\n\n"
+        "When you receive a command that involves a robot action (drawing or movement):\n"
+        "- Clearly acknowledge the command.\n"
+        "- If the command is clear, confirm the action you will take. For example, if the user says 'Draw a red square', respond with something like: 'Okay, I will draw a red square.'\n"
+        "- If the command is ambiguous or lacks detail (e.g., 'Draw something'), ask for clarification. For example: 'Sure, what would you like me to draw?'\n\n"
+        "For general conversation (e.g., 'Hello', 'How are you?', 'What can you draw?'):\n"
+        "- Respond naturally, politely, and concisely.\n\n"
+        "Keep your responses focused and to the point. Avoid overly long explanations unless specifically asked.\n"
+        "Your goal is to be a helpful and efficient interface to the robot arm."
+    )
+    
     messages_for_llm = [
-        {"role": "system", "content": (
-            "You are a helpful assistant controlling a robot arm capable of drawing. "
-            "Understand user commands related to drawing, robot movement, or general conversation. "
-            "If a command is for drawing, try to identify the action (e.g., 'draw', 'sketch'), "
-            "the object/shape (e.g., 'square', 'circle', 'house'), and any parameters (e.g., 'red', 'big'). "
-            "If it's a robot movement command, identify the target (e.g., 'home', 'center'). "
-            "Keep responses concise. If asked to perform an action, confirm it. "
-            "Example commands: 'Draw a circle', 'Go to the home position', 'What can you do?'."
-            "If a drawing command is given, respond with the action and shape. For example if user says 'Draw a star', you can respond with 'Okay, I will draw a star.' "
-            "If it is a simple conversational message, respond naturally."
-        )},
+        {"role": "system", "content": system_prompt},
     ] + llm_chat_history
 
-    logging.info(f"\nSending to LLM ({config.LLM_MODEL_FILENAME}):")
-    # for msg in messages_for_llm[-3:]: logging.info(f"  {msg['role']}: {msg['content']}") # Log last few
+    logging.info(f"\nStreaming to LLM ({config.LLM_MODEL_FILENAME}) with {len(messages_for_llm)} total messages in context.")
 
+    full_assistant_response = ""
     try:
         start_time = time.time()
-        # Use the global llm_instance
-        response = llm_instance.create_chat_completion(
+        # Use stream=True to get a generator
+        stream = llm_instance.create_chat_completion(
             messages=messages_for_llm,
             max_tokens=config.LLM_MAX_TOKENS,
             temperature=config.LLM_TEMPERATURE,
+            stream=True  # Enable streaming
         )
-        llm_output_text = response['choices'][0]['message']['content'].strip()
-        end_time = time.time()
         
-        logging.info(f"LLM response received in {end_time - start_time:.2f} seconds.")
-        logging.info(f"LLM Raw Output: {llm_output_text}")
+        logging.info("LLM stream initiated.")
+        for chunk_index, chunk in enumerate(stream):
+            delta = chunk['choices'][0]['delta']
+            content_piece = delta.get('content')
+            
+            if content_piece: # Check if there's new content in this chunk
+                # logging.debug(f"LLM Stream chunk {chunk_index}: '{content_piece}'") # Can be very verbose
+                yield {"chunk": content_piece, "done": False}
+                full_assistant_response += content_piece
+            
+            # Check if the stream is finished (OpenAI-like API often sends a finish_reason)
+            if chunk['choices'][0].get('finish_reason') is not None:
+                logging.info(f"LLM stream finished. Reason: {chunk['choices'][0]['finish_reason']}")
+                break 
+        
+        end_time = time.time()
+        logging.info(f"LLM full response streamed in {end_time - start_time:.2f} seconds.")
+        logging.info(f"LLM Final Assembled Output: {full_assistant_response}")
 
-        llm_chat_history.append({"role": "assistant", "content": llm_output_text})
-        return {"message": llm_output_text} 
-    
+        llm_chat_history.append({"role": "assistant", "content": full_assistant_response})
+        yield {"chunk": "", "done": True, "final_message": full_assistant_response} # Signal end of stream
+
     except Exception as e:
-        logging.error(f"Error during LLM processing: {e}", exc_info=True)
+        logging.error(f"Error during LLM streaming: {e}", exc_info=True)
         if llm_chat_history and llm_chat_history[-1]["role"] == "user":
-            llm_chat_history.pop()
-        return {"error": f"LLM processing failed."} # Simplified error message for client
+            llm_chat_history.pop() 
+        yield {"error": f"LLM streaming failed.", "done": True}
+
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
@@ -149,23 +169,32 @@ if __name__ == '__main__':
     load_whisper_model() 
     loaded_llm = load_llm_model() 
     
-    if loaded_llm: # Check the return value, not the global directly in this test scope
-        logging.info("\n--- Testing LLM directly ---")
+    if loaded_llm: 
+        logging.info("\n--- Testing LLM Streaming directly ---")
         test_inputs = [
-            "Hello there!",
-            "Can you draw a square for me?",
+            "Hello Robotist!",
+            "Can you draw a very detailed and intricate dragon for me, make it red and breathing fire, on a mountain top?",
         ]
         for test_input in test_inputs:
             logging.info(f"\nUser Input: {test_input}")
-            # For direct test, ensure llm_instance is used if process_command_with_llm relies on global
-            # Or pass loaded_llm to a test-specific version of process_command_with_llm
-            # The current process_command_with_llm uses global llm_instance, which load_llm_model sets.
-            llm_chat_history.clear() # Clear history for isolated test
-            result = process_command_with_llm(test_input) 
-            if result.get("message"):
-                logging.info(f"LLM Response: {result['message']}")
-            elif result.get("error"):
-                logging.info(f"LLM Error: {result['error']}")
+            llm_chat_history.clear() 
+            
+            print("LLM Response (Streaming): ", end="", flush=True)
+            full_response_for_test = ""
+            # Note: process_command_with_llm_stream is a generator
+            for response_part in process_command_with_llm_stream(test_input):
+                if response_part.get("error"):
+                    print(f"\nError: {response_part['error']}")
+                    break
+                if response_part.get("chunk"):
+                    print(response_part["chunk"], end="", flush=True)
+                    full_response_for_test += response_part["chunk"]
+                if response_part.get("done"):
+                    print("\n--- Stream Ended ---")
+                    # logging.info(f"Test: Full assembled response: {full_response_for_test}") # Already logged inside
+                    break
+            print("\n") # Newline after each test input's full response
         llm_chat_history.clear() 
     else:
         logging.error("LLM model not loaded, skipping LLM direct test.")
+

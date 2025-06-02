@@ -38,7 +38,7 @@ function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState('Tap mic to start');
   const [transcribedText, setTranscribedText] = useState('');
-  const [llmResponse, setLlmResponse] = useState('');
+  const [llmResponse, setLlmResponse] = useState(''); // Will accumulate streaming response
   const audioStreamRef = useRef<MediaStream | null>(null);
 
 
@@ -60,7 +60,7 @@ function App() {
       setRobotStatusMessage('Robot: Disconnected (backend offline)');
       setIsDrawingActive(false); 
       setDrawingProgressMessage('');
-      setIsRecording(false); // Reset recording state on disconnect
+      setIsRecording(false); 
       setVoiceStatus('Tap mic to start');
     });
 
@@ -94,7 +94,7 @@ function App() {
         setLastUploadedImageInfo(`Received: ${data.original_filename || 'image'}. Ready for processing.`);
         setUploadedFilePathFromBackend(data.filepath_on_server);
         setQrCodeImage(null); setQrUploadUrl('');
-        setSelectedFile(null); setImagePreviewUrl(null);
+        setSelectedFile(null); setImagePreviewUrl(null); 
       } else {
         setLastUploadedImageInfo(`Upload Info: ${data.message}`);
         setUploadedFilePathFromBackend(null);
@@ -109,32 +109,58 @@ function App() {
       setDrawingProgressMessage(data.message);
     });
 
-    // Voice related socket events
     socket.on('transcription_result', (data: { text?: string, error?: string }) => {
         if (data.error) {
             setVoiceStatus(`Transcription Error: ${data.error}`);
             setTranscribedText('');
+            setLlmResponse(''); // Clear LLM response on transcription error
         } else if (data.text) {
-            setVoiceStatus('Transcription complete. Waiting for LLM...');
+            setVoiceStatus('Robotist is thinking...'); // Changed status
             setTranscribedText(data.text);
+            setLlmResponse(''); // Clear previous LLM response before new one streams
         }
-        // Potentially stop a "processing" animation here
     });
 
-    socket.on('llm_action_response', (data: { action?: any, message?: string, error?: string }) => {
+    // New listener for streaming LLM responses
+    socket.on('llm_response_chunk', (data: { chunk?: string, error?: string, done: boolean, final_message?: string }) => {
         if (data.error) {
-            setVoiceStatus(`LLM Error: ${data.error}`);
-            setLlmResponse('');
-        } else if (data.message) { // Assuming LLM might send a textual confirmation or clarification
-            setVoiceStatus('LLM processed command.');
-            setLlmResponse(data.message);
-        } else if (data.action) {
-             setVoiceStatus('LLM action received.');
-             // Here you would typically trigger further actions based on the LLM's structured output
-             // For now, just displaying it.
-             setLlmResponse(`Action: ${JSON.stringify(data.action)}`);
+            setLlmResponse(prev => prev + `\n[Error: ${data.error}]`);
+            setVoiceStatus('LLM processing error.');
+        } else if (data.chunk) {
+            setLlmResponse(prev => prev + data.chunk);
+            if (!data.done) {
+                setVoiceStatus('Robotist is typing...');
+            }
         }
-        // Potentially stop a "processing" animation here
+        
+        if (data.done) {
+            if (data.final_message && !data.error) { // If backend sends final assembled message
+                setLlmResponse(data.final_message); // Ensure final message is set correctly
+            }
+            setVoiceStatus('Ready for next command.'); // Or some other final status
+            if (data.error) {
+                 setVoiceStatus(`LLM Error: ${data.error}`);
+            } else if (!data.final_message && !data.chunk && !llmResponse) {
+                 // If stream ends with no content and no error, means it was just an empty completion
+                 setVoiceStatus('Robotist finished.');
+            }
+        }
+    });
+
+    // This listener might be deprecated if all LLM responses are streamed via 'llm_response_chunk'
+    // For now, keep it as a fallback or for non-streamed LLM actions if any.
+    socket.on('llm_action_response', (data: { action?: any, message?: string, error?: string }) => {
+        console.log("Received 'llm_action_response' (potentially fallback/non-streamed):", data);
+        if (data.error) {
+            setVoiceStatus(`LLM Error (Non-Streamed): ${data.error}`);
+            // setLlmResponse(''); // Decide if this should overwrite streamed response
+        } else if (data.message) { 
+            setVoiceStatus('LLM processed command (Non-Streamed).');
+            // setLlmResponse(data.message); // Decide if this should overwrite
+        } else if (data.action) {
+             setVoiceStatus('LLM action received (Non-Streamed).');
+             // setLlmResponse(`Action: ${JSON.stringify(data.action)}`); // Decide
+        }
     });
 
 
@@ -144,15 +170,15 @@ function App() {
             audioStreamRef.current.getTracks().forEach(track => track.stop());
         }
     };
-  }, []);
+  }, [llmResponse]); // Added llmResponse to dependency array for the 'done' check logic
 
-  // Robot Control Handlers (no change)
+  // Robot Control Handlers
   const handleConnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_connect_request', {}); }
   const handleDisconnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_disconnect_request', {}); }
   const sendGoHomeCommand = () => { if (!isDrawingActive && socket) socket.emit('send_robot_command', { type: 'go_home' }); }
   const sendSafeCenterCommand = () => { if (!isDrawingActive && socket) socket.emit('send_robot_command', { type: 'move_to_safe_center' }); }
   
-  // QR Code Request Handler (no change)
+  // QR Code Request Handler
   const requestQrCode = () => {
     if (socket && isConnectedToBackend && !isDrawingActive) {
       setQrCodeImage(null); setQrUploadUrl('Requesting QR Code...');
@@ -162,7 +188,7 @@ function App() {
     } else if (isDrawingActive) { alert("Cannot request QR code while drawing is in progress."); }
   };
 
-  // Direct File Input Handlers (no change)
+  // Direct File Input Handlers
   const processNewFile = (file: File | null) => {
     if (file && file.type.startsWith('image/')) {
       setSelectedFile(file); setImagePreviewUrl(URL.createObjectURL(file));
@@ -202,7 +228,7 @@ function App() {
     reader.readAsDataURL(selectedFile); 
   };
 
-  // Process and Draw (no change)
+  // Process and Draw
   const handleProcessAndDrawUploadedImage = () => {
     if (isDrawingActive) { alert("A drawing is already in progress."); return; }
     if (!isRobotConnected) { alert("Please connect to the robot first."); setLastCommandResponse("Error: Robot not connected."); return; }
@@ -222,11 +248,11 @@ function App() {
     }
     setVoiceStatus('Requesting mic permission...');
     setTranscribedText('');
-    setLlmResponse('');
+    setLlmResponse(''); // Clear previous LLM response
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioStreamRef.current = stream; // Store stream to stop it later
-        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' }); // or 'audio/wav' if backend prefers
+        audioStreamRef.current = stream; 
+        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' }); 
         audioChunks = [];
 
         mediaRecorder.ondataavailable = (event) => {
@@ -234,15 +260,14 @@ function App() {
         };
 
         mediaRecorder.onstop = () => {
-            setVoiceStatus('Processing voice...');
+            setVoiceStatus('Processing voice...'); // Initial status after stopping mic
             const audioBlob = new Blob(audioChunks, { type: mediaRecorder?.mimeType });
             
-            // Convert Blob to base64 to send over Socket.IO
             const reader = new FileReader();
             reader.onloadend = () => {
                 const base64Audio = (reader.result as string).split(',')[1];
                 if (socket && base64Audio) {
-                    console.log("Frontend: Sending audio_chunk (actually full audio as base64)");
+                    console.log("Frontend: Sending audio data for transcription.");
                     socket.emit('audio_chunk', { audioData: base64Audio, mimeType: mediaRecorder?.mimeType });
                 } else {
                     setVoiceStatus("Error: Could not send audio data.");
@@ -253,7 +278,6 @@ function App() {
             };
             reader.readAsDataURL(audioBlob);
 
-            // Stop microphone tracks
             if (audioStreamRef.current) {
                 audioStreamRef.current.getTracks().forEach(track => track.stop());
                 audioStreamRef.current = null;
@@ -266,7 +290,7 @@ function App() {
     } catch (err) {
         console.error("Error accessing microphone:", err);
         setVoiceStatus('Mic permission denied or error.');
-        if (audioStreamRef.current) { // Clean up if stream was partially acquired
+        if (audioStreamRef.current) { 
             audioStreamRef.current.getTracks().forEach(track => track.stop());
             audioStreamRef.current = null;
         }
@@ -277,7 +301,7 @@ function App() {
     if (mediaRecorder && isRecording) {
         mediaRecorder.stop();
         setIsRecording(false);
-        // Voice status will be updated by onstop handler
+        // Voice status will be updated by onstop handler, then by transcription_result, then by llm_response_chunk
     }
   };
 
@@ -295,29 +319,20 @@ function App() {
       <p>Backend Connection: {isConnectedToBackend ? 'Connected' : 'Disconnected'}</p>
       <hr />
 
-      {/* Voice Interaction Section */}
       <div className="voice-interaction-section" style={{ padding: '15px', border: '1px solid #555', borderRadius: '8px', marginBottom: '20px', textAlign: 'center' }}>
         <h2>Voice Command</h2>
         <button 
             onClick={handleMicButtonClick} 
             disabled={!isConnectedToBackend || isDrawingActive}
             style={{
-                backgroundColor: isRecording ? '#dc3545' : '#007bff', // Red when recording, Blue otherwise
-                color: 'white',
-                padding: '10px 20px',
-                fontSize: '1.2em',
-                borderRadius: '50%', // Make it round
-                width: '80px',
-                height: '80px',
-                border: 'none',
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center'
+                backgroundColor: isRecording ? '#dc3545' : '#007bff', 
+                color: 'white', padding: '10px 20px', fontSize: '1.2em',
+                borderRadius: '50%', width: '80px', height: '80px',
+                border: 'none', cursor: 'pointer', display: 'flex',
+                alignItems: 'center', justifyContent: 'center'
             }}
             title={isRecording ? "Stop Recording" : "Start Recording"}
         >
-            {/* Simple Mic SVG Icon */}
             <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" fill="currentColor" viewBox="0 0 16 16">
                 <path d="M5 3a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0V3z"/>
                 <path d="M3.5 6.5A.5.5 0 0 1 4 7v1a4 4 0 0 0 8 0V7a.5.5 0 0 1 1 0v1a5 5 0 0 1-4.5 4.975V15h3a.5.5 0 0 1 0 1h-7a.5.5 0 0 1 0-1h3v-2.025A5 5 0 0 1 3 8V7a.5.5 0 0 1 .5-.5z"/>
@@ -325,12 +340,11 @@ function App() {
         </button>
         <p style={{ marginTop: '10px', minHeight: '20px' }}>{voiceStatus}</p>
         {transcribedText && <p><b>You said:</b> {transcribedText}</p>}
-        {llmResponse && <p><b>LLM:</b> {llmResponse}</p>}
+        {llmResponse && <p style={{whiteSpace: 'pre-wrap'}}><b>Robotist:</b> {llmResponse}</p>} {/* Added pre-wrap for newlines */}
       </div>
       
       <hr />
       <h2>Image Input</h2>
-      {/* Image input sections remain the same */}
       <div className="image-input-methods" style={{ display: 'flex', justifyContent: 'space-around', marginBottom: '20px' }}>
         <div className="qr-upload-section" style={{border: '1px solid #555', padding: '15px', borderRadius: '8px', width: '45%'}}>
           <h3>Upload via QR Code</h3>
@@ -356,7 +370,6 @@ function App() {
 
       <hr />
       <h2>Robot Control</h2>
-      {/* Robot control buttons remain the same, but also disabled if recording */}
       <button onClick={handleConnectRobot} disabled={!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording}> Connect to Robot </button>
       <button onClick={handleDisconnectRobot} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording}> Disconnect (Graceful) </button>
       <br />
