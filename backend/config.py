@@ -46,7 +46,7 @@ AUDIO_TEMP_FOLDER = 'audio_tmp' # Relative to the backend directory
 
 # --- LLM Settings ---
 # IMPORTANT: Replace with the actual filename of your downloaded GGUF model
-LLM_MODEL_FILENAME = "phi-3-mini-instruct.Q4_K_M.gguf" # Example filename
+LLM_MODEL_FILENAME = "Phi-3-mini-4k-instruct-q4.gguf"
 LLM_MAX_TOKENS = 512 # Max tokens for LLM response
 LLM_TEMPERATURE = 0.3 # Temperature for LLM response
 LLM_N_CTX = 2048 # Context window size for the LLM

@@ -13,8 +13,14 @@ import qrcode
 from io import BytesIO
 import base64 
 import socket
-import time # For potential delays between commands
-from image_processing_engine import process_image_to_robot_commands_pipeline
+import time 
+import logging # For more controlled logging
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO) # Set to logging.DEBUG for more verbose output if needed
+logging.getLogger('engineio.server').setLevel(logging.WARNING) # Reduce engineio verbosity
+logging.getLogger('socketio.server').setLevel(logging.WARNING) # Reduce socketio server verbosity
+
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_very_secret_key_here!'
@@ -24,24 +30,31 @@ app.config['AUDIO_TEMP_FOLDER_PATH'] = os.path.join(os.path.dirname(__file__), c
 # Create upload and audio temp directories if they don't exist
 if not os.path.exists(app.config['UPLOAD_FOLDER']):
     os.makedirs(app.config['UPLOAD_FOLDER'])
-    print(f"Created image upload folder at: {app.config['UPLOAD_FOLDER']}")
+    logging.info(f"Created image upload folder at: {app.config['UPLOAD_FOLDER']}")
 
 if not os.path.exists(app.config['AUDIO_TEMP_FOLDER_PATH']):
     os.makedirs(app.config['AUDIO_TEMP_FOLDER_PATH'])
-    print(f"Created temporary audio folder at: {app.config['AUDIO_TEMP_FOLDER_PATH']}")
+    logging.info(f"Created temporary audio folder at: {app.config['AUDIO_TEMP_FOLDER_PATH']}")
 
 # Load AI models when the application starts
-print("Attempting to load Whisper model...")
-load_whisper_model()
-print("Whisper model loading initiated.")
+logging.info("--- Initializing AI Models ---")
+whisper_model_loaded = load_whisper_model()
+if whisper_model_loaded:
+    logging.info("Whisper model loaded successfully during startup.")
+else:
+    logging.error("Whisper model FAILED to load during startup.")
 
-print("Attempting to load LLM model...")
-load_llm_model()
-print("LLM model loading initiated.")
+llm_instance = load_llm_model() # This function now returns the model or None
+if llm_instance:
+    logging.info("LLM model loaded successfully during startup.")
+else:
+    logging.error("LLM model FAILED to load during startup. Check voice_assistant.py and model path in config.py.")
+logging.info("--- AI Model Initialization Complete ---")
 
 
+# Remove engineio_logger=True to reduce verbosity of raw packet data
+# logger=True can still be useful for SocketIO specific logs if needed, but basic logging above is better.
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet',
-                    logger=True, engineio_logger=True,
                     max_http_buffer_size=10 * 1024 * 1024) 
 robot = RobotInterface() 
 
@@ -140,7 +153,7 @@ def handle_qr_upload_page(session_id):
 
 @socketio.on('connect')
 def handle_connect():
-    print(f"Client connected: {request.sid}")
+    logging.info(f"Client connected: {request.sid}")
     emit('response', {'data': 'Connected to Python backend!'})
     emit('robot_connection_status', {'success': robot.is_connected,
                                      'message': 'Connected to robot' if robot.is_connected else 'Not connected to robot'})
@@ -148,7 +161,7 @@ def handle_connect():
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    print(f"Client disconnected: {request.sid}")
+    logging.info(f"Client disconnected: {request.sid}")
 
 # ... (other handlers like robot_connect_request, robot_disconnect_request, send_robot_command remain the same) ...
 @socketio.on('robot_connect_request')
@@ -265,9 +278,10 @@ def handle_direct_image_upload(data):
 
 @socketio.on('audio_chunk') 
 def handle_audio_chunk(data):
-    print("--- backend: 'audio_chunk' event received ---")
+    logging.info("--- API: 'audio_chunk' event received ---")
     global is_drawing_active
     if is_drawing_active: 
+        logging.warning("API: Drawing is active, ignoring audio chunk.")
         emit('transcription_result', {'error': 'Drawing is active, cannot process voice command now.'})
         return
 
@@ -275,13 +289,17 @@ def handle_audio_chunk(data):
     mime_type = data.get('mimeType', 'audio/webm') 
     
     if not audio_data_b64:
+        logging.error("API: No audio data (audioData key) in received chunk.")
         emit('transcription_result', {'error': 'No audio data received.'})
         return
     
-    print(f"Backend: Received audio data. Mime type: {mime_type}. Base64 data length: {len(audio_data_b64)}")
+    # Log only a small part of the base64 string to avoid flooding the console
+    logging.info(f"API: Received audio data. Mime type: {mime_type}. Base64 preview: {audio_data_b64[:30]}...")
 
     try:
         audio_bytes = base64.b64decode(audio_data_b64)
+        logging.info(f"API: Base64 decoded. Byte length: {len(audio_bytes)}")
+        
         file_extension = ".webm"
         if 'wav' in mime_type: file_extension = ".wav"
         elif 'mp3' in mime_type: file_extension = ".mp3"
@@ -290,36 +308,37 @@ def handle_audio_chunk(data):
         temp_audio_filepath = os.path.join(app.config['AUDIO_TEMP_FOLDER_PATH'], temp_audio_filename)
         
         with open(temp_audio_filepath, 'wb') as f: f.write(audio_bytes)
-        print(f"Backend: Temporary audio file saved: {temp_audio_filepath}")
+        logging.info(f"API: Temporary audio file saved: {temp_audio_filepath}")
 
         transcribed_text = transcribe_audio(temp_audio_filepath) 
 
         if transcribed_text is not None:
+            logging.info(f"API: Transcription successful: '{transcribed_text}'")
             emit('transcription_result', {'text': transcribed_text})
             
-            # --- New: Process with LLM ---
-            print(f"Backend: Sending transcribed text to LLM: '{transcribed_text}'")
-            llm_result = process_command_with_llm(transcribed_text) # from voice_assistant.py
-            print(f"Backend: LLM processing result: {llm_result}")
-            emit('llm_action_response', llm_result) # Send LLM result to frontend
-            # --- End New ---
+            logging.info(f"API: Sending transcribed text to LLM: '{transcribed_text}'")
+            llm_result = process_command_with_llm(transcribed_text) 
+            logging.info(f"API: LLM processing result: {llm_result}")
+            emit('llm_action_response', llm_result)
         else:
+            logging.error("API: Transcription failed (transcribe_audio returned None).")
             emit('transcription_result', {'error': 'Transcription failed on server.'})
-            # Also emit an LLM error in this case so frontend isn't stuck waiting
             emit('llm_action_response', {'error': 'Cannot process with LLM, transcription failed.'})
-
 
         try:
             os.remove(temp_audio_filepath)
+            logging.info(f"API: Temporary audio file removed: {temp_audio_filepath}")
         except Exception as e:
-            print(f"Backend Warning: Error removing temporary audio file {temp_audio_filepath}: {e}")
+            logging.warning(f"API Warning: Error removing temporary audio file {temp_audio_filepath}: {e}")
 
     except base64.binascii.Error as b64e:
+        logging.error(f"API Error: Base64 decoding failed. {b64e}")
         emit('transcription_result', {'error': 'Invalid audio data format (base64 decode).'})
         emit('llm_action_response', {'error': 'Cannot process with LLM, audio data error.'})
     except Exception as e:
-        emit('transcription_result', {'error': f'Server error processing audio: {str(e)}'})
-        emit('llm_action_response', {'error': f'Cannot process with LLM, server error: {str(e)}'})
+        logging.error(f"API Error: Error processing audio chunk: {e}", exc_info=True) # Log full exception
+        emit('transcription_result', {'error': f'Server error processing audio.'})
+        emit('llm_action_response', {'error': f'Cannot process with LLM, server error.'})
 
 
 # ... (process_image_for_drawing handler remains the same) ...
@@ -395,8 +414,8 @@ if __name__ == '__main__':
     server_port = 5555 
     app.config['SERVER_PORT'] = server_port 
 
-    print(f"Starting Python backend server (SocketIO with Flask) on port {server_port}...")
-    print(f"Frontend should connect to ws://localhost:{server_port}")
-    print(f"QR code upload page will be accessible via http://<YOUR_LOCAL_IP>:{server_port}/qr_upload_page/<session_id>")
+    logging.info(f"Starting Python backend server (SocketIO with Flask) on port {server_port}...")
+    logging.info(f"Frontend should connect to ws://localhost:{server_port}")
+    logging.info(f"QR code upload page will be accessible via http://<YOUR_LOCAL_IP>:{server_port}/qr_upload_page/<session_id>")
     
     socketio.run(app, host='0.0.0.0', port=server_port, debug=True, use_reloader=False)
