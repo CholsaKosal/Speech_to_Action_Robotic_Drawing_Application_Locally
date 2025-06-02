@@ -42,4 +42,13 @@ DEFAULT_CANNY_THRESHOLD1 = 50
 DEFAULT_CANNY_THRESHOLD2 = 150
 
 # --- Temporary Audio File Settings ---
-AUDIO_TEMP_FOLDER = 'audio_tmp' # Relative to the backend directory for storing temporary audio files
+AUDIO_TEMP_FOLDER = 'audio_tmp' # Relative to the backend directory
+
+# --- LLM Settings ---
+# IMPORTANT: Replace with the actual filename of your downloaded GGUF model
+LLM_MODEL_FILENAME = "phi-3-mini-instruct.Q4_K_M.gguf" # Example filename
+LLM_MAX_TOKENS = 512 # Max tokens for LLM response
+LLM_TEMPERATURE = 0.3 # Temperature for LLM response
+LLM_N_CTX = 2048 # Context window size for the LLM
+LLM_N_GPU_LAYERS = 0 # Number of layers to offload to GPU. 0 for CPU only. 
+                     # If you have a compatible GPU and llama-cpp-python with GPU support, you can increase this.
