@@ -159,8 +159,8 @@ echo Look under "Display Devices" in that file for VRAM information (e.g., "Disp
     *(Note: `requirements.txt` should be kept up-to-date with all necessary backend libraries like Flask, opencv-python, Pillow, qrcode, numpy, `openai-whisper`, `llama-cpp-python`, etc.)*
 7.  **Download AI Models:**
     * **Whisper models** are typically downloaded automatically by the `openai-whisper` library on first use (e.g., the "base" model).
-    * **LLM model (e.g., Phi-3 Mini Instruct GGUF):**
-        * Download the desired GGUF model file (e.g., a Q4\_K\_M quantized version of Phi-3 Mini Instruct) from Hugging Face Hub.
+    * **LLM model (e.g., deepseek-llm-7b-chat GGUF GGUF):**
+        * Download the desired GGUF model file (e.g., a Q4\_K\_M quantized version of deepseek-llm-7b-chat GGUF) from Hugging Face Hub.
         * Create a directory `backend/models/`.
         * Place the downloaded `.gguf` file into `backend/models/`.
         * Ensure the `LLM_MODEL_FILENAME` in `backend/config.py` matches the name of this file.
@@ -274,7 +274,7 @@ This script helps generate a snapshot of the current codebase, excluding large o
   * **API Documentation (Frontend-Backend):** As the WebSocket/HTTP API between the frontend and backend evolves, document the message formats, endpoints, and expected data structures.
   * **LLM and STT Model Management:**
       * Models are stored locally (e.g., in `backend/models/`, which is gitignored).
-      * Document which specific models and quantization levels are being used (e.g., Whisper 'base', Phi-3 Mini Instruct Q4\_K\_M GGUF).
+      * Document which specific models and quantization levels are being used (e.g., Whisper 'base', deepseek-llm-7b-chat GGUF Q4\_K\_M GGUF).
   * **Dependencies:** Keep `backend/requirements.txt` and `frontend/s2a-drawing-ui/package.json` up-to-date.
   * **Troubleshooting:**
       * Check backend logs for Python errors.

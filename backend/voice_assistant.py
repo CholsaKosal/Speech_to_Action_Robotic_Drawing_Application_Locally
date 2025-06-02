@@ -5,6 +5,7 @@ import time
 from llama_cpp import Llama
 import config # Import your project's config
 import logging # For better logging
+import json # For parsing structured commands
 
 # --- Whisper STT Model ---
 WHISPER_MODEL_SIZE = "base" 
@@ -74,10 +75,11 @@ def load_llm_model():
                 model_path=model_path,
                 n_ctx=config.LLM_N_CTX,         
                 n_gpu_layers=config.LLM_N_GPU_LAYERS, 
-                verbose=True # Llama.cpp internal logging
+                # chat_format="chatml", # Try if default formatting is off for DeepSeek
+                verbose=True 
             )
             logging.info(f"LLM model ({model_filename}) loaded successfully into llm_instance.")
-            return llm_instance # Return the loaded model
+            return llm_instance 
         except Exception as e:
             logging.error(f"Error loading LLM model from {model_path}: {e}", exc_info=True)
             llm_instance = None
@@ -88,33 +90,50 @@ def load_llm_model():
 def process_command_with_llm_stream(text_input):
     """
     Processes the transcribed text with the LLM and yields response chunks (streaming).
+    Attempts to extract a structured command from the LLM's full response.
     """
     global llm_instance, llm_chat_history 
     if llm_instance is None:
         logging.error("LLM model (llm_instance) is not loaded. Cannot process command.")
         if load_llm_model() is None: 
             yield {"error": "LLM not available (failed to load).", "done": True}
-            return # Important to return after yielding the error
+            return 
 
-    MAX_HISTORY_TURNS = 4 
+    MAX_HISTORY_TURNS = 3 
     if len(llm_chat_history) > MAX_HISTORY_TURNS * 2:
         llm_chat_history = llm_chat_history[-(MAX_HISTORY_TURNS * 2):]
 
     llm_chat_history.append({"role": "user", "content": text_input})
     
     system_prompt = (
-        "You are 'Robotist', the intelligent AI controlling a robotic drawing arm. Your primary functions are to:\n" # Updated name
-        "1.  Understand and execute drawing commands (e.g., 'Draw a house', 'Sketch a flower').\n"
-        "2.  Understand and execute robot movement commands (e.g., 'Go home', 'Move to the center').\n"
-        "3.  Engage in helpful and friendly conversation with the user about your capabilities, drawing tasks, or general topics.\n\n"
-        "When you receive a command that involves a robot action (drawing or movement):\n"
-        "- Clearly acknowledge the command.\n"
-        "- If the command is clear, confirm the action you will take. For example, if the user says 'Draw a red square', respond with something like: 'Okay, I will draw a red square.'\n"
-        "- If the command is ambiguous or lacks detail (e.g., 'Draw something'), ask for clarification. For example: 'Sure, what would you like me to draw?'\n\n"
-        "For general conversation (e.g., 'Hello', 'How are you?', 'What can you draw?'):\n"
-        "- Respond naturally, politely, and concisely.\n\n"
-        "Keep your responses focused and to the point. Avoid overly long explanations unless specifically asked.\n"
-        "Your goal is to be a helpful and efficient interface to the robot arm."
+        "## IDENTITY AND ROLE: YOU ARE ROBOTIST! ##\n"
+        "YOU ARE ROBOTIST, a specialized AI assistant that CONTROLS a physical robotic drawing arm. Your ONLY identity is Robotist. "
+        "DO NOT mention being Phi or any other AI. DO NOT say you are developed by Microsoft or any other company. YOU ARE ROBOTIST.\n"
+        "Your primary purpose is to assist users with drawing tasks and robot control through clear, friendly, and concise conversation, always as Robotist.\n\n"
+        "## ROBOTIST'S CORE FUNCTIONS ##\n"
+        "1.  **Drawing Commands:** Understand and CONFIRM requests like 'Robotist, draw a house with a red door' or 'Robotist, sketch a flower'. You will then initiate the drawing process through the robot arm.\n"
+        "2.  **Robot Movement:** Understand and CONFIRM commands like 'Robotist, go to your home position' or 'Robotist, move to the center of the paper'. You will then initiate the robot movement.\n"
+        "3.  **Conversation (as Robotist):** Chat about drawing, your capabilities as Robotist, or provide general assistance related to your functions. Always maintain the Robotist persona.\n\n"
+        "## INTERACTION GUIDELINES & COMMAND STRUCTURE ##\n"
+        "- **Always identify as Robotist.**\n"
+        "- **Greetings:** Respond as Robotist. Example: User: 'Hello' -> Robotist: 'Hello! Robotist here. How can I help you draw today?'\n"
+        "- **Capability Questions:** If asked 'What can you do?', respond: 'As Robotist, I can control this arm to draw what you describe, move the arm, and chat about our drawing projects. What would you like to create?'\n"
+        "- **Action Commands (Drawing/Movement):**\n"
+        "  1. Acknowledge the command naturally (e.g., 'Okay, you'd like me to draw a red circle.').\n"
+        "  2. State your intention to perform the action (e.g., 'I will now draw a red circle.').\n"
+        "  3. **CRITICAL FOR SYSTEM:** After your natural language response, if it's an actionable command, append the special token `ACTION_CMD:` followed by a valid JSON object describing the command. This JSON is for system processing and should not be part of your spoken response to the user.\n"
+        "     - Example User: 'Robotist, draw a blue square.'\n"
+        "     - Example Robotist Spoken Response: 'Alright, a blue square it is! I will draw a blue square.'\n"
+        "     - Example Robotist Appended System Command: `ACTION_CMD: {\"type\": \"draw\", \"parameters\": {\"shape\": \"square\", \"color\": \"blue\"}}`\n\n"
+        "     - Example User: 'Robotist, go home.'\n"
+        "     - Example Robotist Spoken Response: 'Certainly! Moving to the home position.'\n"
+        "     - Example Robotist Appended System Command: `ACTION_CMD: {\"type\": \"move\", \"parameters\": {\"target\": \"home\"}}`\n\n"
+        "     - Example User: 'What can you draw?' (This is conversational)\n"
+        "     - Example Robotist Spoken Response: 'I can draw various shapes like circles, squares, triangles, and simple objects. What did you have in mind?' (No ACTION_CMD needed here)\n"
+        "- **Clarification:** If a command is vague, ask for more details. E.g., 'Draw something.' -> Robotist: 'I can try! What kind of object or shape would you like me to draw?' (No ACTION_CMD needed for clarification questions).\n"
+        "- **YOU CAN DRAW:** When asked to draw, DO NOT say you are an AI that cannot physically draw. You are the interface to a robot that DOES draw. Confirm the drawing command positively.\n"
+        "- **Be Concise:** Keep conversational responses brief and to the point.\n\n"
+        "You are Robotist. Begin."
     )
     
     messages_for_llm = [
@@ -126,12 +145,11 @@ def process_command_with_llm_stream(text_input):
     full_assistant_response = ""
     try:
         start_time = time.time()
-        # Use stream=True to get a generator
         stream = llm_instance.create_chat_completion(
             messages=messages_for_llm,
             max_tokens=config.LLM_MAX_TOKENS,
-            temperature=config.LLM_TEMPERATURE,
-            stream=True  # Enable streaming
+            temperature=config.LLM_TEMPERATURE, 
+            stream=True 
         )
         
         logging.info("LLM stream initiated.")
@@ -139,22 +157,56 @@ def process_command_with_llm_stream(text_input):
             delta = chunk['choices'][0]['delta']
             content_piece = delta.get('content')
             
-            if content_piece: # Check if there's new content in this chunk
-                # logging.debug(f"LLM Stream chunk {chunk_index}: '{content_piece}'") # Can be very verbose
+            if content_piece: 
                 yield {"chunk": content_piece, "done": False}
                 full_assistant_response += content_piece
             
-            # Check if the stream is finished (OpenAI-like API often sends a finish_reason)
             if chunk['choices'][0].get('finish_reason') is not None:
                 logging.info(f"LLM stream finished. Reason: {chunk['choices'][0]['finish_reason']}")
                 break 
         
         end_time = time.time()
         logging.info(f"LLM full response streamed in {end_time - start_time:.2f} seconds.")
-        logging.info(f"LLM Final Assembled Output: {full_assistant_response}")
+        logging.info(f"LLM Final Assembled Output (raw): {full_assistant_response}")
 
-        llm_chat_history.append({"role": "assistant", "content": full_assistant_response})
-        yield {"chunk": "", "done": True, "final_message": full_assistant_response} # Signal end of stream
+        # --- Attempt to extract and parse ACTION_CMD ---
+        parsed_action_command = None
+        natural_language_response = full_assistant_response # Default to full response
+
+        action_cmd_marker = "ACTION_CMD:"
+        if action_cmd_marker in full_assistant_response:
+            parts = full_assistant_response.split(action_cmd_marker, 1)
+            natural_language_response = parts[0].strip() # Text before ACTION_CMD
+            action_json_str = parts[1].strip()
+            logging.info(f"Found ACTION_CMD marker. JSON string part: {action_json_str}")
+            try:
+                # Attempt to find the first '{' and last '}' to isolate the JSON object
+                # This is a basic attempt and might need refinement for complex cases
+                json_start = action_json_str.find('{')
+                json_end = action_json_str.rfind('}')
+                if json_start != -1 and json_end != -1 and json_end > json_start:
+                    potential_json = action_json_str[json_start : json_end+1]
+                    logging.info(f"Attempting to parse JSON: {potential_json}")
+                    parsed_action_command = json.loads(potential_json)
+                    logging.info(f"Successfully parsed ACTION_CMD: {parsed_action_command}")
+                else:
+                    logging.warning("Could not properly isolate JSON object within ACTION_CMD string.")
+            except json.JSONDecodeError as e:
+                logging.warning(f"JSONDecodeError parsing ACTION_CMD: {e}. String was: {action_json_str}")
+            except Exception as e:
+                logging.warning(f"Generic error parsing ACTION_CMD: {e}")
+        
+        llm_chat_history.append({"role": "assistant", "content": natural_language_response}) # Store only natural response in history
+        
+        final_response_payload = {
+            "chunk": "", 
+            "done": True, 
+            "final_message": natural_language_response # Send the spoken part to frontend
+        }
+        if parsed_action_command:
+            final_response_payload["parsed_action"] = parsed_action_command
+        
+        yield final_response_payload
 
     except Exception as e:
         logging.error(f"Error during LLM streaming: {e}", exc_info=True)
@@ -172,28 +224,35 @@ if __name__ == '__main__':
     if loaded_llm: 
         logging.info("\n--- Testing LLM Streaming directly ---")
         test_inputs = [
-            "Hello Robotist!",
-            "Can you draw a very detailed and intricate dragon for me, make it red and breathing fire, on a mountain top?",
+            "Hello Robotist",
+            "What can you do?",
+            "Robotist draw a red square",
+            "Move home"
         ]
         for test_input in test_inputs:
             logging.info(f"\nUser Input: {test_input}")
             llm_chat_history.clear() 
             
-            print("LLM Response (Streaming): ", end="", flush=True)
-            full_response_for_test = ""
-            # Note: process_command_with_llm_stream is a generator
+            print(f"Robotist Response (Streaming for '{test_input}'): ", end="", flush=True)
+            final_parsed_action_for_test = None
+            final_natural_response_for_test = ""
+
             for response_part in process_command_with_llm_stream(test_input):
                 if response_part.get("error"):
                     print(f"\nError: {response_part['error']}")
                     break
-                if response_part.get("chunk"):
+                if response_part.get("chunk"): # This is the streaming text for display
                     print(response_part["chunk"], end="", flush=True)
-                    full_response_for_test += response_part["chunk"]
+                
                 if response_part.get("done"):
                     print("\n--- Stream Ended ---")
-                    # logging.info(f"Test: Full assembled response: {full_response_for_test}") # Already logged inside
+                    final_natural_response_for_test = response_part.get("final_message", "")
+                    if response_part.get("parsed_action"):
+                        final_parsed_action_for_test = response_part.get("parsed_action")
+                        logging.info(f"TEST: Extracted Parsed Action: {final_parsed_action_for_test}")
+                    # logging.info(f"TEST: Final Natural Language Response: {final_natural_response_for_test}")
                     break
-            print("\n") # Newline after each test input's full response
+            print("\n") 
         llm_chat_history.clear() 
     else:
         logging.error("LLM model not loaded, skipping LLM direct test.")
