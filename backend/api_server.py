@@ -5,7 +5,7 @@ from robot_interface import RobotInterface
 import config # Your existing config
 from image_processing_engine import process_image_to_robot_commands_pipeline
 # Import STT and LLM functions from voice_assistant
-from voice_assistant import transcribe_audio, load_whisper_model, load_llm_model, process_command_with_llm_stream # Updated import
+from voice_assistant import transcribe_audio, load_whisper_model, load_llm_model, process_command_with_llm_stream 
 
 import os
 import uuid
@@ -16,10 +16,15 @@ import socket
 import time 
 import logging # For more controlled logging
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO) 
+# Configure basic logging with timestamps
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(name)s - %(module)s - %(funcName)s - %(lineno)d - %(message)s'
+)
+# Reduce verbosity of external libraries if desired
 logging.getLogger('engineio.server').setLevel(logging.WARNING) 
 logging.getLogger('socketio.server').setLevel(logging.WARNING) 
+logging.getLogger('werkzeug').setLevel(logging.WARNING) # Quiets down Flask's HTTP request logs unless error
 
 
 app = Flask(__name__)
@@ -129,7 +134,6 @@ def handle_qr_upload_page(session_id):
             _, f_ext = os.path.splitext(original_filename)
             if f_ext.lower() not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
                  return jsonify({"error": "Invalid file type."}), 400
-
             filename_on_server = str(uuid.uuid4()) + f_ext
             filepath_on_server = os.path.join(app.config['UPLOAD_FOLDER'], filename_on_server)
             try:
@@ -179,11 +183,14 @@ def handle_robot_disconnect_request(json_data):
     emit('robot_connection_status', {'success': robot.is_connected, 'message': message if success else "Failed to disconnect"})
 
 @socketio.on('send_robot_command') 
-def handle_send_robot_command(json_data):
+def handle_send_robot_command(json_data, triggered_by_llm=False): 
     global is_drawing_active
     if is_drawing_active:
-        emit('command_response', {'success': False, 'message': 'Cannot send manual commands while drawing is active.', 'command_sent': json_data.get('type', 'N/A')})
-        return
+        if triggered_by_llm:
+            logging.warning("LLM tried to send command while drawing active.")
+        else:
+            emit('command_response', {'success': False, 'message': 'Cannot send manual commands while drawing is active.', 'command_sent': json_data.get('type', 'N/A')})
+        return False, "Drawing is active." # Indicate failure
 
     command_type = json_data.get('type', 'raw')
     command_str = json_data.get('command_str') 
@@ -191,8 +198,9 @@ def handle_send_robot_command(json_data):
     if not robot.is_connected and command_type not in ['go_home']:
         conn_success, conn_message = robot.connect_robot()
         if not conn_success:
-            emit('command_response', {'success': False, 'message': f'Robot not connected & connection failed: {conn_message}', 'command_sent': command_type})
-            return
+            if not triggered_by_llm: 
+                emit('command_response', {'success': False, 'message': f'Robot not connected & connection failed: {conn_message}', 'command_sent': command_type})
+            return False, f'Robot not connected & connection failed: {conn_message}' 
         emit('robot_connection_status', {'success': True, 'message': conn_message})
 
     success, message = False, "Invalid command type"
@@ -212,10 +220,14 @@ def handle_send_robot_command(json_data):
     elif command_type == 'raw' and not command_str:
         message = "No command_str provided for raw command."
         actual_command_sent = "N/A"
-        
-    emit('command_response', {'success': success, 'message': message, 'command_sent': actual_command_sent})
+    
+    if not triggered_by_llm: 
+        emit('command_response', {'success': success, 'message': message, 'command_sent': actual_command_sent})
+    
     if not robot.is_connected: 
          emit('robot_connection_status', {'success': False, 'message': 'Disconnected (possibly due to command error/timeout)'})
+    
+    return success, message 
 
 
 @socketio.on('request_qr_code')
@@ -224,7 +236,6 @@ def handle_request_qr_code(data):
     if is_drawing_active:
         emit('qr_code_data', {'error': 'Drawing is currently active. Cannot generate new QR code.'})
         return
-
     current_upload_session_id = str(uuid.uuid4())
     host_ip = request.host.split(':')[0]
     if host_ip == '127.0.0.1' or host_ip == 'localhost':
@@ -233,7 +244,6 @@ def handle_request_qr_code(data):
             s.settimeout(0.1); s.connect(("8.8.8.8", 80)); host_ip = s.getsockname()[0]; s.close()
         except Exception as e:
             host_ip = '127.0.0.1'
-    
     server_port = app.config.get('SERVER_PORT', 5555) 
     upload_url = f"http://{host_ip}:{server_port}/qr_upload_page/{current_upload_session_id}"
     qr_img = qrcode.make(upload_url); img_io = BytesIO(); qr_img.save(img_io, 'PNG'); img_io.seek(0)
@@ -246,10 +256,8 @@ def handle_direct_image_upload(data):
     if is_drawing_active:
         emit('direct_image_upload_response', {'success': False, 'message': 'Cannot upload image while drawing is active.'})
         return
-
     original_filename = data.get('filename')
     base64_data = data.get('fileData')
-
     if not original_filename or not base64_data:
         emit('direct_image_upload_response', {'success': False, 'message': 'Missing filename or file data.'})
         return
@@ -275,13 +283,7 @@ def handle_direct_image_upload(data):
 @socketio.on('audio_chunk') 
 def handle_audio_chunk(data):
     logging.info("--- API: 'audio_chunk' event received ---")
-    global is_drawing_active
-    if is_drawing_active: 
-        logging.warning("API: Drawing is active, ignoring audio chunk.")
-        emit('transcription_result', {'error': 'Drawing is active, cannot process voice command now.'})
-        # Also inform frontend that LLM processing won't happen
-        emit('llm_response_chunk', {'error': 'Drawing is active.', 'done': True})
-        return
+    global is_drawing_active 
 
     audio_data_b64 = data.get('audioData')
     mime_type = data.get('mimeType', 'audio/webm') 
@@ -312,19 +314,44 @@ def handle_audio_chunk(data):
 
         if transcribed_text is not None:
             logging.info(f"API: Transcription successful: '{transcribed_text}'")
-            emit('transcription_result', {'text': transcribed_text}) # Send full transcription once
+            emit('transcription_result', {'text': transcribed_text}) 
             
             logging.info(f"API: Streaming transcribed text to LLM: '{transcribed_text}'")
-            # Iterate through the generator from process_command_with_llm_stream
+            parsed_action_command_from_llm = None 
+
             for llm_response_part in process_command_with_llm_stream(transcribed_text):
-                # llm_response_part will be like {"chunk": "text part", "done": False} or {"error": "...", "done": True}
-                # logging.debug(f"API: Emitting LLM chunk: {llm_response_part}") # Can be very verbose
-                emit('llm_response_chunk', llm_response_part) # New event for streaming
+                emit('llm_response_chunk', llm_response_part) 
                 if llm_response_part.get("done"):
-                    logging.info("API: LLM stream finished or error occurred.")
-                    break # Exit loop once done or error
-        else:
-            logging.error("API: Transcription failed (transcribe_audio returned None).")
+                    logging.info("API: LLM stream finished or error occurred during stream.")
+                    if llm_response_part.get("parsed_action"):
+                        parsed_action_command_from_llm = llm_response_part["parsed_action"]
+                    break 
+            
+            if parsed_action_command_from_llm:
+                logging.info(f"API: Processing parsed action from LLM: {parsed_action_command_from_llm}")
+                action_type = parsed_action_command_from_llm.get("type")
+                parameters = parsed_action_command_from_llm.get("parameters", {})
+
+                if is_drawing_active:
+                    logging.warning(f"API: Drawing is active. LLM command '{action_type}' will not be executed now.")
+                elif action_type == "move":
+                    target = parameters.get("target")
+                    if target == "home":
+                        logging.info("API: Executing LLM command: move home")
+                        handle_send_robot_command({'type': 'go_home'}, triggered_by_llm=True)
+                    elif target == "center":
+                        logging.info("API: Executing LLM command: move to safe center")
+                        handle_send_robot_command({'type': 'move_to_safe_center'}, triggered_by_llm=True)
+                    else:
+                        logging.warning(f"API: LLM move command with unknown target: {target}")
+                elif action_type == "draw":
+                    shape = parameters.get("shape", "unknown shape")
+                    color = parameters.get("color", "")
+                    logging.info(f"API: LLM command: draw {color} {shape}. Feature not fully implemented for direct drawing.")
+                else:
+                    logging.info(f"API: LLM identified action type '{action_type}', but no handler implemented yet.")
+        else: 
+            logging.error("API: Transcription failed.")
             emit('transcription_result', {'error': 'Transcription failed on server.'})
             emit('llm_response_chunk', {'error': 'Cannot process with LLM, transcription failed.', 'done': True})
 
@@ -343,41 +370,32 @@ def handle_audio_chunk(data):
         emit('transcription_result', {'error': f'Server error processing audio.'})
         emit('llm_response_chunk', {'error': f'Cannot process with LLM, server error.', 'done': True})
 
-
 @socketio.on('process_image_for_drawing')
 def handle_process_image_for_drawing(data):
     global is_drawing_active
     if is_drawing_active:
         emit('command_response', {'success': False, 'message': "Another drawing is already in progress."})
         return
-
     filepath_on_server = data.get('filepath')
     original_filename = data.get('original_filename', os.path.basename(filepath_on_server or "unknown_image"))
-
     if not filepath_on_server or not os.path.exists(filepath_on_server):
         emit('command_response', {'success': False, 'message': f"File not found: {filepath_on_server}"})
         return
-
     emit('drawing_status_update', {'active': True, 'message': f"Processing '{original_filename}'..."})
     is_drawing_active = True
-    
     canny_t1 = data.get('canny_t1', config.DEFAULT_CANNY_THRESHOLD1) 
     canny_t2 = data.get('canny_t2', config.DEFAULT_CANNY_THRESHOLD2)
-    
     try:
         robot_commands_tuples = process_image_to_robot_commands_pipeline(
             filepath_on_server, canny_thresh1=canny_t1, canny_thresh2=canny_t2
         )
-
         if not robot_commands_tuples:
             emit('command_response', {'success': False, 'message': f"No drawing commands for '{original_filename}'."})
             is_drawing_active = False 
             emit('drawing_status_update', {'active': False, 'message': f"Failed to process '{original_filename}'."})
             return
-
         num_cmds = len(robot_commands_tuples)
         emit('drawing_status_update', {'active': True, 'message': f"Generated {num_cmds} commands. Preparing to draw..."})
-        
         if not robot.is_connected:
             conn_success, conn_msg = robot.connect_robot()
             if not conn_success:
@@ -386,7 +404,6 @@ def handle_process_image_for_drawing(data):
                 emit('drawing_status_update', {'active': False, 'message': f"Drawing failed (robot connection)."})
                 return
             emit('robot_connection_status', {'success': True, 'message': conn_msg})
-
         for i, cmd_tuple in enumerate(robot_commands_tuples):
             x_py, z_py, y_py = cmd_tuple
             formatted_cmd_str = robot._format_command(x_py, z_py, y_py)
@@ -401,10 +418,8 @@ def handle_process_image_for_drawing(data):
                 is_drawing_active = False
                 return 
             socketio.sleep(0.05) 
-
         emit('command_response', {'success': True, 'message': f"Sent all {num_cmds} commands for '{original_filename}'."})
         emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete."})
-
     except Exception as e:
         emit('command_response', {'success': False, 'message': f"Error in drawing pipeline: {e}"})
         emit('drawing_status_update', {'active': False, 'message': f"Error processing/drawing."})
