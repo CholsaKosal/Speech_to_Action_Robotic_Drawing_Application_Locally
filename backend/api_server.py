@@ -17,9 +17,9 @@ import time
 import logging # For more controlled logging
 
 # Configure basic logging
-logging.basicConfig(level=logging.INFO) # Set to logging.DEBUG for more verbose output if needed
-logging.getLogger('engineio.server').setLevel(logging.WARNING) # Reduce engineio verbosity
-logging.getLogger('socketio.server').setLevel(logging.WARNING) # Reduce socketio server verbosity
+logging.basicConfig(level=logging.INFO) 
+logging.getLogger('engineio.server').setLevel(logging.WARNING) 
+logging.getLogger('socketio.server').setLevel(logging.WARNING) 
 
 
 app = Flask(__name__)
@@ -44,16 +44,13 @@ if whisper_model_loaded:
 else:
     logging.error("Whisper model FAILED to load during startup.")
 
-llm_instance = load_llm_model() # This function now returns the model or None
+llm_instance = load_llm_model() 
 if llm_instance:
     logging.info("LLM model loaded successfully during startup.")
 else:
     logging.error("LLM model FAILED to load during startup. Check voice_assistant.py and model path in config.py.")
 logging.info("--- AI Model Initialization Complete ---")
 
-
-# Remove engineio_logger=True to reduce verbosity of raw packet data
-# logger=True can still be useful for SocketIO specific logs if needed, but basic logging above is better.
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet',
                     max_http_buffer_size=10 * 1024 * 1024) 
 robot = RobotInterface() 
@@ -163,7 +160,6 @@ def handle_connect():
 def handle_disconnect():
     logging.info(f"Client disconnected: {request.sid}")
 
-# ... (other handlers like robot_connect_request, robot_disconnect_request, send_robot_command remain the same) ...
 @socketio.on('robot_connect_request')
 def handle_robot_connect_request(json_data):
     global is_drawing_active
@@ -293,8 +289,8 @@ def handle_audio_chunk(data):
         emit('transcription_result', {'error': 'No audio data received.'})
         return
     
-    # Log only a small part of the base64 string to avoid flooding the console
-    logging.info(f"API: Received audio data. Mime type: {mime_type}. Base64 preview: {audio_data_b64[:30]}...")
+    # Changed to only log reception and length, not the data itself
+    logging.info(f"API: Received audio data. Mime type: {mime_type}. Data length (chars): {len(audio_data_b64)}")
 
     try:
         audio_bytes = base64.b64decode(audio_data_b64)
@@ -336,12 +332,10 @@ def handle_audio_chunk(data):
         emit('transcription_result', {'error': 'Invalid audio data format (base64 decode).'})
         emit('llm_action_response', {'error': 'Cannot process with LLM, audio data error.'})
     except Exception as e:
-        logging.error(f"API Error: Error processing audio chunk: {e}", exc_info=True) # Log full exception
+        logging.error(f"API Error: Error processing audio chunk: {e}", exc_info=True) 
         emit('transcription_result', {'error': f'Server error processing audio.'})
         emit('llm_action_response', {'error': f'Cannot process with LLM, server error.'})
 
-
-# ... (process_image_for_drawing handler remains the same) ...
 @socketio.on('process_image_for_drawing')
 def handle_process_image_for_drawing(data):
     global is_drawing_active
