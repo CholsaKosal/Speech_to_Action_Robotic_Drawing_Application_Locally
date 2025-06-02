@@ -5,7 +5,7 @@ from robot_interface import RobotInterface
 import config # Your existing config
 from image_processing_engine import process_image_to_robot_commands_pipeline
 # Import STT and LLM functions from voice_assistant
-from voice_assistant import transcribe_audio, load_whisper_model, load_llm_model, process_command_with_llm 
+from voice_assistant import transcribe_audio, load_whisper_model, load_llm_model, process_command_with_llm_stream # Updated import
 
 import os
 import uuid
@@ -279,6 +279,8 @@ def handle_audio_chunk(data):
     if is_drawing_active: 
         logging.warning("API: Drawing is active, ignoring audio chunk.")
         emit('transcription_result', {'error': 'Drawing is active, cannot process voice command now.'})
+        # Also inform frontend that LLM processing won't happen
+        emit('llm_response_chunk', {'error': 'Drawing is active.', 'done': True})
         return
 
     audio_data_b64 = data.get('audioData')
@@ -287,9 +289,9 @@ def handle_audio_chunk(data):
     if not audio_data_b64:
         logging.error("API: No audio data (audioData key) in received chunk.")
         emit('transcription_result', {'error': 'No audio data received.'})
+        emit('llm_response_chunk', {'error': 'No audio data for LLM.', 'done': True})
         return
     
-    # Changed to only log reception and length, not the data itself
     logging.info(f"API: Received audio data. Mime type: {mime_type}. Data length (chars): {len(audio_data_b64)}")
 
     try:
@@ -310,16 +312,21 @@ def handle_audio_chunk(data):
 
         if transcribed_text is not None:
             logging.info(f"API: Transcription successful: '{transcribed_text}'")
-            emit('transcription_result', {'text': transcribed_text})
+            emit('transcription_result', {'text': transcribed_text}) # Send full transcription once
             
-            logging.info(f"API: Sending transcribed text to LLM: '{transcribed_text}'")
-            llm_result = process_command_with_llm(transcribed_text) 
-            logging.info(f"API: LLM processing result: {llm_result}")
-            emit('llm_action_response', llm_result)
+            logging.info(f"API: Streaming transcribed text to LLM: '{transcribed_text}'")
+            # Iterate through the generator from process_command_with_llm_stream
+            for llm_response_part in process_command_with_llm_stream(transcribed_text):
+                # llm_response_part will be like {"chunk": "text part", "done": False} or {"error": "...", "done": True}
+                # logging.debug(f"API: Emitting LLM chunk: {llm_response_part}") # Can be very verbose
+                emit('llm_response_chunk', llm_response_part) # New event for streaming
+                if llm_response_part.get("done"):
+                    logging.info("API: LLM stream finished or error occurred.")
+                    break # Exit loop once done or error
         else:
             logging.error("API: Transcription failed (transcribe_audio returned None).")
             emit('transcription_result', {'error': 'Transcription failed on server.'})
-            emit('llm_action_response', {'error': 'Cannot process with LLM, transcription failed.'})
+            emit('llm_response_chunk', {'error': 'Cannot process with LLM, transcription failed.', 'done': True})
 
         try:
             os.remove(temp_audio_filepath)
@@ -330,11 +337,12 @@ def handle_audio_chunk(data):
     except base64.binascii.Error as b64e:
         logging.error(f"API Error: Base64 decoding failed. {b64e}")
         emit('transcription_result', {'error': 'Invalid audio data format (base64 decode).'})
-        emit('llm_action_response', {'error': 'Cannot process with LLM, audio data error.'})
+        emit('llm_response_chunk', {'error': 'Cannot process with LLM, audio data error.', 'done': True})
     except Exception as e:
         logging.error(f"API Error: Error processing audio chunk: {e}", exc_info=True) 
         emit('transcription_result', {'error': f'Server error processing audio.'})
-        emit('llm_action_response', {'error': f'Cannot process with LLM, server error.'})
+        emit('llm_response_chunk', {'error': f'Cannot process with LLM, server error.', 'done': True})
+
 
 @socketio.on('process_image_for_drawing')
 def handle_process_image_for_drawing(data):
