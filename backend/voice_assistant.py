@@ -4,97 +4,105 @@ import os
 import time
 from llama_cpp import Llama
 import config # Import your project's config
+import logging # For better logging
 
 # --- Whisper STT Model ---
 WHISPER_MODEL_SIZE = "base" 
-whisper_model = None
+whisper_model = None # Global variable for the Whisper model instance
 
 def load_whisper_model():
     """Loads the Whisper model. Call this once when the server starts."""
-    global whisper_model
+    global whisper_model # Declare that we are using the global variable
     if whisper_model is None:
-        print(f"Loading Whisper model ({WHISPER_MODEL_SIZE})...")
+        logging.info(f"Attempting to load Whisper model ({WHISPER_MODEL_SIZE})...")
         try:
             whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
-            print(f"Whisper model ({WHISPER_MODEL_SIZE}) loaded successfully.")
+            logging.info(f"Whisper model ({WHISPER_MODEL_SIZE}) loaded successfully.")
+            return whisper_model # Return the loaded model
         except Exception as e:
-            print(f"Error loading Whisper model: {e}")
+            logging.error(f"Error loading Whisper model: {e}", exc_info=True)
             whisper_model = None 
+            return None
+    logging.info("Whisper model already loaded.")
     return whisper_model
 
 def transcribe_audio(audio_filepath):
     """Transcribes the given audio file using the loaded Whisper model."""
-    global whisper_model
+    global whisper_model # Ensure we're using the global instance
     if whisper_model is None:
-        print("Whisper model is not loaded. Cannot transcribe.")
+        logging.error("Whisper model is not loaded. Cannot transcribe.")
         return None
     
     if not os.path.exists(audio_filepath):
-        print(f"Audio file not found: {audio_filepath}")
+        logging.error(f"Audio file not found for transcription: {audio_filepath}")
         return None
 
     try:
-        print(f"Transcribing audio file: {audio_filepath} with model {WHISPER_MODEL_SIZE}...")
+        logging.info(f"Transcribing audio file: {audio_filepath} with Whisper model {WHISPER_MODEL_SIZE}...")
         start_time = time.time()
-        result = whisper_model.transcribe(audio_filepath, fp16=False) # fp16=False for CPU
+        result = whisper_model.transcribe(audio_filepath, fp16=False) 
         transcription = result["text"]
         end_time = time.time()
-        print(f"Transcription complete in {end_time - start_time:.2f} seconds.")
-        print(f"Transcription: {transcription}")
+        logging.info(f"Transcription complete in {end_time - start_time:.2f} seconds.")
+        logging.info(f"Transcription: {transcription}")
         return transcription
     except Exception as e:
-        print(f"Error during audio transcription: {e}")
+        logging.error(f"Error during audio transcription: {e}", exc_info=True)
         return None
 
 # --- Llama LLM ---
-llm = None
-llm_chat_history = [] # Simple way to maintain some context
+llm_instance = None # Global variable for the Llama model instance
+llm_chat_history = [] 
 
 def load_llm_model():
     """Loads the Llama GGUF model. Call this once when the server starts."""
-    global llm
-    if llm is None:
-        model_path = os.path.join(os.path.dirname(__file__), "models", config.LLM_MODEL_FILENAME)
+    global llm_instance # Declare that we are using the global variable
+    if llm_instance is None:
+        model_filename = config.LLM_MODEL_FILENAME
+        model_path = os.path.join(os.path.dirname(__file__), "models", model_filename)
+        
+        logging.info(f"Attempting to load LLM model: {model_filename} from path: {model_path}")
         if not os.path.exists(model_path):
-            print(f"LLM model file not found at: {model_path}")
-            print("Please ensure the model is downloaded and LLM_MODEL_FILENAME in config.py is correct.")
-            llm = None
+            logging.error(f"LLM model file NOT FOUND at: {model_path}")
+            logging.error("Please ensure the model is downloaded and LLM_MODEL_FILENAME in config.py is correct.")
+            llm_instance = None
             return None
         
-        print(f"Loading LLM model from: {model_path} ...")
+        logging.info(f"LLM model file found. Initializing Llama from: {model_path} ...")
         try:
-            llm = Llama(
+            llm_instance = Llama(
                 model_path=model_path,
-                n_ctx=config.LLM_N_CTX,         # Context window size
-                n_gpu_layers=config.LLM_N_GPU_LAYERS, # Number of layers to offload to GPU (0 for CPU)
-                verbose=True                    # Set to True for more detailed Llama.cpp output
+                n_ctx=config.LLM_N_CTX,         
+                n_gpu_layers=config.LLM_N_GPU_LAYERS, 
+                verbose=True # Llama.cpp internal logging
             )
-            print(f"LLM model loaded successfully ({config.LLM_MODEL_FILENAME}).")
+            logging.info(f"LLM model ({model_filename}) loaded successfully into llm_instance.")
+            return llm_instance # Return the loaded model
         except Exception as e:
-            print(f"Error loading LLM model: {e}")
-            llm = None
-    return llm
+            logging.error(f"Error loading LLM model from {model_path}: {e}", exc_info=True)
+            llm_instance = None
+            return None
+    logging.info("LLM model already loaded.")
+    return llm_instance
 
 def process_command_with_llm(text_input):
     """
     Processes the transcribed text with the LLM to get a response or action.
     """
-    global llm, llm_chat_history
-    if llm is None:
-        print("LLM model is not loaded. Cannot process command.")
-        return {"error": "LLM not available."}
+    global llm_instance, llm_chat_history # Ensure we're using the global instance
+    if llm_instance is None:
+        logging.error("LLM model (llm_instance) is not loaded. Cannot process command.")
+        # Attempt to load it now as a fallback, though it should be loaded at startup
+        if load_llm_model() is None: # This will try to set the global llm_instance
+             return {"error": "LLM not available (failed to load)."}
+        # If load_llm_model() succeeded, llm_instance is now set.
 
-    # Simple chat history management (keep last N turns, e.g., 4 user + 4 assistant = 8 messages)
     MAX_HISTORY_TURNS = 4 
     if len(llm_chat_history) > MAX_HISTORY_TURNS * 2:
         llm_chat_history = llm_chat_history[-(MAX_HISTORY_TURNS * 2):]
 
-    # Append user message to history
     llm_chat_history.append({"role": "user", "content": text_input})
     
-    # For Phi-3, the prompt format is typically a list of messages
-    # System prompt can guide the LLM's behavior
-    # We might need to adjust the system prompt based on observed behavior
     messages_for_llm = [
         {"role": "system", "content": (
             "You are a helpful assistant controlling a robot arm capable of drawing. "
@@ -107,67 +115,57 @@ def process_command_with_llm(text_input):
             "If a drawing command is given, respond with the action and shape. For example if user says 'Draw a star', you can respond with 'Okay, I will draw a star.' "
             "If it is a simple conversational message, respond naturally."
         )},
-    ] + llm_chat_history # Add the current conversation history
+    ] + llm_chat_history
 
-    print(f"\nSending to LLM ({config.LLM_MODEL_FILENAME}):")
-    for msg in messages_for_llm[-3:]: # Log last few messages for brevity
-        print(f"  {msg['role']}: {msg['content']}")
+    logging.info(f"\nSending to LLM ({config.LLM_MODEL_FILENAME}):")
+    # for msg in messages_for_llm[-3:]: logging.info(f"  {msg['role']}: {msg['content']}") # Log last few
 
     try:
         start_time = time.time()
-        response = llm.create_chat_completion(
+        # Use the global llm_instance
+        response = llm_instance.create_chat_completion(
             messages=messages_for_llm,
             max_tokens=config.LLM_MAX_TOKENS,
             temperature=config.LLM_TEMPERATURE,
-            # stop=["\nUser:", "\nAssistant:"] # Optional stop tokens
         )
         llm_output_text = response['choices'][0]['message']['content'].strip()
         end_time = time.time()
         
-        print(f"LLM response received in {end_time - start_time:.2f} seconds.")
-        print(f"LLM Raw Output: {llm_output_text}")
+        logging.info(f"LLM response received in {end_time - start_time:.2f} seconds.")
+        logging.info(f"LLM Raw Output: {llm_output_text}")
 
-        # Append assistant's response to history
         llm_chat_history.append({"role": "assistant", "content": llm_output_text})
-        
-        # For now, we return the raw text.
-        # Later, we might parse this for specific actions.
-        # e.g., if llm_output_text contains "action:draw, shape:circle", parse it.
-        return {"message": llm_output_text} # Changed from 'action' to 'message' for now
+        return {"message": llm_output_text} 
     
     except Exception as e:
-        print(f"Error during LLM processing: {e}")
-        # Remove the last user message if processing failed to avoid resending a broken state
+        logging.error(f"Error during LLM processing: {e}", exc_info=True)
         if llm_chat_history and llm_chat_history[-1]["role"] == "user":
             llm_chat_history.pop()
-        return {"error": f"LLM processing failed: {str(e)}"}
-
+        return {"error": f"LLM processing failed."} # Simplified error message for client
 
 if __name__ == '__main__':
-    print("Voice Assistant Module - Direct Test")
+    logging.basicConfig(level=logging.INFO)
+    logging.info("Voice Assistant Module - Direct Test")
     load_whisper_model() 
-    load_llm_model() # Load LLM for testing
+    loaded_llm = load_llm_model() 
     
-    if llm:
-        print("\n--- Testing LLM directly ---")
+    if loaded_llm: # Check the return value, not the global directly in this test scope
+        logging.info("\n--- Testing LLM directly ---")
         test_inputs = [
             "Hello there!",
             "Can you draw a square for me?",
-            "What is the capital of France?",
-            "Move the robot to its home position."
         ]
         for test_input in test_inputs:
-            print(f"\nUser Input: {test_input}")
+            logging.info(f"\nUser Input: {test_input}")
+            # For direct test, ensure llm_instance is used if process_command_with_llm relies on global
+            # Or pass loaded_llm to a test-specific version of process_command_with_llm
+            # The current process_command_with_llm uses global llm_instance, which load_llm_model sets.
             llm_chat_history.clear() # Clear history for isolated test
-            llm_chat_history.append({"role": "user", "content": test_input}) # Prime history for this test
-            result = process_command_with_llm(test_input) # This will append again, effectively duplicating for test
-                                                        # but it's okay for this direct test structure.
-                                                        # Proper use in API server won't have this issue.
+            result = process_command_with_llm(test_input) 
             if result.get("message"):
-                print(f"LLM Response: {result['message']}")
+                logging.info(f"LLM Response: {result['message']}")
             elif result.get("error"):
-                print(f"LLM Error: {result['error']}")
-        llm_chat_history.clear() # Clear history after tests
+                logging.info(f"LLM Error: {result['error']}")
+        llm_chat_history.clear() 
     else:
-        print("LLM model not loaded, skipping LLM direct test.")
-
+        logging.error("LLM model not loaded, skipping LLM direct test.")
