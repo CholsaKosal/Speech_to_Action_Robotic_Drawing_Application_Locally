@@ -18,7 +18,7 @@ QR_UPLOAD_FOLDER = 'qr_uploads' # Relative to the backend directory
 # Z is typically the pen height/depth axis for drawing.
 # Y is typically the left/right axis on the paper for drawing.
 
-ROBOT_HOME_POSITION_PY = (409.328464947, -350.922061873, 30.699294352)
+ROBOT_HOME_POSITION_PY = (300, -350.922061873, 300)
 SAFE_ABOVE_CENTER_PY = (0.00, -150.0, 0.00)
 
 # --- Drawing Constants (adapted from original main.py) ---

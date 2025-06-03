@@ -26,7 +26,6 @@ const StopIcon = () => (
 
 function App() {
   const [isConnectedToBackend, setIsConnectedToBackend] = useState(false);
-  // const [backendMessage, setBackendMessage] = useState(''); // Less prominent now
 
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [robotStatusMessage, setRobotStatusMessage] = useState('Robot: Not connected');
@@ -59,6 +58,11 @@ function App() {
   const [llmResponse, setLlmResponse] = useState('');
   const audioStreamRef = useRef<MediaStream | null>(null);
 
+  // Manual Coordinate Input States
+  const [xCoord, setXCoord] = useState('');
+  const [yCoord, setYCoord] = useState('');
+  const [zCoord, setZCoord] = useState('');
+
 
   useEffect(() => {
     socket = io(PYTHON_BACKEND_URL, { transports: ['websocket'] });
@@ -66,14 +70,12 @@ function App() {
     socket.on('connect', () => {
       console.log('Frontend: Connected to Python backend via Socket.IO!');
       setIsConnectedToBackend(true);
-      // setBackendMessage('Connected to Python Backend!');
       setInteractionStatus('Tap mic or type command.');
     });
 
     socket.on('disconnect', () => {
       console.log('Frontend: Disconnected from Python backend.');
       setIsConnectedToBackend(false);
-      // setBackendMessage('Disconnected from Python Backend.');
       setIsRobotConnected(false);
       setRobotStatusMessage('Robot: Disconnected (backend offline)');
       setIsDrawingActive(false); 
@@ -82,10 +84,6 @@ function App() {
       setIsRecording(false); 
       setInteractionStatus('Backend offline. Please refresh or check server.');
     });
-
-    // socket.on('response', (data: { data: string }) => { // Less prominent now
-    //   // setBackendMessage(data.data);
-    // });
 
     socket.on('robot_connection_status', (data: { success: boolean, message: string }) => {
       setIsRobotConnected(data.success);
@@ -129,7 +127,7 @@ function App() {
       if (data.progress !== undefined) {
         setDrawingProgressPercent(data.progress);
       }
-      if (!data.active) { // Reset progress when drawing finishes or is aborted
+      if (!data.active) { 
         setDrawingProgressPercent(0);
       }
     });
@@ -312,44 +310,58 @@ function App() {
       setInteractionStatus('Command empty. Tap mic or type command.');
       return;
     }
-    console.log('[Frontend DEBUG] Attempting to submit to LLM. Text:', text);
-    console.log('[Frontend DEBUG] Socket object available:', !!socket);
-    console.log('[Frontend DEBUG] isConnectedToBackend state:', isConnectedToBackend);
-    if (socket) console.log('[Frontend DEBUG] Socket connected property:', socket.connected);
-
     if (socket && isConnectedToBackend && socket.connected) { 
-      console.log("Frontend: Sending text to LLM for processing via 'submit_text_to_llm' event. Payload:", { text_command: text });
       socket.emit('submit_text_to_llm', { text_command: text });
       setLlmResponse(''); 
       setInteractionStatus('Robotist is thinking...');
       if (text !== rawTranscribedText) setRawTranscribedText('');
     } else {
-      let debugMessage = "Cannot send command. ";
-      if (!socket) debugMessage += "Socket object is null/undefined. ";
-      if (!isConnectedToBackend) debugMessage += "isConnectedToBackend state is false. ";
-      if (socket && !socket.connected) debugMessage += "socket.connected property is false. ";
-      console.error('[Frontend DEBUG] ' + debugMessage, { socketExists: !!socket, isConnectedToBackendState: isConnectedToBackend, socketConnectedProp: socket?.connected });
-      alert(debugMessage + "Please check backend connection and refresh if necessary.");
+      // ... (error handling as before)
+      alert("Cannot send command. Backend not connected or socket issue.");
       setInteractionStatus('Backend disconnected or socket issue.');
     }
   };
 
   const handleSendEditableCommand = () => { submitTextToLLM(editableCommandText); };
 
-  // Inline styles for better structure - can be moved to App.css
+  const handleSendCustomCoordinates = () => {
+    if (!isRobotConnected) {
+        alert("Robot not connected.");
+        return;
+    }
+    if (isDrawingActive) {
+        alert("Cannot send coordinates while drawing is active.");
+        return;
+    }
+    const x = parseFloat(xCoord);
+    const y = parseFloat(yCoord); // This will be our Z (depth) for the robot
+    const z = parseFloat(zCoord); // This will be our Y (side-to-side) for the robot
+
+    if (isNaN(x) || isNaN(y) || isNaN(z)) {
+        alert("Invalid coordinates. Please enter numbers for X, Y (depth), and Z (side-to-side).");
+        return;
+    }
+    if (socket) {
+        // The backend will expect {x_py, z_py, y_py}
+        // So, frontend X -> x_py, frontend Y (depth) -> z_py, frontend Z (side) -> y_py
+        socket.emit('send_custom_coordinates', { x_py: x, z_py: y, y_py: z });
+        setLastCommandResponse(`Sent custom coords: X=${x}, Depth=${y}, Side=${z}`);
+    }
+  };
+
   const styles: { [key: string]: React.CSSProperties } = {
     appContainer: { maxWidth: '1200px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif', color: '#e0e0e0', backgroundColor: '#1e1e1e' },
     header: { textAlign: 'center' as const, marginBottom: '30px', borderBottom: '1px solid #444', paddingBottom: '20px' },
     mainTitle: { fontSize: '2.5em', color: '#61dafb', margin: '0 0 10px 0' },
     statusText: { fontSize: '0.9em', color: isConnectedToBackend ? '#76ff03' : '#ff5252' },
-    mainContentGrid: { display: 'grid', gridTemplateColumns: '1fr 2fr 1.5fr', gap: '25px', alignItems: 'start' }, // 3-column layout
-    section: { backgroundColor: '#2a2a2a', padding: '20px', borderRadius: '8px', marginBottom: '0px', boxShadow: '0 4px 8px rgba(0,0,0,0.2)', height: '100%' }, // Ensure sections take full height of grid cell
+    mainContentGrid: { display: 'grid', gridTemplateColumns: '1fr 2fr 1.5fr', gap: '25px', alignItems: 'start' }, 
+    section: { backgroundColor: '#2a2a2a', padding: '20px', borderRadius: '8px', marginBottom: '0px', boxShadow: '0 4px 8px rgba(0,0,0,0.2)', height: '100%' }, 
     sectionTitle: { fontSize: '1.5em', color: '#61dafb', borderBottom: '1px solid #444', paddingBottom: '10px', marginBottom: '15px' },
     button: { backgroundColor: '#007bff', color: 'white', border: 'none', padding: '10px 15px', borderRadius: '5px', cursor: 'pointer', fontSize: '1em', margin: '5px', transition: 'background-color 0.2s ease' },
     buttonDisabled: { backgroundColor: '#555', cursor: 'not-allowed' },
     micButton: { backgroundColor: isRecording ? '#dc3545' : '#007bff', width: '60px', height: '60px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' },
     textarea: { width: 'calc(100% - 22px)', padding: '10px', marginBottom: '10px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff', minHeight: '60px' },
-    imageUploadContainer: { display: 'flex', flexDirection: 'column', gap: '20px'}, // Stack QR and Desktop upload vertically
+    imageUploadContainer: { display: 'flex', flexDirection: 'column', gap: '20px'}, 
     uploadBox: { border: '1px dashed #555', padding: '20px', borderRadius: '8px', textAlign: 'center' as const, backgroundColor: '#333', transition: 'background-color 0.2s, border-color 0.2s' },
     uploadBoxDragging: { borderColor: '#007bff', backgroundColor: '#3a3a3a' },
     imagePreview: { maxWidth: '100%', maxHeight: '150px', border: '1px solid #444', borderRadius: '4px', marginTop: '10px' },
@@ -357,6 +369,10 @@ function App() {
     progressBar: { width: `${drawingProgressPercent}%`, backgroundColor: '#61dafb', height: '20px', textAlign: 'center' as const, lineHeight: '20px', color: '#1e1e1e', transition: 'width 0.3s ease' },
     robotStatus: { padding: '10px', backgroundColor: '#333', borderRadius: '4px', fontSize: '0.9em', marginTop: '10px' },
     llmResponseBox: { marginTop: '15px', padding: '15px', border: '1px solid #444', borderRadius: '4px', backgroundColor: '#333', whiteSpace: 'pre-wrap' as const, maxHeight: '200px', overflowY: 'auto' as const},
+    coordInputContainer: { display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '15px', marginBottom: '15px' },
+    coordInputGroup: { display: 'flex', alignItems: 'center', gap: '10px' },
+    coordLabel: { minWidth: '70px', textAlign: 'right' as const, color: '#bbb' },
+    coordInput: { flexGrow: 1, padding: '8px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff' },
   };
 
   return (
@@ -377,6 +393,26 @@ function App() {
             <button onClick={sendGoHomeCommand} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, marginTop: '10px', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Send Robot to Home </button>
             <button onClick={sendSafeCenterCommand} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, marginTop: '10px', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Send to Safe Center </button>
           </div>
+
+          <div style={styles.coordInputContainer}>
+            <h3 style={{fontSize: '1.2em', color: '#ccc', marginBottom: '10px', textAlign: 'center'}}>Move to Specific Position:</h3>
+            <div style={styles.coordInputGroup}>
+              <label htmlFor="x-coord" style={styles.coordLabel}>X (mm):</label>
+              <input type="number" id="x-coord" value={xCoord} onChange={(e) => setXCoord(e.target.value)} placeholder="e.g., 100" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+            </div>
+            <div style={styles.coordInputGroup}>
+              <label htmlFor="y-coord" style={styles.coordLabel}>Z/Depth (mm):</label>
+              <input type="number" id="y-coord" value={yCoord} onChange={(e) => setYCoord(e.target.value)} placeholder="e.g., -150" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+            </div>
+            <div style={styles.coordInputGroup}>
+              <label htmlFor="z-coord" style={styles.coordLabel}>Y (mm):</label>
+              <input type="number" id="z-coord" value={zCoord} onChange={(e) => setZCoord(e.target.value)} placeholder="e.g., 50" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+            </div>
+            <button onClick={handleSendCustomCoordinates} disabled={!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord} style={{...styles.button, marginTop: '10px', backgroundColor: '#17a2b8', ...((!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord) && styles.buttonDisabled)}}>
+              Send Custom Coordinates
+            </button>
+          </div>
+
           <div style={styles.robotStatus}>
               <p style={{margin: 0, color: isRobotConnected ? '#76ff03' : '#ffc107'}}>{robotStatusMessage}</p>
           </div>
@@ -424,10 +460,10 @@ function App() {
         
         {/* Column 3: Image Input */}
         <section style={styles.section}>
-          <h2 style={styles.sectionTitle}>Image Input</h2>
-          <div style={styles.imageUploadContainer}> {/* This will now stack items vertically */}
+          <h2 style={styles.sectionTitle}>Image Input for Drawing</h2>
+          <div style={styles.imageUploadContainer}> 
             <div style={styles.uploadBox}>
-              <h3>Upload via QR Code</h3>
+              <h3>Connect to the same WIFI for Upload via QR Code</h3>
               <button onClick={requestQrCode} disabled={!isConnectedToBackend || isDrawingActive || isRecording} style={{...styles.button, ...((!isConnectedToBackend || isDrawingActive || isRecording) && styles.buttonDisabled)}}>
                 Get QR Code
               </button>
