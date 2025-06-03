@@ -33,9 +33,14 @@ interface ThresholdOption {
 const THRESHOLD_OPTIONS: ThresholdOption[] = Array.from({ length: 10 }, (_, i) => ({
   key: `opt${i + 1}`,
   label: `Style ${i + 1}`,
-  t1: (i + 1) * 10 + 20, // Example: 30, 40, ..., 120
-  t2: (i + 1) * 20 + 40, // Example: 60, 80, ..., 240
+  t1: (i + 1) * 10 + 20, 
+  t2: (i + 1) * 20 + 40, 
 }));
+
+interface ResumableDrawingInfo {
+    original_filename: string;
+    progress: number;
+}
 
 
 function App() {
@@ -58,6 +63,8 @@ function App() {
   const [isDrawingActive, setIsDrawingActive] = useState(false);
   const [drawingProgressMessage, setDrawingProgressMessage] = useState('');
   const [drawingProgressPercent, setDrawingProgressPercent] = useState(0);
+  const [resumableDrawingInfo, setResumableDrawingInfo] = useState<ResumableDrawingInfo | null>(null);
+
 
   const [isRecording, setIsRecording] = useState(false);
   const [interactionStatus, setInteractionStatus] = useState('Tap mic or type command.');
@@ -71,10 +78,13 @@ function App() {
   const [zCoord, setZCoord] = useState('');
 
   const [showThresholdModal, setShowThresholdModal] = useState(false);
-  const [selectedThresholdKey, setSelectedThresholdKey] = useState<string>(THRESHOLD_OPTIONS[2].key); // Default to Style 3
+  const [selectedThresholdKey, setSelectedThresholdKey] = useState<string>(THRESHOLD_OPTIONS[2].key); 
   const [thresholdPreviewImage, setThresholdPreviewImage] = useState<string | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
 
+  const clearResumableState = () => {
+    setResumableDrawingInfo(null);
+  };
 
   useEffect(() => {
     socket = io(PYTHON_BACKEND_URL, { transports: ['websocket'] });
@@ -83,6 +93,7 @@ function App() {
       console.log('Frontend: Connected to Python backend via Socket.IO!');
       setIsConnectedToBackend(true);
       setInteractionStatus('Tap mic or type command.');
+      // Backend will send resumable state if any on connect
     });
 
     socket.on('disconnect', () => {
@@ -96,6 +107,7 @@ function App() {
       setIsRecording(false); 
       setInteractionStatus('Backend offline. Please refresh or check server.');
       setShowThresholdModal(false); 
+      // Do not clear resumableDrawingInfo here, allow to persist across disconnects if backend remembers
     });
 
     socket.on('robot_connection_status', (data: { success: boolean, message: string }) => {
@@ -117,6 +129,7 @@ function App() {
         setSelectedFile(null); setImagePreviewUrl(null);
       }
       setLastUploadedImageInfo(''); setUploadedFilePathFromBackend(null);
+      clearResumableState(); // New QR request clears resumable state
     });
 
     const handleImageUploadSuccess = (data: { success: boolean, message: string, original_filename?: string, filepath_on_server?: string}) => {
@@ -125,6 +138,7 @@ function App() {
         setUploadedFilePathFromBackend(data.filepath_on_server);
         setQrCodeImage(null); setQrUploadUrl('');
         setSelectedFile(null); setImagePreviewUrl(null); 
+        clearResumableState(); // New image upload clears resumable state
       } else {
         setLastUploadedImageInfo(`Upload Info: ${data.message}`);
         setUploadedFilePathFromBackend(null);
@@ -134,14 +148,20 @@ function App() {
     socket.on('qr_image_received', handleImageUploadSuccess);
     socket.on('direct_image_upload_response', handleImageUploadSuccess); 
 
-    socket.on('drawing_status_update', (data: { active: boolean, message: string, progress?: number }) => {
+    socket.on('drawing_status_update', (data: { active: boolean, message: string, progress?: number, resumable?: boolean, original_filename?: string }) => {
       setIsDrawingActive(data.active);
       setDrawingProgressMessage(data.message);
       if (data.progress !== undefined) {
         setDrawingProgressPercent(data.progress);
       }
       if (!data.active) { 
-        setDrawingProgressPercent(0);
+        setDrawingProgressPercent(0); // Reset progress bar if drawing is not active
+      }
+
+      if (data.resumable && data.original_filename) {
+        setResumableDrawingInfo({ original_filename: data.original_filename, progress: data.progress || 0 });
+      } else if (!data.active && !data.resumable) { // Drawing finished or was cleared
+        clearResumableState();
       }
     });
 
@@ -207,7 +227,8 @@ function App() {
     const selectedOpt = THRESHOLD_OPTIONS.find(opt => opt.key === key);
     if (selectedOpt && uploadedFilePathFromBackend && socket) {
         setIsPreviewLoading(true);
-        setThresholdPreviewImage(null); // Clear previous preview
+        setThresholdPreviewImage(null); 
+        console.log(`Requesting preview for T1=${selectedOpt.t1}, T2=${selectedOpt.t2}`);
         socket.emit('request_threshold_preview', {
             filepath: uploadedFilePathFromBackend,
             t1: selectedOpt.t1,
@@ -220,19 +241,30 @@ function App() {
     if (showThresholdModal && selectedThresholdKey && uploadedFilePathFromBackend) {
         requestThresholdPreview(selectedThresholdKey);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedThresholdKey, showThresholdModal, uploadedFilePathFromBackend]); // Removed requestThresholdPreview to avoid re-triggering
+  }, [selectedThresholdKey, showThresholdModal, uploadedFilePathFromBackend, requestThresholdPreview]); 
+
 
   const handleConnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_connect_request', {}); }
   const handleDisconnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_disconnect_request', {}); }
-  const sendGoHomeCommand = () => { if (!isDrawingActive && socket) socket.emit('send_robot_command', { type: 'go_home' }); }
-  const sendSafeCenterCommand = () => { if (!isDrawingActive && socket) socket.emit('send_robot_command', { type: 'move_to_safe_center' }); }
+  const sendGoHomeCommand = () => { 
+    if (!isDrawingActive && socket) {
+      clearResumableState();
+      socket.emit('send_robot_command', { type: 'go_home' }); 
+    }
+  }
+  const sendSafeCenterCommand = () => { 
+    if (!isDrawingActive && socket) {
+      clearResumableState();
+      socket.emit('send_robot_command', { type: 'move_to_safe_center' }); 
+    }
+  }
   
   const requestQrCode = () => {
     if (socket && isConnectedToBackend && !isDrawingActive) {
       setQrCodeImage(null); setQrUploadUrl('Requesting QR Code...');
       setSelectedFile(null); setImagePreviewUrl(null); 
       setLastUploadedImageInfo(''); setUploadedFilePathFromBackend(null);
+      clearResumableState();
       socket.emit('request_qr_code', {});
     } else if (isDrawingActive) { alert("Cannot request QR code while drawing is in progress."); }
   };
@@ -242,6 +274,7 @@ function App() {
       setSelectedFile(file); setImagePreviewUrl(URL.createObjectURL(file));
       setQrCodeImage(null); setQrUploadUrl('');
       setLastUploadedImageInfo(''); setUploadedFilePathFromBackend(null);
+      clearResumableState();
     } else {
       setSelectedFile(null); setImagePreviewUrl(null);
       if (file) { alert('Please select/drop an image file.'); }
@@ -269,6 +302,7 @@ function App() {
       const base64Data = (e.target?.result as string)?.split(',')[1];
       if (base64Data) {
         setLastUploadedImageInfo(`Sending ${selectedFile.name} to backend...`);
+        clearResumableState();
         socket.emit('direct_image_upload', { filename: selectedFile.name, fileData: base64Data });
       } else { alert("Could not read file data."); setLastUploadedImageInfo("Error reading file.");}
     };
@@ -280,8 +314,9 @@ function App() {
     if (isDrawingActive) { alert("A drawing is already in progress."); return; }
     if (!isRobotConnected) { alert("Please connect to the robot first."); setLastCommandResponse("Error: Robot not connected."); return; }
     if (uploadedFilePathFromBackend) {
-      setSelectedThresholdKey(THRESHOLD_OPTIONS[2].key); // Reset to default when opening
-      setThresholdPreviewImage(null); // Clear previous preview
+      clearResumableState(); // Starting a new drawing process clears any old resumable state
+      setSelectedThresholdKey(THRESHOLD_OPTIONS[2].key); 
+      setThresholdPreviewImage(null); 
       setShowThresholdModal(true); 
     } else { 
       alert("No image has been successfully uploaded to the backend yet."); 
@@ -300,7 +335,7 @@ function App() {
         alert("Invalid threshold option selected.");
         return;
     }
-
+    clearResumableState(); // Ensure any previous resumable state is cleared before starting new
     const originalFilename = lastUploadedImageInfo.includes("Received: ") ? lastUploadedImageInfo.split("Received: ")[1].split(". Ready")[0] : "uploaded_image";
     socket.emit('process_image_for_drawing', { 
         filepath: uploadedFilePathFromBackend, 
@@ -312,6 +347,17 @@ function App() {
     setDrawingProgressMessage("Requesting image processing and drawing..."); 
     setDrawingProgressPercent(0);
     setShowThresholdModal(false); 
+  };
+
+  const handleResumeDrawing = () => {
+    if (resumableDrawingInfo && socket && isConnectedToBackend) {
+        console.log("Frontend: Emitting 'resume_drawing_request'");
+        socket.emit('resume_drawing_request', {});
+        setDrawingProgressMessage(`Attempting to resume drawing of '${resumableDrawingInfo.original_filename}'...`);
+        // Resumable info will be cleared by backend or on new drawing status update
+    } else {
+        alert("No resumable drawing found or backend not connected.");
+    }
   };
 
 
@@ -337,7 +383,7 @@ function App() {
             const audioBlob = new Blob(audioChunks, { type: mediaRecorder?.mimeType });
             const reader = new FileReader();
             reader.onloadend = () => {
-                const base64Audio = (reader.result as string).split(',')[1];
+                const base64Audio = (reader.result as string)?.split(',')[1];
                 if (socket && base64Audio) {
                     socket.emit('audio_chunk', { audioData: base64Audio, mimeType: mediaRecorder?.mimeType });
                 } else { setInteractionStatus("Error: Could not send audio data."); }
@@ -381,6 +427,7 @@ function App() {
       return;
     }
     if (socket && isConnectedToBackend && socket.connected) { 
+      clearResumableState(); // Sending a new LLM command clears resumable state
       socket.emit('submit_text_to_llm', { text_command: text });
       setLlmResponse(''); 
       setInteractionStatus('Robotist is thinking...');
@@ -411,6 +458,7 @@ function App() {
         return;
     }
     if (socket) {
+        clearResumableState(); // Manual coordinate send clears resumable state
         socket.emit('send_custom_coordinates', { x_py: x, z_py: y, y_py: z });
         setLastCommandResponse(`Sent custom coords: X=${x}, Depth=${y}, Side=${z}`);
     }
@@ -451,6 +499,7 @@ function App() {
     modalPreviewArea: { textAlign: 'center' as const, borderLeft: '1px solid #444', paddingLeft: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
     modalPreviewImage: { maxWidth: '350px', maxHeight: '350px', border: '1px solid #555', borderRadius: '4px', backgroundColor: '#1e1e1e', minHeight: '250px' }, // Increased preview image size
     modalActions: { marginTop: '25px', textAlign: 'right' as const },
+    resumeButton: { backgroundColor: '#ffc107', color: '#1e1e1e', marginTop: '10px' }
   };
 
   return (
@@ -459,6 +508,22 @@ function App() {
         <h1 style={styles.mainTitle}>CamTech Robotic Drawing Control</h1>
         <p style={styles.statusText}>Backend: {isConnectedToBackend ? 'Connected' : 'Disconnected'}</p>
       </header>
+
+      {/* Resumable Drawing Info and Button */}
+      {resumableDrawingInfo && !isDrawingActive && (
+        <div style={{...styles.section, marginBottom: '20px', padding: '15px', backgroundColor: '#3e2723', border: '1px solid #ffc107'}}>
+            <h3 style={{...styles.sectionTitle, color: '#ffc107', borderBottomColor: '#ffc107'}}>Interrupted Drawing Detected</h3>
+            <p>Drawing of "<strong>{resumableDrawingInfo.original_filename}</strong>" was interrupted at {resumableDrawingInfo.progress.toFixed(0)}%.</p>
+            <button 
+                onClick={handleResumeDrawing} 
+                style={{...styles.button, ...styles.resumeButton}}
+                disabled={!isConnectedToBackend || !isRobotConnected}
+            >
+                Resume Drawing
+            </button>
+        </div>
+      )}
+
 
       <div style={styles.mainContentGrid}>
         {/* Column 1: Robot Control */}
@@ -570,7 +635,7 @@ function App() {
               </div>
             </div>
           )}
-          {!isDrawingActive && drawingProgressMessage && !lastUploadedImageInfo.startsWith("Received:") && <p style={{textAlign: 'center', marginTop: '15px', color: '#aaa'}}>{drawingProgressMessage}</p>}
+          {!isDrawingActive && drawingProgressMessage && !lastUploadedImageInfo.startsWith("Received:") && !resumableDrawingInfo && <p style={{textAlign: 'center', marginTop: '15px', color: '#aaa'}}>{drawingProgressMessage}</p>}
         </section>
       </div>
 
