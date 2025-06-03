@@ -3,7 +3,7 @@ from flask import Flask, request, render_template_string, jsonify, send_file
 from flask_socketio import SocketIO, emit
 from robot_interface import RobotInterface
 import config # Your existing config
-from image_processing_engine import process_image_to_robot_commands_pipeline
+from image_processing_engine import process_image_to_robot_commands_pipeline, get_canny_edges_array # UPDATED IMPORT
 # Import STT and LLM functions from voice_assistant
 from voice_assistant import transcribe_audio, load_whisper_model, load_llm_model, process_command_with_llm_stream 
 
@@ -14,7 +14,9 @@ from io import BytesIO
 import base64 
 import socket
 import time 
-import logging # For more controlled logging
+import logging 
+import cv2 # For image encoding for preview
+import numpy as np # For image processing if needed here
 
 # Configure basic logging with timestamps
 logging.basicConfig(
@@ -24,11 +26,11 @@ logging.basicConfig(
 # Reduce verbosity of external libraries if desired
 logging.getLogger('engineio.server').setLevel(logging.WARNING) 
 logging.getLogger('socketio.server').setLevel(logging.WARNING) 
-logging.getLogger('werkzeug').setLevel(logging.WARNING) # Quiets down Flask's HTTP request logs unless error
+logging.getLogger('werkzeug').setLevel(logging.WARNING) 
 
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your_very_secret_key_here!' # TODO: Change this in a real deployment
+app.config['SECRET_KEY'] = 'your_very_secret_key_here!' 
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), config.QR_UPLOAD_FOLDER)
 app.config['AUDIO_TEMP_FOLDER_PATH'] = os.path.join(os.path.dirname(__file__), config.AUDIO_TEMP_FOLDER)
 
@@ -50,7 +52,7 @@ else:
     logging.error("Whisper model FAILED to load during startup.")
 
 llm_instance_global = load_llm_model() 
-if llm_instance_global: # Check the global instance
+if llm_instance_global: 
     logging.info("LLM model loaded successfully during startup.")
 else:
     logging.error("LLM model FAILED to load during startup. Check voice_assistant.py and model path in config.py.")
@@ -196,7 +198,7 @@ def handle_send_robot_command(json_data, triggered_by_llm=False):
     command_type = json_data.get('type', 'raw')
     command_str = json_data.get('command_str') 
     
-    if not robot.is_connected and command_type not in ['go_home']: # Allow go_home even if not connected (it will try to connect)
+    if not robot.is_connected and command_type not in ['go_home']: 
         conn_success, conn_message = robot.connect_robot()
         if not conn_success:
             if not triggered_by_llm: 
@@ -316,7 +318,6 @@ def handle_audio_chunk(data):
 
         if transcribed_text is not None:
             logging.info(f"API: Transcription successful: '{transcribed_text}'")
-            # ONLY send transcription back. LLM processing will happen via 'submit_text_to_llm'
             emit('transcription_result', {'text': transcribed_text}) 
         else: 
             logging.error("API: Transcription failed.")
@@ -350,26 +351,21 @@ def handle_submit_text_to_llm(data):
     
     parsed_action_command_from_llm = None
     try:
-        # process_command_with_llm_stream should be imported from voice_assistant
         for llm_response_part in process_command_with_llm_stream(text_command): 
-            emit('llm_response_chunk', llm_response_part) # Stream each part to the client
+            emit('llm_response_chunk', llm_response_part) 
             if llm_response_part.get("done"):
                 logging.info("API: LLM stream finished for text command.")
                 if llm_response_part.get("parsed_action"):
                     parsed_action_command_from_llm = llm_response_part["parsed_action"]
-                break # Exit the loop once the stream is done
+                break 
         
         if parsed_action_command_from_llm:
             logging.info(f"API: Processing parsed action from LLM (text_command): {parsed_action_command_from_llm}")
             action_type = parsed_action_command_from_llm.get("type")
             parameters = parsed_action_command_from_llm.get("parameters", {})
-
-            global is_drawing_active # Ensure is_drawing_active is accessible
+            global is_drawing_active 
             if is_drawing_active:
                 logging.warning(f"API: Drawing is active. LLM command '{action_type}' from text input will not be executed now.")
-                # Optionally emit a message to frontend:
-                # emit('llm_response_chunk', {'chunk': "\n(Cannot execute action, drawing is active)", 'done': True, 'final_message': llm_response_part.get("final_message","") + "\n(Cannot execute action, drawing is active)" if llm_response_part else "\n(Cannot execute action, drawing is active)"})
-
             elif action_type == "move":
                 target = parameters.get("target")
                 if target == "home":
@@ -380,21 +376,29 @@ def handle_submit_text_to_llm(data):
                     handle_send_robot_command({'type': 'move_to_safe_center'}, triggered_by_llm=True)
                 else:
                     logging.warning(f"API: LLM move command (text_command) with unknown target: {target}")
-            elif action_type == "draw_request_clarification": # Example of handling a non-movement action
+            elif action_type == "move_to_coords":
+                x = parameters.get("x")
+                y = parameters.get("y") # This is Python Z (depth) from LLM
+                z = parameters.get("z") # This is Python Y (side-to-side) from LLM
+                logging.info(f"API: Executing LLM command (text_command): move to coords X={x}, Y(depth)={y}, Z(side)={z}")
+                if x is not None and y is not None and z is not None:
+                    # The robot.move_to_position_py expects (x_py, z_py, y_py)
+                    # LLM's "y" is our z_py (depth), LLM's "z" is our y_py (side-to-side)
+                    handle_send_robot_command({'type': 'raw', 'command_str': robot._format_command(x, y, z)}, triggered_by_llm=True)
+                else:
+                    logging.warning(f"API: LLM move_to_coords command missing one or more coordinates: {parameters}")
+
+            elif action_type == "draw_request_clarification": 
                 logging.info(f"API: LLM requested drawing clarification: {parameters.get('details')}")
-                # No robot action here, the clarification is part of the LLM's textual response
-            # Add other action handlers as needed
             else:
                 logging.info(f"API: LLM (text_command) identified action type '{action_type}', but no specific robot action handler implemented yet.")
     
-    except NameError as ne: # Specifically catch if process_command_with_llm_stream is not defined
+    except NameError as ne: 
         logging.error(f"API Error in handle_submit_text_to_llm: NameError - {ne}. Check imports.", exc_info=True)
         emit('llm_response_chunk', {'error': f'Server configuration error (NameError). Cannot process command.', 'done': True})
     except Exception as e:
         logging.error(f"API Error in handle_submit_text_to_llm during LLM processing: {e}", exc_info=True)
         emit('llm_response_chunk', {'error': f'Server error processing text command: {e}', 'done': True})
-
-# In backend/api_server.py
 
 @socketio.on('send_custom_coordinates')
 def handle_send_custom_coordinates_event(data):
@@ -404,26 +408,22 @@ def handle_send_custom_coordinates_event(data):
         emit('command_response', {'success': False, 'message': 'Cannot send custom coordinates while drawing is active.'})
         return
 
-    if not robot.is_connected: # Assuming 'robot' is your RobotInterface instance
+    if not robot.is_connected:
         emit('command_response', {'success': False, 'message': 'Robot not connected.'})
         return
 
     try:
-        # Extract coordinates based on the payload from the frontend
         x_py = float(data.get('x_py'))
-        z_py = float(data.get('z_py')) # This is pen height/depth
-        y_py = float(data.get('y_py')) # This is side-to-side on paper
+        z_py = float(data.get('z_py')) # This is pen height/depth from frontend Y
+        y_py = float(data.get('y_py')) # This is side-to-side on paper from frontend Z
 
         logging.info(f"API: Attempting to move to custom coordinates: X_py={x_py}, Z_py(depth)={z_py}, Y_py(side)={y_py}")
         
-        # Use your robot interface's method to move to a position
-        # The robot_interface.py already has move_to_position_py(self, x_py, z_py, y_py)
-        # which sends the command as "x_py,z_py,y_py"
         success, message = robot.move_to_position_py(x_py, z_py, y_py)
         
         emit('command_response', {'success': success, 'message': message, 'command_sent': f'Custom Coords: X={x_py}, Depth={z_py}, Side={y_py}'})
         
-        if not robot.is_connected: # Check if command caused disconnect
+        if not robot.is_connected: 
              emit('robot_connection_status', {'success': False, 'message': 'Disconnected (possibly due to command error/timeout)'})
 
     except (TypeError, ValueError) as e:
@@ -432,6 +432,49 @@ def handle_send_custom_coordinates_event(data):
     except Exception as e:
         logging.error(f"API Error in handle_send_custom_coordinates_event: {e}", exc_info=True)
         emit('command_response', {'success': False, 'message': f'Server error: {e}'})
+
+
+@socketio.on('request_threshold_preview')
+def handle_request_threshold_preview(data):
+    logging.info(f"--- API: Event 'request_threshold_preview' RECEIVED with data: {data} ---")
+    filepath = data.get('filepath')
+    t1 = data.get('t1')
+    t2 = data.get('t2')
+
+    if not filepath or not os.path.exists(filepath):
+        logging.error(f"API: Filepath for preview not found or invalid: {filepath}")
+        emit('threshold_preview_image_response', {'error': 'File not found for preview.'})
+        return
+    if t1 is None or t2 is None:
+        logging.error(f"API: Thresholds t1 or t2 missing for preview. Got t1={t1}, t2={t2}")
+        emit('threshold_preview_image_response', {'error': 'Thresholds not provided for preview.'})
+        return
+    
+    try:
+        t1 = int(t1)
+        t2 = int(t2)
+    except ValueError:
+        logging.error(f"API: Invalid threshold values for preview (not integers). t1={t1}, t2={t2}")
+        emit('threshold_preview_image_response', {'error': 'Invalid threshold values.'})
+        return
+
+    try:
+        # Use the new get_canny_edges_array function from image_processing_engine
+        edges_array = get_canny_edges_array(filepath, t1, t2) # UPDATED CALL
+
+        if edges_array is not None:
+            _, buffer = cv2.imencode('.png', edges_array)
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
+            logging.info(f"API: Successfully generated preview for T1={t1}, T2={t2}")
+            emit('threshold_preview_image_response', {'image_base64': img_base64})
+        else:
+            logging.error(f"API: Failed to generate Canny edges for preview (returned None). File: {filepath}, T1={t1}, T2={t2}")
+            emit('threshold_preview_image_response', {'error': 'Failed to generate preview edges.'})
+            
+    except Exception as e:
+        logging.error(f"API Error generating threshold preview: {e}", exc_info=True)
+        emit('threshold_preview_image_response', {'error': f'Server error generating preview: {e}'})
+
 
 @socketio.on('process_image_for_drawing')
 def handle_process_image_for_drawing(data):
@@ -447,9 +490,11 @@ def handle_process_image_for_drawing(data):
     
     emit('drawing_status_update', {'active': True, 'message': f"Processing '{original_filename}'..."})
     is_drawing_active = True
-    # Get Canny thresholds from frontend if provided, else use defaults from config
+    
     canny_t1 = data.get('canny_t1', config.DEFAULT_CANNY_THRESHOLD1) 
     canny_t2 = data.get('canny_t2', config.DEFAULT_CANNY_THRESHOLD2)
+    logging.info(f"API: Processing image for drawing with T1={canny_t1}, T2={canny_t2}")
+
 
     try:
         robot_commands_tuples = process_image_to_robot_commands_pipeline(
@@ -473,7 +518,6 @@ def handle_process_image_for_drawing(data):
                 return
             emit('robot_connection_status', {'success': True, 'message': conn_msg})
         
-        # Go to a safe position above center before starting to draw
         safe_x, safe_z, safe_y = config.SAFE_ABOVE_CENTER_PY
         success_safe, msg_safe = robot.move_to_position_py(safe_x, safe_z, safe_y)
         if not success_safe:
@@ -485,8 +529,8 @@ def handle_process_image_for_drawing(data):
             return
 
         for i, cmd_tuple in enumerate(robot_commands_tuples):
-            x_py, z_py, y_py = cmd_tuple # z_py is pen height, x_py and y_py are planar
-            formatted_cmd_str = robot._format_command(x_py, z_py, y_py) # Ensure correct mapping in _format_command
+            x_py, z_py, y_py = cmd_tuple 
+            formatted_cmd_str = robot._format_command(x_py, z_py, y_py) 
             progress_message = f"Drawing '{original_filename}': Cmd {i+1}/{num_cmds}"
             emit('drawing_status_update', {'active': True, 'message': progress_message, 'progress': (i+1)/num_cmds * 100})
             
@@ -498,17 +542,17 @@ def handle_process_image_for_drawing(data):
                 robot.go_home() 
                 is_drawing_active = False
                 return 
-            socketio.sleep(0.0005) # Very Small delay between commands for smoothness 
+            socketio.sleep(0.0005) # Very Small delay between commands for drawing smoothness 
             
         emit('command_response', {'success': True, 'message': f"Sent all {num_cmds} commands for '{original_filename}'."})
         emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete."})
-        robot.go_home() # Go home after successful drawing
+        robot.go_home() 
 
     except Exception as e:
         logging.error(f"Error in drawing pipeline: {e}", exc_info=True)
         emit('command_response', {'success': False, 'message': f"Error in drawing pipeline: {e}"})
         emit('drawing_status_update', {'active': False, 'message': f"Error processing/drawing."})
-        robot.go_home() # Attempt to go home on error
+        robot.go_home() 
     finally:
         is_drawing_active = False
 
@@ -521,5 +565,4 @@ if __name__ == '__main__':
     logging.info(f"Frontend should connect to ws://localhost:{server_port}")
     logging.info(f"QR code upload page will be accessible via http://<YOUR_LOCAL_IP>:{server_port}/qr_upload_page/<session_id>")
     
-    # Ensure use_reloader is False for stability, especially with global model instances
     socketio.run(app, host='0.0.0.0', port=server_port, debug=True, use_reloader=False)
