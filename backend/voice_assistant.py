@@ -141,10 +141,14 @@ def process_command_with_llm_stream(text_input):
         "- **Always identify as Robotist.**\n"
         "- **Greetings:** Respond as Robotist. Example: User: 'Hello' -> Robotist: 'Hello! Robotist here. How can I help you with your drawing or robot tasks today?'\n"
         "- **Capability Questions:** If asked 'What can you do?', respond: 'As Robotist, I can control this arm to draw from an image you upload, move the arm to specific positions, and chat about these tasks. What would you like to do?'\n"
-        "- **Action Commands (Movement):**\n"
-        "  1. ALWAYS provide a natural language spoken response FIRST. Example: 'Certainly! Moving to the home position.'\n"
-        "  2. CRITICAL FOR SYSTEM (AFTER SPOKEN RESPONSE): If it's an actionable MOVEMENT command, you MUST then append the special token `ACTION_CMD:` followed by a valid JSON object. THIS `ACTION_CMD:` PART IS FOR THE SYSTEM AND SHOULD NOT BE SPOKEN. Example: `ACTION_CMD: {\"type\": \"move\", \"parameters\": {\"target\": \"home\"}}`\n"
-        "- **Drawing Commands (from voice description):**\n"
+        "- **Action Commands (Movement & Drawing Initiation from Uploaded Image):**\n"
+        "  1. For any command that results in a direct robot action (like 'move home', 'move to center') or initiates a drawing process from an *already uploaded image*, you MUST provide TWO things in your response:\n"
+        "     a. FIRST, a natural language spoken confirmation. Example: 'Certainly! Moving to the home position.' or 'Okay, I will start drawing the uploaded image.'\n"
+        "     b. SECOND, IMMEDIATELY AFTER the spoken confirmation, you MUST append the special token `ACTION_CMD:` followed by a valid JSON object describing the action. THIS `ACTION_CMD:` PART IS FOR THE SYSTEM AND SHOULD NOT BE SPOKEN.\n"
+        "  2. **BOTH PARTS (spoken confirmation AND `ACTION_CMD:` block) ARE MANDATORY** for these actionable commands. Do not omit either part.\n"
+        "  3. Example for movement: `Certainly! Moving to the home position. ACTION_CMD: {\"type\": \"move\", \"parameters\": {\"target\": \"home\"}}`\n"
+        "  4. Example for starting a drawing (if image is already uploaded and confirmed): `Okay, starting the drawing process now. ACTION_CMD: {\"type\": \"draw_uploaded_image\"}` (Parameters for drawing can be added if needed, e.g., image identifier).\n"
+        "- **Drawing Commands (from voice description - when no image is ready):**\n"
         "  1. Acknowledge the request. Example: 'You'd like me to draw a blue square.'\n"
         "  2. Explain your current limitation and guide the user. Example: 'I understand you want a blue square! To draw it, I need an image. Could you please upload an image of a blue square using the QR code or the file upload option on the screen? Then I can process that for drawing.'\n"
         "  3. For system processing, append (THIS IS FOR THE SYSTEM AND SHOULD NOT BE SPOKEN): `ACTION_CMD: {\"type\": \"draw_request_clarification\", \"details\": \"User asked to draw [original description, e.g., blue square]. Needs image upload.\"}`\n"
@@ -164,9 +168,6 @@ def process_command_with_llm_stream(text_input):
     try:
         start_time = time.time()
         
-        # Log the exact messages being sent to the LLM
-        # logging.debug(f"Messages sent to LLM: {json.dumps(messages_for_llm, indent=2)}")
-
         stream = llm_instance.create_chat_completion(
             messages=messages_for_llm,
             max_tokens=config.LLM_MAX_TOKENS,
@@ -178,8 +179,6 @@ def process_command_with_llm_stream(text_input):
         chunk_count = 0
         for chunk_index, chunk_data in enumerate(stream):
             chunk_count += 1
-            # logging.debug(f"LLM Raw Chunk {chunk_index}: {chunk_data}") # Very verbose, enable if needed
-            
             delta = chunk_data['choices'][0]['delta']
             content_piece = delta.get('content')
             
@@ -199,44 +198,55 @@ def process_command_with_llm_stream(text_input):
         logging.info(f"LLM Final Assembled Output (raw from stream): {full_assistant_response}")
 
         parsed_action_command = None
-        natural_language_response = full_assistant_response.strip()
+        # Start with the full response, will be trimmed if ACTION_CMD is found
+        final_natural_language_response = full_assistant_response.strip() 
 
         action_cmd_marker = "ACTION_CMD:"
-        if action_cmd_marker in natural_language_response: # Check in the stripped response
-            parts = natural_language_response.split(action_cmd_marker, 1)
-            natural_language_response = parts[0].strip() 
-            
+        if action_cmd_marker in final_natural_language_response:
+            parts = final_natural_language_response.split(action_cmd_marker, 1)
+            spoken_part = parts[0].strip()
             action_json_str = parts[1].strip()
-            logging.info(f"Found ACTION_CMD marker. Natural language part: '{natural_language_response}'. JSON string part: '{action_json_str}'")
+            
+            logging.info(f"Found ACTION_CMD marker. Potential spoken part: '{spoken_part}'. JSON string part: '{action_json_str}'")
             try:
-                # Attempt to find the start and end of the JSON object more robustly
                 json_start = action_json_str.find('{')
                 json_end = action_json_str.rfind('}')
                 if json_start != -1 and json_end != -1 and json_end > json_start:
                     potential_json = action_json_str[json_start : json_end+1]
-                    logging.info(f"Attempting to parse JSON: {potential_json}")
+                    logging.info(f"Attempting to parse JSON from ACTION_CMD: {potential_json}")
                     parsed_action_command = json.loads(potential_json)
                     logging.info(f"Successfully parsed ACTION_CMD: {parsed_action_command}")
                 else:
                     logging.warning(f"Could not properly isolate JSON object within ACTION_CMD string: '{action_json_str}'")
             except json.JSONDecodeError as e:
                 logging.warning(f"JSONDecodeError parsing ACTION_CMD: {e}. String was: '{action_json_str}'")
-            except Exception as e: # Catch any other parsing errors
+            except Exception as e: 
                 logging.warning(f"Generic error parsing ACTION_CMD JSON: {e}. String was: '{action_json_str}'")
+
+            if not spoken_part and parsed_action_command:
+                # If LLM only gave ACTION_CMD, but it's a valid action, create a generic spoken response.
+                final_natural_language_response = "Okay." 
+                logging.info(f"ACTION_CMD was present but spoken part was empty. Using generic response: '{final_natural_language_response}'")
+            else:
+                final_natural_language_response = spoken_part
         
-        # Add the natural language part of the assistant's response to history
-        if natural_language_response: # Only add if there's actual text
-            llm_chat_history.append({"role": "assistant", "content": natural_language_response}) 
-        elif full_assistant_response and not parsed_action_command: # If there was some output but no action_cmd and no natural response extracted
-             llm_chat_history.append({"role": "assistant", "content": full_assistant_response.strip()}) # Add the whole thing
-        elif not full_assistant_response:
-            logging.warning("LLM produced an empty response.")
+        # Add the determined natural language response to history
+        if final_natural_language_response:
+            llm_chat_history.append({"role": "assistant", "content": final_natural_language_response})
+        elif full_assistant_response and not parsed_action_command: 
+             # This case handles if LLM gave some output, but it wasn't an ACTION_CMD, and somehow final_natural_language_response ended up empty.
+             llm_chat_history.append({"role": "assistant", "content": full_assistant_response.strip()})
+             final_natural_language_response = full_assistant_response.strip() # Ensure it's set for the payload
+        elif not full_assistant_response and not parsed_action_command : # LLM gave nothing at all.
+            logging.warning("LLM produced an empty response and no action command.")
+            final_natural_language_response = "I'm sorry, I didn't quite understand. Could you please rephrase?" 
+            llm_chat_history.append({"role": "assistant", "content": final_natural_language_response})
 
 
         final_response_payload = {
-            "chunk": "", # No new chunk here, this is the final "done" signal
+            "chunk": "", 
             "done": True, 
-            "final_message": natural_language_response # Send the cleaned natural language part
+            "final_message": final_natural_language_response 
         }
         if parsed_action_command:
             final_response_payload["parsed_action"] = parsed_action_command
@@ -246,70 +256,55 @@ def process_command_with_llm_stream(text_input):
 
     except Exception as e:
         logging.error(f"Error during LLM streaming in process_command_with_llm_stream: {e}", exc_info=True)
-        # Attempt to remove the last user message from history if an error occurs mid-processing
         if llm_chat_history and llm_chat_history[-1]["role"] == "user":
             llm_chat_history.pop() 
         yield {"error": f"LLM streaming failed due to server error: {str(e)}", "done": True}
 
 
 if __name__ == '__main__':
-    # This is a basic test script for voice_assistant.py
-    # For full testing, run via api_server.py and interact with the frontend.
-    logging.basicConfig(level=logging.DEBUG) # Use DEBUG for more verbose output during test
+    logging.basicConfig(level=logging.DEBUG) 
     
     logging.info("--- Voice Assistant Module Direct Test ---")
     
-    # Test Whisper Model Loading and Transcription
     logging.info("\n--- Testing Whisper STT ---")
     if load_whisper_model():
-        # Create a dummy audio file for testing (requires a library like pydub or soundfile)
-        # For simplicity, we'll assume a file exists or skip this part.
-        # Example: dummy_audio_path = "test_audio.wav" 
-        # if os.path.exists(dummy_audio_path):
-        #     transcription = transcribe_audio(dummy_audio_path)
-        #     logging.info(f"Test Transcription: {transcription if transcription else 'Failed'}")
-        # else:
-        #     logging.warning(f"Test audio file ({dummy_audio_path}) not found. Skipping transcription test.")
         logging.info("Whisper model loaded. Transcription test would require an audio file.")
     else:
         logging.error("Whisper model failed to load. Cannot test transcription.")
 
-    # Test LLM Model Loading and Streaming
     logging.info("\n--- Testing LLM Streaming ---")
-    if load_llm_model(): # This sets the global llm_instance
+    if load_llm_model(): 
         test_inputs = [
             "Hello Robotist",
             "What can you do?",
             "Robotist draw a red square",
-            "Move home"
+            "Move home",
+            "go to center of paper" # Test case similar to problematic one
         ]
         for test_input_idx, test_input_text in enumerate(test_inputs):
             logging.info(f"\n--- Test Input {test_input_idx + 1}: '{test_input_text}' ---")
-            llm_chat_history.clear() # Clear history for each independent test
+            llm_chat_history.clear() 
             
             print(f"Robotist Response (Streaming for '{test_input_text}'): ", end="", flush=True)
             
-            full_response_for_test = ""
-            parsed_action_for_test = None
-
             for response_part in process_command_with_llm_stream(test_input_text):
                 if response_part.get("error"):
                     print(f"\nLLM Stream Error: {response_part['error']}")
                     break
                 if response_part.get("chunk"): 
-                    print(response_part["chunk"], end="", flush=True) # Simulate streaming to console
-                    full_response_for_test += response_part["chunk"]
+                    print(response_part["chunk"], end="", flush=True) 
                 
                 if response_part.get("done"):
                     print("\n--- LLM Stream Ended for this test input ---")
                     if response_part.get("final_message"):
                          logging.debug(f"Test: Final natural message from payload: '{response_part.get('final_message')}'")
                     if response_part.get("parsed_action"):
-                        parsed_action_for_test = response_part.get("parsed_action")
-                        logging.info(f"Test: Extracted Parsed Action: {parsed_action_for_test}")
-                    break # End of stream for this input
+                        logging.info(f"Test: Extracted Parsed Action: {response_part.get('parsed_action')}")
+                    else:
+                        logging.info(f"Test: No parsed action extracted for this input.")
+                    break 
             print("\n") 
-        llm_chat_history.clear() # Clear history after all tests
+        llm_chat_history.clear() 
     else:
         logging.error("LLM model not loaded, skipping LLM direct test.")
 
