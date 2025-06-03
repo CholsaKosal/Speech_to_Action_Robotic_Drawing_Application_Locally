@@ -49,7 +49,7 @@ dmypy.json
 # User-specific uploads and models (uncomment if you decide not to track them)
 backend/qr_uploads/
 backend/models/
-backend/audio_tmp/ # Ignore temporary audio files
+backend/audio_tmp/
 
 # Log files
 *.log
