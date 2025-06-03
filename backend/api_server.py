@@ -394,6 +394,44 @@ def handle_submit_text_to_llm(data):
         logging.error(f"API Error in handle_submit_text_to_llm during LLM processing: {e}", exc_info=True)
         emit('llm_response_chunk', {'error': f'Server error processing text command: {e}', 'done': True})
 
+# In backend/api_server.py
+
+@socketio.on('send_custom_coordinates')
+def handle_send_custom_coordinates_event(data):
+    logging.info(f"--- API: Event 'send_custom_coordinates' RECEIVED with data: {data} ---")
+    global is_drawing_active
+    if is_drawing_active:
+        emit('command_response', {'success': False, 'message': 'Cannot send custom coordinates while drawing is active.'})
+        return
+
+    if not robot.is_connected: # Assuming 'robot' is your RobotInterface instance
+        emit('command_response', {'success': False, 'message': 'Robot not connected.'})
+        return
+
+    try:
+        # Extract coordinates based on the payload from the frontend
+        x_py = float(data.get('x_py'))
+        z_py = float(data.get('z_py')) # This is pen height/depth
+        y_py = float(data.get('y_py')) # This is side-to-side on paper
+
+        logging.info(f"API: Attempting to move to custom coordinates: X_py={x_py}, Z_py(depth)={z_py}, Y_py(side)={y_py}")
+        
+        # Use your robot interface's method to move to a position
+        # The robot_interface.py already has move_to_position_py(self, x_py, z_py, y_py)
+        # which sends the command as "x_py,z_py,y_py"
+        success, message = robot.move_to_position_py(x_py, z_py, y_py)
+        
+        emit('command_response', {'success': success, 'message': message, 'command_sent': f'Custom Coords: X={x_py}, Depth={z_py}, Side={y_py}'})
+        
+        if not robot.is_connected: # Check if command caused disconnect
+             emit('robot_connection_status', {'success': False, 'message': 'Disconnected (possibly due to command error/timeout)'})
+
+    except (TypeError, ValueError) as e:
+        logging.error(f"API Error: Invalid coordinate data received: {data} - {e}", exc_info=True)
+        emit('command_response', {'success': False, 'message': f'Invalid coordinate data: {e}'})
+    except Exception as e:
+        logging.error(f"API Error in handle_send_custom_coordinates_event: {e}", exc_info=True)
+        emit('command_response', {'success': False, 'message': f'Server error: {e}'})
 
 @socketio.on('process_image_for_drawing')
 def handle_process_image_for_drawing(data):

@@ -121,41 +121,33 @@ def process_command_with_llm_stream(text_input):
             yield {"error": "LLM not available (failed to load).", "done": True}
             return 
 
-    MAX_HISTORY_TURNS = 3 
-    if len(llm_chat_history) > MAX_HISTORY_TURNS * 2: # Each turn is a user + assistant message
+    MAX_HISTORY_TURNS = 1 # Keep history very short for simpler models
+    if len(llm_chat_history) > MAX_HISTORY_TURNS * 2: 
         llm_chat_history = llm_chat_history[-(MAX_HISTORY_TURNS * 2):]
 
     llm_chat_history.append({"role": "user", "content": text_input})
     
-    # System prompt refinement
+    # Simplified System Prompt - Focus on Command Extraction
     system_prompt = (
-        "## IDENTITY AND ROLE: YOU ARE ROBOTIST! ##\n"
-        "YOU ARE ROBOTIST, a specialized AI assistant that CONTROLS a physical robotic drawing arm. Your ONLY identity is Robotist. "
-        "DO NOT mention being Phi or any other AI. DO NOT say you are developed by Microsoft or any other company. YOU ARE ROBOTIST.\n"
-        "Your primary purpose is to assist users with drawing tasks and robot control through clear, friendly, and concise conversation, always as Robotist.\n\n"
-        "## ROBOTIST'S CORE FUNCTIONS ##\n"
-        "1.  **Drawing Commands:** Understand requests like 'Robotist, draw a house with a red door' or 'Robotist, sketch a flower'. When asked to draw something from description, you MUST explain that you need an image uploaded to draw from, as you cannot generate images from text alone yet. Then, guide the user to upload an image.\n"
-        "2.  **Robot Movement:** Understand and CONFIRM commands like 'Robotist, go to your home position' or 'Robotist, move to the center of the paper'. You will then initiate the robot movement.\n"
-        "3.  **Conversation (as Robotist):** Chat about drawing, your capabilities as Robotist, or provide general assistance related to your functions. Always maintain the Robotist persona.\n\n"
-        "## INTERACTION GUIDELINES & COMMAND STRUCTURE ##\n"
-        "- **Always identify as Robotist.**\n"
-        "- **Greetings:** Respond as Robotist. Example: User: 'Hello' -> Robotist: 'Hello! Robotist here. How can I help you with your drawing or robot tasks today?'\n"
-        "- **Capability Questions:** If asked 'What can you do?', respond: 'As Robotist, I can control this arm to draw from an image you upload, move the arm to specific positions, and chat about these tasks. What would you like to do?'\n"
-        "- **Action Commands (Movement & Drawing Initiation from Uploaded Image):**\n"
-        "  1. For any command that results in a direct robot action (like 'move home', 'move to center') or initiates a drawing process from an *already uploaded image*, you MUST provide TWO things in your response:\n"
-        "     a. FIRST, a natural language spoken confirmation. Example: 'Certainly! Moving to the home position.' or 'Okay, I will start drawing the uploaded image.'\n"
-        "     b. SECOND, IMMEDIATELY AFTER the spoken confirmation, you MUST append the special token `ACTION_CMD:` followed by a valid JSON object describing the action. THIS `ACTION_CMD:` PART IS FOR THE SYSTEM AND SHOULD NOT BE SPOKEN.\n"
-        "  2. **BOTH PARTS (spoken confirmation AND `ACTION_CMD:` block) ARE MANDATORY** for these actionable commands. Do not omit either part.\n"
-        "  3. Example for movement: `Certainly! Moving to the home position. ACTION_CMD: {\"type\": \"move\", \"parameters\": {\"target\": \"home\"}}`\n"
-        "  4. Example for starting a drawing (if image is already uploaded and confirmed): `Okay, starting the drawing process now. ACTION_CMD: {\"type\": \"draw_uploaded_image\"}` (Parameters for drawing can be added if needed, e.g., image identifier).\n"
-        "- **Drawing Commands (from voice description - when no image is ready):**\n"
-        "  1. Acknowledge the request. Example: 'You'd like me to draw a blue square.'\n"
-        "  2. Explain your current limitation and guide the user. Example: 'I understand you want a blue square! To draw it, I need an image. Could you please upload an image of a blue square using the QR code or the file upload option on the screen? Then I can process that for drawing.'\n"
-        "  3. For system processing, append (THIS IS FOR THE SYSTEM AND SHOULD NOT BE SPOKEN): `ACTION_CMD: {\"type\": \"draw_request_clarification\", \"details\": \"User asked to draw [original description, e.g., blue square]. Needs image upload.\"}`\n"
-        "- **Clarification (general):** If a command is vague, ask for more details.\n"
-        "- **YOU CAN DRAW (from an image):** When an image is uploaded and the user asks to draw *that image*, confirm and prepare for that process. DO NOT say you are an AI that cannot physically draw. You are the interface to a robot that DOES draw from processed images.\n"
-        "- **Be Concise:** Keep conversational responses brief and to the point.\n\n"
-        "You are Robotist. Begin."
+        "## YOU ARE ROBOTIST - ROBOT CONTROLLER ##\n"
+        "Your primary function is to understand user commands and translate them into structured JSON for a robot arm. "
+        "You also provide brief spoken feedback.\n\n"
+        "### CORE ROBOT ACTIONS & REQUIRED OUTPUT FORMAT ###\n"
+        "For the following specific user intents, your output MUST be in this exact two-part format:\n"
+        "1.  **Spoken Confirmation:** A very short, direct confirmation.\n"
+        "2.  **System Directive (`ACTION_CMD:`):** IMMEDIATELY after the spoken confirmation, append `ACTION_CMD:` followed by the precise JSON shown below. This JSON part is for the system and IS NOT SPOKEN.\n\n"
+        "**MANDATORY EXAMPLES - FOLLOW THESE EXACTLY:**\n\n"
+        "  - User input contains: \"home\", \"go home\", \"move to home position\"\n"
+        "    Your Output: `Okay, moving home. ACTION_CMD: {\"type\": \"move\", \"parameters\": {\"target\": \"home\"}}`\n\n"
+        "  - User input contains: \"center\", \"go to center\", \"move to center position\", \"middle of paper\"\n"
+        "    Your Output: `Alright, moving to the center. ACTION_CMD: {\"type\": \"move\", \"parameters\": {\"target\": \"center\"}}`\n\n"
+        "  - User input (after image upload is confirmed by system): \"draw it\", \"start drawing\", \"go ahead and draw\"\n"
+        "    Your Output: `Starting the drawing. ACTION_CMD: {\"type\": \"draw_uploaded_image\"}`\n\n"
+        "**IMPORTANT:**\n"
+        "- If the user's command clearly matches one of the above intents, you MUST output both the spoken confirmation AND the corresponding `ACTION_CMD:` block. NO EXCEPTIONS.\n"
+        "- If the user asks to draw something from a verbal description (e.g., \"draw a cat\"), respond: `I need an image to draw from. Please upload one. ACTION_CMD: {\"type\": \"draw_request_clarification\", \"details\": \"User asked to draw from description. Needs image.\"}`\n"
+        "- For any other input (greetings, questions, unclear commands), provide a very brief, helpful response as Robotist. DO NOT output `ACTION_CMD:` for these. Example: User: \"Hello\" -> Your Output: `Hello! Robotist here.` User: \"What can you do?\" -> Your Output: `I can control the robot to move and draw from images.`\n\n"
+        "Be direct and prioritize the `ACTION_CMD:` for recognized actions. You are Robotist."
     )
     
     messages_for_llm = [
@@ -170,8 +162,8 @@ def process_command_with_llm_stream(text_input):
         
         stream = llm_instance.create_chat_completion(
             messages=messages_for_llm,
-            max_tokens=config.LLM_MAX_TOKENS,
-            temperature=config.LLM_TEMPERATURE, 
+            max_tokens=config.LLM_MAX_TOKENS, # Max tokens for the LLM's response
+            temperature=config.LLM_TEMPERATURE, # Controls randomness: 0.0 for deterministic, ~0.7 for creative
             stream=True 
         )
         
@@ -198,7 +190,6 @@ def process_command_with_llm_stream(text_input):
         logging.info(f"LLM Final Assembled Output (raw from stream): {full_assistant_response}")
 
         parsed_action_command = None
-        # Start with the full response, will be trimmed if ACTION_CMD is found
         final_natural_language_response = full_assistant_response.strip() 
 
         action_cmd_marker = "ACTION_CMD:"
@@ -224,20 +215,17 @@ def process_command_with_llm_stream(text_input):
                 logging.warning(f"Generic error parsing ACTION_CMD JSON: {e}. String was: '{action_json_str}'")
 
             if not spoken_part and parsed_action_command:
-                # If LLM only gave ACTION_CMD, but it's a valid action, create a generic spoken response.
-                final_natural_language_response = "Okay." 
+                final_natural_language_response = "Okay, processing that." 
                 logging.info(f"ACTION_CMD was present but spoken part was empty. Using generic response: '{final_natural_language_response}'")
             else:
                 final_natural_language_response = spoken_part
         
-        # Add the determined natural language response to history
         if final_natural_language_response:
             llm_chat_history.append({"role": "assistant", "content": final_natural_language_response})
         elif full_assistant_response and not parsed_action_command: 
-             # This case handles if LLM gave some output, but it wasn't an ACTION_CMD, and somehow final_natural_language_response ended up empty.
              llm_chat_history.append({"role": "assistant", "content": full_assistant_response.strip()})
-             final_natural_language_response = full_assistant_response.strip() # Ensure it's set for the payload
-        elif not full_assistant_response and not parsed_action_command : # LLM gave nothing at all.
+             final_natural_language_response = full_assistant_response.strip() 
+        elif not full_assistant_response and not parsed_action_command : 
             logging.warning("LLM produced an empty response and no action command.")
             final_natural_language_response = "I'm sorry, I didn't quite understand. Could you please rephrase?" 
             llm_chat_history.append({"role": "assistant", "content": final_natural_language_response})
@@ -279,7 +267,8 @@ if __name__ == '__main__':
             "What can you do?",
             "Robotist draw a red square",
             "Move home",
-            "go to center of paper" # Test case similar to problematic one
+            "go to center of paper", 
+            "move to home position" 
         ]
         for test_input_idx, test_input_text in enumerate(test_inputs):
             logging.info(f"\n--- Test Input {test_input_idx + 1}: '{test_input_text}' ---")
