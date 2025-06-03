@@ -498,7 +498,7 @@ def handle_process_image_for_drawing(data):
                 robot.go_home() 
                 is_drawing_active = False
                 return 
-            socketio.sleep(0.05) # Small delay between commands
+            socketio.sleep(0.0005) # Very Small delay between commands for smoothness 
             
         emit('command_response', {'success': True, 'message': f"Sent all {num_cmds} commands for '{original_filename}'."})
         emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete."})
