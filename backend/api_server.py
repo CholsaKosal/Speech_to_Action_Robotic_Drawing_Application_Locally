@@ -28,7 +28,7 @@ logging.getLogger('werkzeug').setLevel(logging.WARNING) # Quiets down Flask's HT
 
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your_very_secret_key_here!'
+app.config['SECRET_KEY'] = 'your_very_secret_key_here!' # TODO: Change this in a real deployment
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), config.QR_UPLOAD_FOLDER)
 app.config['AUDIO_TEMP_FOLDER_PATH'] = os.path.join(os.path.dirname(__file__), config.AUDIO_TEMP_FOLDER)
 
@@ -49,8 +49,8 @@ if whisper_model_loaded:
 else:
     logging.error("Whisper model FAILED to load during startup.")
 
-llm_instance = load_llm_model() 
-if llm_instance:
+llm_instance_global = load_llm_model() 
+if llm_instance_global: # Check the global instance
     logging.info("LLM model loaded successfully during startup.")
 else:
     logging.error("LLM model FAILED to load during startup. Check voice_assistant.py and model path in config.py.")
@@ -145,6 +145,7 @@ def handle_qr_upload_page(session_id):
                 current_upload_session_id = None 
                 return jsonify({"message": f"Image '{original_filename}' uploaded successfully!"}), 200
             except Exception as e:
+                logging.error(f"Error saving QR uploaded file: {e}", exc_info=True)
                 socketio.emit('qr_image_received', {
                     'success': False, 'message': f"Error saving '{original_filename}' on server.",
                     'original_filename': original_filename
@@ -190,12 +191,12 @@ def handle_send_robot_command(json_data, triggered_by_llm=False):
             logging.warning("LLM tried to send command while drawing active.")
         else:
             emit('command_response', {'success': False, 'message': 'Cannot send manual commands while drawing is active.', 'command_sent': json_data.get('type', 'N/A')})
-        return False, "Drawing is active." # Indicate failure
+        return False, "Drawing is active." 
 
     command_type = json_data.get('type', 'raw')
     command_str = json_data.get('command_str') 
     
-    if not robot.is_connected and command_type not in ['go_home']:
+    if not robot.is_connected and command_type not in ['go_home']: # Allow go_home even if not connected (it will try to connect)
         conn_success, conn_message = robot.connect_robot()
         if not conn_success:
             if not triggered_by_llm: 
@@ -243,6 +244,7 @@ def handle_request_qr_code(data):
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0.1); s.connect(("8.8.8.8", 80)); host_ip = s.getsockname()[0]; s.close()
         except Exception as e:
+            logging.warning(f"Could not determine local network IP, defaulting to 127.0.0.1: {e}")
             host_ip = '127.0.0.1'
     server_port = app.config.get('SERVER_PORT', 5555) 
     upload_url = f"http://{host_ip}:{server_port}/qr_upload_page/{current_upload_session_id}"
@@ -275,23 +277,23 @@ def handle_direct_image_upload(data):
             'original_filename': original_filename, 'filepath_on_server': filepath_on_server
         })
     except base64.binascii.Error:
+        logging.error(f"Base64 decoding error for direct image upload: {original_filename}", exc_info=True)
         emit('direct_image_upload_response', {'success': False, 'message': f"Error decoding image data.", 'original_filename': original_filename})
-    except Exception:
+    except Exception as e:
+        logging.error(f"Error saving direct uploaded file: {e}", exc_info=True)
         emit('direct_image_upload_response', {'success': False, 'message': f"Failed to save file on server.", 'original_filename': original_filename})
 
 
 @socketio.on('audio_chunk') 
 def handle_audio_chunk(data):
-    logging.info("--- API: 'audio_chunk' event received ---")
-    global is_drawing_active 
-
+    logging.info(f"--- API: Event 'audio_chunk' RECEIVED with data keys: {list(data.keys())} ---")
+    
     audio_data_b64 = data.get('audioData')
     mime_type = data.get('mimeType', 'audio/webm') 
     
     if not audio_data_b64:
         logging.error("API: No audio data (audioData key) in received chunk.")
         emit('transcription_result', {'error': 'No audio data received.'})
-        emit('llm_response_chunk', {'error': 'No audio data for LLM.', 'done': True})
         return
     
     logging.info(f"API: Received audio data. Mime type: {mime_type}. Data length (chars): {len(audio_data_b64)}")
@@ -314,46 +316,11 @@ def handle_audio_chunk(data):
 
         if transcribed_text is not None:
             logging.info(f"API: Transcription successful: '{transcribed_text}'")
+            # ONLY send transcription back. LLM processing will happen via 'submit_text_to_llm'
             emit('transcription_result', {'text': transcribed_text}) 
-            
-            logging.info(f"API: Streaming transcribed text to LLM: '{transcribed_text}'")
-            parsed_action_command_from_llm = None 
-
-            for llm_response_part in process_command_with_llm_stream(transcribed_text):
-                emit('llm_response_chunk', llm_response_part) 
-                if llm_response_part.get("done"):
-                    logging.info("API: LLM stream finished or error occurred during stream.")
-                    if llm_response_part.get("parsed_action"):
-                        parsed_action_command_from_llm = llm_response_part["parsed_action"]
-                    break 
-            
-            if parsed_action_command_from_llm:
-                logging.info(f"API: Processing parsed action from LLM: {parsed_action_command_from_llm}")
-                action_type = parsed_action_command_from_llm.get("type")
-                parameters = parsed_action_command_from_llm.get("parameters", {})
-
-                if is_drawing_active:
-                    logging.warning(f"API: Drawing is active. LLM command '{action_type}' will not be executed now.")
-                elif action_type == "move":
-                    target = parameters.get("target")
-                    if target == "home":
-                        logging.info("API: Executing LLM command: move home")
-                        handle_send_robot_command({'type': 'go_home'}, triggered_by_llm=True)
-                    elif target == "center":
-                        logging.info("API: Executing LLM command: move to safe center")
-                        handle_send_robot_command({'type': 'move_to_safe_center'}, triggered_by_llm=True)
-                    else:
-                        logging.warning(f"API: LLM move command with unknown target: {target}")
-                elif action_type == "draw":
-                    shape = parameters.get("shape", "unknown shape")
-                    color = parameters.get("color", "")
-                    logging.info(f"API: LLM command: draw {color} {shape}. Feature not fully implemented for direct drawing.")
-                else:
-                    logging.info(f"API: LLM identified action type '{action_type}', but no handler implemented yet.")
         else: 
             logging.error("API: Transcription failed.")
             emit('transcription_result', {'error': 'Transcription failed on server.'})
-            emit('llm_response_chunk', {'error': 'Cannot process with LLM, transcription failed.', 'done': True})
 
         try:
             os.remove(temp_audio_filepath)
@@ -362,13 +329,71 @@ def handle_audio_chunk(data):
             logging.warning(f"API Warning: Error removing temporary audio file {temp_audio_filepath}: {e}")
 
     except base64.binascii.Error as b64e:
-        logging.error(f"API Error: Base64 decoding failed. {b64e}")
+        logging.error(f"API Error: Base64 decoding failed. {b64e}", exc_info=True)
         emit('transcription_result', {'error': 'Invalid audio data format (base64 decode).'})
-        emit('llm_response_chunk', {'error': 'Cannot process with LLM, audio data error.', 'done': True})
     except Exception as e:
         logging.error(f"API Error: Error processing audio chunk: {e}", exc_info=True) 
         emit('transcription_result', {'error': f'Server error processing audio.'})
-        emit('llm_response_chunk', {'error': f'Cannot process with LLM, server error.', 'done': True})
+
+
+@socketio.on('submit_text_to_llm')
+def handle_submit_text_to_llm(data):
+    logging.info(f"--- API: Event 'submit_text_to_llm' RECEIVED with data: {data} ---") 
+    
+    text_command = data.get('text_command')
+    if not text_command:
+        logging.error("API: No text_command in 'submit_text_to_llm' event.")
+        emit('llm_response_chunk', {'error': 'No text command received by server.', 'done': True})
+        return
+
+    logging.info(f"API: Processing text command for LLM: '{text_command}'")
+    
+    parsed_action_command_from_llm = None
+    try:
+        # process_command_with_llm_stream should be imported from voice_assistant
+        for llm_response_part in process_command_with_llm_stream(text_command): 
+            emit('llm_response_chunk', llm_response_part) # Stream each part to the client
+            if llm_response_part.get("done"):
+                logging.info("API: LLM stream finished for text command.")
+                if llm_response_part.get("parsed_action"):
+                    parsed_action_command_from_llm = llm_response_part["parsed_action"]
+                break # Exit the loop once the stream is done
+        
+        if parsed_action_command_from_llm:
+            logging.info(f"API: Processing parsed action from LLM (text_command): {parsed_action_command_from_llm}")
+            action_type = parsed_action_command_from_llm.get("type")
+            parameters = parsed_action_command_from_llm.get("parameters", {})
+
+            global is_drawing_active # Ensure is_drawing_active is accessible
+            if is_drawing_active:
+                logging.warning(f"API: Drawing is active. LLM command '{action_type}' from text input will not be executed now.")
+                # Optionally emit a message to frontend:
+                # emit('llm_response_chunk', {'chunk': "\n(Cannot execute action, drawing is active)", 'done': True, 'final_message': llm_response_part.get("final_message","") + "\n(Cannot execute action, drawing is active)" if llm_response_part else "\n(Cannot execute action, drawing is active)"})
+
+            elif action_type == "move":
+                target = parameters.get("target")
+                if target == "home":
+                    logging.info("API: Executing LLM command (text_command): move home")
+                    handle_send_robot_command({'type': 'go_home'}, triggered_by_llm=True)
+                elif target == "center":
+                    logging.info("API: Executing LLM command (text_command): move to safe center")
+                    handle_send_robot_command({'type': 'move_to_safe_center'}, triggered_by_llm=True)
+                else:
+                    logging.warning(f"API: LLM move command (text_command) with unknown target: {target}")
+            elif action_type == "draw_request_clarification": # Example of handling a non-movement action
+                logging.info(f"API: LLM requested drawing clarification: {parameters.get('details')}")
+                # No robot action here, the clarification is part of the LLM's textual response
+            # Add other action handlers as needed
+            else:
+                logging.info(f"API: LLM (text_command) identified action type '{action_type}', but no specific robot action handler implemented yet.")
+    
+    except NameError as ne: # Specifically catch if process_command_with_llm_stream is not defined
+        logging.error(f"API Error in handle_submit_text_to_llm: NameError - {ne}. Check imports.", exc_info=True)
+        emit('llm_response_chunk', {'error': f'Server configuration error (NameError). Cannot process command.', 'done': True})
+    except Exception as e:
+        logging.error(f"API Error in handle_submit_text_to_llm during LLM processing: {e}", exc_info=True)
+        emit('llm_response_chunk', {'error': f'Server error processing text command: {e}', 'done': True})
+
 
 @socketio.on('process_image_for_drawing')
 def handle_process_image_for_drawing(data):
@@ -381,10 +406,13 @@ def handle_process_image_for_drawing(data):
     if not filepath_on_server or not os.path.exists(filepath_on_server):
         emit('command_response', {'success': False, 'message': f"File not found: {filepath_on_server}"})
         return
+    
     emit('drawing_status_update', {'active': True, 'message': f"Processing '{original_filename}'..."})
     is_drawing_active = True
+    # Get Canny thresholds from frontend if provided, else use defaults from config
     canny_t1 = data.get('canny_t1', config.DEFAULT_CANNY_THRESHOLD1) 
     canny_t2 = data.get('canny_t2', config.DEFAULT_CANNY_THRESHOLD2)
+
     try:
         robot_commands_tuples = process_image_to_robot_commands_pipeline(
             filepath_on_server, canny_thresh1=canny_t1, canny_thresh2=canny_t2
@@ -394,8 +422,10 @@ def handle_process_image_for_drawing(data):
             is_drawing_active = False 
             emit('drawing_status_update', {'active': False, 'message': f"Failed to process '{original_filename}'."})
             return
+        
         num_cmds = len(robot_commands_tuples)
         emit('drawing_status_update', {'active': True, 'message': f"Generated {num_cmds} commands. Preparing to draw..."})
+        
         if not robot.is_connected:
             conn_success, conn_msg = robot.connect_robot()
             if not conn_success:
@@ -404,11 +434,24 @@ def handle_process_image_for_drawing(data):
                 emit('drawing_status_update', {'active': False, 'message': f"Drawing failed (robot connection)."})
                 return
             emit('robot_connection_status', {'success': True, 'message': conn_msg})
+        
+        # Go to a safe position above center before starting to draw
+        safe_x, safe_z, safe_y = config.SAFE_ABOVE_CENTER_PY
+        success_safe, msg_safe = robot.move_to_position_py(safe_x, safe_z, safe_y)
+        if not success_safe:
+            logging.error(f"Failed to move to safe position before drawing: {msg_safe}")
+            emit('command_response', {'success': False, 'message': f"Failed to move to safe start: {msg_safe}. Aborted."})
+            emit('drawing_status_update', {'active': False, 'message': f"Drawing aborted (safe start failed)."})
+            robot.go_home() 
+            is_drawing_active = False
+            return
+
         for i, cmd_tuple in enumerate(robot_commands_tuples):
-            x_py, z_py, y_py = cmd_tuple
-            formatted_cmd_str = robot._format_command(x_py, z_py, y_py)
+            x_py, z_py, y_py = cmd_tuple # z_py is pen height, x_py and y_py are planar
+            formatted_cmd_str = robot._format_command(x_py, z_py, y_py) # Ensure correct mapping in _format_command
             progress_message = f"Drawing '{original_filename}': Cmd {i+1}/{num_cmds}"
             emit('drawing_status_update', {'active': True, 'message': progress_message, 'progress': (i+1)/num_cmds * 100})
+            
             success, msg = robot.send_command_raw(formatted_cmd_str)
             if not success:
                 error_message = f"Error cmd {i+1} ({formatted_cmd_str}): {msg}. Aborted."
@@ -417,12 +460,17 @@ def handle_process_image_for_drawing(data):
                 robot.go_home() 
                 is_drawing_active = False
                 return 
-            socketio.sleep(0.05) 
+            socketio.sleep(0.05) # Small delay between commands
+            
         emit('command_response', {'success': True, 'message': f"Sent all {num_cmds} commands for '{original_filename}'."})
         emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete."})
+        robot.go_home() # Go home after successful drawing
+
     except Exception as e:
+        logging.error(f"Error in drawing pipeline: {e}", exc_info=True)
         emit('command_response', {'success': False, 'message': f"Error in drawing pipeline: {e}"})
         emit('drawing_status_update', {'active': False, 'message': f"Error processing/drawing."})
+        robot.go_home() # Attempt to go home on error
     finally:
         is_drawing_active = False
 
@@ -435,4 +483,5 @@ if __name__ == '__main__':
     logging.info(f"Frontend should connect to ws://localhost:{server_port}")
     logging.info(f"QR code upload page will be accessible via http://<YOUR_LOCAL_IP>:{server_port}/qr_upload_page/<session_id>")
     
+    # Ensure use_reloader is False for stability, especially with global model instances
     socketio.run(app, host='0.0.0.0', port=server_port, debug=True, use_reloader=False)

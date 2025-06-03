@@ -34,11 +34,12 @@ function App() {
   const [isDrawingActive, setIsDrawingActive] = useState(false);
   const [drawingProgressMessage, setDrawingProgressMessage] = useState('');
 
-  // Voice Interaction States
+  // Voice & Text Interaction States
   const [isRecording, setIsRecording] = useState(false);
-  const [voiceStatus, setVoiceStatus] = useState('Tap mic to start');
-  const [transcribedText, setTranscribedText] = useState('');
-  const [llmResponse, setLlmResponse] = useState(''); // Will accumulate streaming response
+  const [interactionStatus, setInteractionStatus] = useState('Tap mic or type command.'); // General status for voice/text
+  const [rawTranscribedText, setRawTranscribedText] = useState(''); // "You said: ..."
+  const [editableCommandText, setEditableCommandText] = useState(''); // For editing STT or typing new
+  const [llmResponse, setLlmResponse] = useState('');
   const audioStreamRef = useRef<MediaStream | null>(null);
 
 
@@ -50,6 +51,7 @@ function App() {
       console.log('Frontend: Connected to Python backend via Socket.IO!');
       setIsConnectedToBackend(true);
       setBackendMessage('Connected to Python Backend!');
+      setInteractionStatus('Tap mic or type command.');
     });
 
     socket.on('disconnect', () => {
@@ -61,7 +63,7 @@ function App() {
       setIsDrawingActive(false); 
       setDrawingProgressMessage('');
       setIsRecording(false); 
-      setVoiceStatus('Tap mic to start');
+      setInteractionStatus('Backend offline. Please refresh or check server.');
     });
 
     socket.on('response', (data: { data: string }) => {
@@ -109,60 +111,45 @@ function App() {
       setDrawingProgressMessage(data.message);
     });
 
+    // Listener for transcription result (text only)
     socket.on('transcription_result', (data: { text?: string, error?: string }) => {
         if (data.error) {
-            setVoiceStatus(`Transcription Error: ${data.error}`);
-            setTranscribedText('');
-            setLlmResponse(''); // Clear LLM response on transcription error
+            setInteractionStatus(`Transcription Error: ${data.error}`);
+            setRawTranscribedText('');
+            setEditableCommandText('');
+            setLlmResponse('');
         } else if (data.text) {
-            setVoiceStatus('Robotist is thinking...'); // Changed status
-            setTranscribedText(data.text);
-            setLlmResponse(''); // Clear previous LLM response before new one streams
+            setRawTranscribedText(data.text); // Display "You said: ..."
+            setEditableCommandText(data.text); // Populate editable field
+            setLlmResponse(''); // Clear previous LLM response
+            setInteractionStatus('Edit command below or send to Robotist.');
         }
     });
-
-    // New listener for streaming LLM responses
+    
+    // Listener for streaming LLM responses
     socket.on('llm_response_chunk', (data: { chunk?: string, error?: string, done: boolean, final_message?: string }) => {
         if (data.error) {
             setLlmResponse(prev => prev + `\n[Error: ${data.error}]`);
-            setVoiceStatus('LLM processing error.');
+            setInteractionStatus('LLM processing error.');
         } else if (data.chunk) {
             setLlmResponse(prev => prev + data.chunk);
             if (!data.done) {
-                setVoiceStatus('Robotist is typing...');
+                setInteractionStatus('Robotist is typing...');
             }
         }
         
         if (data.done) {
-            if (data.final_message && !data.error) { // If backend sends final assembled message
-                setLlmResponse(data.final_message); // Ensure final message is set correctly
+            if (data.final_message && !data.error) {
+                setLlmResponse(data.final_message);
             }
-            setVoiceStatus('Ready for next command.'); // Or some other final status
+            setInteractionStatus('Ready for next command.');
             if (data.error) {
-                 setVoiceStatus(`LLM Error: ${data.error}`);
-            } else if (!data.final_message && !data.chunk && !llmResponse) {
-                 // If stream ends with no content and no error, means it was just an empty completion
-                 setVoiceStatus('Robotist finished.');
+                 setInteractionStatus(`LLM Error: ${data.error}`);
+            } else if (!data.final_message && !data.chunk && llmResponse === "") { // Check if llmResponse was empty before this final empty chunk
+                 setInteractionStatus('Robotist finished.');
             }
         }
     });
-
-    // This listener might be deprecated if all LLM responses are streamed via 'llm_response_chunk'
-    // For now, keep it as a fallback or for non-streamed LLM actions if any.
-    socket.on('llm_action_response', (data: { action?: any, message?: string, error?: string }) => {
-        console.log("Received 'llm_action_response' (potentially fallback/non-streamed):", data);
-        if (data.error) {
-            setVoiceStatus(`LLM Error (Non-Streamed): ${data.error}`);
-            // setLlmResponse(''); // Decide if this should overwrite streamed response
-        } else if (data.message) { 
-            setVoiceStatus('LLM processed command (Non-Streamed).');
-            // setLlmResponse(data.message); // Decide if this should overwrite
-        } else if (data.action) {
-             setVoiceStatus('LLM action received (Non-Streamed).');
-             // setLlmResponse(`Action: ${JSON.stringify(data.action)}`); // Decide
-        }
-    });
-
 
     return () => { 
         if (socket) socket.disconnect(); 
@@ -170,7 +157,8 @@ function App() {
             audioStreamRef.current.getTracks().forEach(track => track.stop());
         }
     };
-  }, [llmResponse]); // Added llmResponse to dependency array for the 'done' check logic
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Removed llmResponse from dependency array as it caused issues with final message setting
 
   // Robot Control Handlers
   const handleConnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_connect_request', {}); }
@@ -246,9 +234,12 @@ function App() {
         alert("Cannot record voice while drawing is active or backend is disconnected.");
         return;
     }
-    setVoiceStatus('Requesting mic permission...');
-    setTranscribedText('');
-    setLlmResponse(''); // Clear previous LLM response
+    // Clear previous interaction states
+    setRawTranscribedText('');
+    setEditableCommandText('');
+    setLlmResponse('');
+    setInteractionStatus('Requesting mic permission...');
+
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         audioStreamRef.current = stream; 
@@ -260,21 +251,22 @@ function App() {
         };
 
         mediaRecorder.onstop = () => {
-            setVoiceStatus('Processing voice...'); // Initial status after stopping mic
+            setInteractionStatus('Sending audio for transcription...');
             const audioBlob = new Blob(audioChunks, { type: mediaRecorder?.mimeType });
             
             const reader = new FileReader();
             reader.onloadend = () => {
                 const base64Audio = (reader.result as string).split(',')[1];
                 if (socket && base64Audio) {
-                    console.log("Frontend: Sending audio data for transcription.");
+                    console.log("Frontend: Sending audio data for transcription only.");
+                    // Backend's 'audio_chunk' should now only transcribe and send text back
                     socket.emit('audio_chunk', { audioData: base64Audio, mimeType: mediaRecorder?.mimeType });
                 } else {
-                    setVoiceStatus("Error: Could not send audio data.");
+                    setInteractionStatus("Error: Could not send audio data.");
                 }
             };
             reader.onerror = () => {
-                setVoiceStatus("Error reading audio blob.");
+                setInteractionStatus("Error reading audio blob.");
             };
             reader.readAsDataURL(audioBlob);
 
@@ -286,10 +278,10 @@ function App() {
 
         mediaRecorder.start();
         setIsRecording(true);
-        setVoiceStatus('Recording... Tap mic to stop.');
+        setInteractionStatus('Recording... Tap mic to stop.');
     } catch (err) {
         console.error("Error accessing microphone:", err);
-        setVoiceStatus('Mic permission denied or error.');
+        setInteractionStatus('Mic permission denied or error.');
         if (audioStreamRef.current) { 
             audioStreamRef.current.getTracks().forEach(track => track.stop());
             audioStreamRef.current = null;
@@ -301,7 +293,7 @@ function App() {
     if (mediaRecorder && isRecording) {
         mediaRecorder.stop();
         setIsRecording(false);
-        // Voice status will be updated by onstop handler, then by transcription_result, then by llm_response_chunk
+        // interactionStatus will be updated by onstop, then by transcription_result
     }
   };
 
@@ -309,8 +301,57 @@ function App() {
     if (isRecording) {
         stopRecording();
     } else {
+        // Clear text input field when starting new voice recording
+        // setEditableCommandText(''); // Keep this if user might want to edit a typed command then speak
         startRecording();
     }
+  };
+
+  // Handler for sending the (potentially edited) command text to LLM
+  const submitTextToLLM = (text: string) => {
+    if (!text.trim()) {
+      alert("Command text cannot be empty.");
+      setInteractionStatus('Command empty. Tap mic or type command.');
+      return;
+    }
+
+    // Enhanced Debugging Logs
+    console.log('[Frontend DEBUG] Attempting to submit to LLM. Text:', text);
+    console.log('[Frontend DEBUG] Socket object available:', !!socket);
+    console.log('[Frontend DEBUG] isConnectedToBackend state:', isConnectedToBackend);
+    if (socket) {
+      console.log('[Frontend DEBUG] Socket connected property:', socket.connected);
+    }
+
+
+    if (socket && isConnectedToBackend && socket.connected) { 
+      console.log("Frontend: Sending text to LLM for processing via 'submit_text_to_llm' event. Payload:", { text_command: text });
+      socket.emit('submit_text_to_llm', { text_command: text });
+      setLlmResponse(''); 
+      setInteractionStatus('Robotist is thinking...');
+      // Clear raw transcription if this submission didn't originate from it directly
+      // or if it's a significantly edited version. 
+      if (text !== rawTranscribedText) {
+        setRawTranscribedText('');
+      }
+    } else {
+      let debugMessage = "Cannot send command. ";
+      if (!socket) debugMessage += "Socket object is null/undefined. ";
+      if (!isConnectedToBackend) debugMessage += "isConnectedToBackend state is false. ";
+      if (socket && !socket.connected) debugMessage += "socket.connected property is false. ";
+      
+      console.error('[Frontend DEBUG] ' + debugMessage, { 
+        socketExists: !!socket, 
+        isConnectedToBackendState: isConnectedToBackend, 
+        socketConnectedProp: socket?.connected 
+      });
+      alert(debugMessage + "Please check backend connection and refresh if necessary.");
+      setInteractionStatus('Backend disconnected or socket issue.');
+    }
+  };
+
+  const handleSendEditableCommand = () => {
+    submitTextToLLM(editableCommandText);
   };
 
   return (
@@ -319,34 +360,58 @@ function App() {
       <p>Backend Connection: {isConnectedToBackend ? 'Connected' : 'Disconnected'}</p>
       <hr />
 
-      <div className="voice-interaction-section" style={{ padding: '15px', border: '1px solid #555', borderRadius: '8px', marginBottom: '20px', textAlign: 'center' }}>
-        <h2>Voice Command</h2>
+      <div className="interaction-section" style={{ padding: '15px', border: '1px solid #555', borderRadius: '8px', marginBottom: '20px', textAlign: 'left' }}>
+        <h2>Robotist Interaction</h2>
+        <div style={{ display: 'flex', alignItems: 'center', marginBottom: '15px' }}>
+          <button 
+              onClick={handleMicButtonClick} 
+              disabled={!isConnectedToBackend || isDrawingActive}
+              style={{
+                  backgroundColor: isRecording ? '#dc3545' : '#007bff', 
+                  color: 'white', padding: '10px', fontSize: '1em',
+                  borderRadius: '50%', width: '60px', height: '60px', // Smaller mic button
+                  border: 'none', cursor: 'pointer', display: 'flex',
+                  alignItems: 'center', justifyContent: 'center', marginRight: '15px'
+              }}
+              title={isRecording ? "Stop Recording" : "Start Voice Command"}
+          >
+              <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 16 16">
+                  <path d="M5 3a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0V3z"/>
+                  <path d="M3.5 6.5A.5.5 0 0 1 4 7v1a4 4 0 0 0 8 0V7a.5.5 0 0 1 1 0v1a5 5 0 0 1-4.5 4.975V15h3a.5.5 0 0 1 0 1h-7a.5.5 0 0 1 0-1h3v-2.025A5 5 0 0 1 3 8V7a.5.5 0 0 1 .5-.5z"/>
+              </svg>
+          </button>
+          <p style={{ margin: '0', flexGrow: 1 }}>{interactionStatus}</p>
+        </div>
+
+        {rawTranscribedText && <p style={{fontSize: '0.9em', color: '#aaa'}}><em>You said: "{rawTranscribedText}"</em></p>}
+        
+        <textarea 
+            value={editableCommandText}
+            onChange={(e) => setEditableCommandText(e.target.value)}
+            placeholder="Type command or edit transcribed text here..."
+            rows={3}
+            style={{ width: 'calc(100% - 22px)', padding: '10px', marginBottom: '10px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff' }}
+            disabled={!isConnectedToBackend || isDrawingActive || isRecording}
+        />
         <button 
-            onClick={handleMicButtonClick} 
-            disabled={!isConnectedToBackend || isDrawingActive}
-            style={{
-                backgroundColor: isRecording ? '#dc3545' : '#007bff', 
-                color: 'white', padding: '10px 20px', fontSize: '1.2em',
-                borderRadius: '50%', width: '80px', height: '80px',
-                border: 'none', cursor: 'pointer', display: 'flex',
-                alignItems: 'center', justifyContent: 'center'
-            }}
-            title={isRecording ? "Stop Recording" : "Start Recording"}
+            onClick={handleSendEditableCommand} 
+            disabled={!editableCommandText.trim() || !isConnectedToBackend || isDrawingActive || isRecording}
+            style={{padding: '10px 15px'}}
         >
-            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" fill="currentColor" viewBox="0 0 16 16">
-                <path d="M5 3a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0V3z"/>
-                <path d="M3.5 6.5A.5.5 0 0 1 4 7v1a4 4 0 0 0 8 0V7a.5.5 0 0 1 1 0v1a5 5 0 0 1-4.5 4.975V15h3a.5.5 0 0 1 0 1h-7a.5.5 0 0 1 0-1h3v-2.025A5 5 0 0 1 3 8V7a.5.5 0 0 1 .5-.5z"/>
-            </svg>
+            Send Command to Robotist
         </button>
-        <p style={{ marginTop: '10px', minHeight: '20px' }}>{voiceStatus}</p>
-        {transcribedText && <p><b>You said:</b> {transcribedText}</p>}
-        {llmResponse && <p style={{whiteSpace: 'pre-wrap'}}><b>Robotist:</b> {llmResponse}</p>} {/* Added pre-wrap for newlines */}
+
+        {llmResponse && (
+          <div style={{marginTop: '15px', padding: '10px', border: '1px solid #444', borderRadius: '4px', backgroundColor: '#2a2a2a'}}>
+            <p style={{whiteSpace: 'pre-wrap', margin: 0}}><b>Robotist:</b> {llmResponse}</p>
+          </div>
+        )}
       </div>
       
       <hr />
       <h2>Image Input</h2>
-      <div className="image-input-methods" style={{ display: 'flex', justifyContent: 'space-around', marginBottom: '20px' }}>
-        <div className="qr-upload-section" style={{border: '1px solid #555', padding: '15px', borderRadius: '8px', width: '45%'}}>
+      <div className="image-input-methods" style={{ display: 'flex', justifyContent: 'space-around', marginBottom: '20px', flexWrap: 'wrap', gap: '10px' }}>
+        <div className="qr-upload-section" style={{border: '1px solid #555', padding: '15px', borderRadius: '8px', flex: '1 1 300px', minWidth: '280px'}}>
           <h3>Upload via QR Code</h3>
           <button onClick={requestQrCode} disabled={!isConnectedToBackend || isDrawingActive || isRecording}>
             Get QR Code for Phone Upload
@@ -354,7 +419,7 @@ function App() {
           {qrUploadUrl && !qrCodeImage && <p style={{fontSize: '0.8em', wordBreak: 'break-all'}}><small>{qrUploadUrl}</small></p>}
           {qrCodeImage && ( <div> <p><small>Scan to upload. URL: {qrUploadUrl}</small></p> <img src={qrCodeImage} alt="QR Code for Upload" style={{border: "1px solid #ccc", marginTop:"10px", maxWidth: '150px'}} /> </div> )}
         </div>
-        <div className="direct-upload-section" style={{ border: isDragging ? '2px dashed #007bff' : '1px solid #555', padding: '15px', borderRadius: '8px', width: '45%', textAlign: 'center', backgroundColor: isDragging ? '#333' : 'transparent', transition: 'background-color 0.2s, border-color 0.2s', opacity: (isDrawingActive || isRecording) ? 0.5 : 1, pointerEvents: (isDrawingActive || isRecording) ? 'none' : 'auto' }}
+        <div className="direct-upload-section" style={{ border: isDragging ? '2px dashed #007bff' : '1px solid #555', padding: '15px', borderRadius: '8px', flex: '1 1 300px', minWidth: '280px', textAlign: 'center', backgroundColor: isDragging ? '#333' : 'transparent', transition: 'background-color 0.2s, border-color 0.2s', opacity: (isDrawingActive || isRecording) ? 0.5 : 1, pointerEvents: (isDrawingActive || isRecording) ? 'none' : 'auto' }}
           onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop} >
           <h3>Upload from Desktop</h3>
           <input type="file" accept="image/*" onChange={handleFileSelect} ref={fileInputRef} style={{ display: 'none' }} disabled={isDrawingActive || isRecording} />

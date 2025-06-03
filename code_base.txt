@@ -95,7 +95,7 @@ dmypy.json
 # User-specific uploads and models (uncomment if you decide not to track them)
 backend/qr_uploads/
 backend/models/
-backend/audio_tmp/ # Ignore temporary audio files
+backend/audio_tmp/
 
 # Log files
 *.log
@@ -3618,6 +3618,9 @@ export default defineConfig({
 
 --- END OF FILE: frontend/s2a-drawing-ui/vite.config.ts ---
 --- START OF FILE: README.md ---
+(This project will change into webapp due to computational resource constrain)
+
+
 # Speech to Action Robotic Drawing Application
 
 ## Introduction to the project
