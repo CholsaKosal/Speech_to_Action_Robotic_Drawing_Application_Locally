@@ -9,7 +9,7 @@ let socket: Socket;
 let mediaRecorder: MediaRecorder | null = null;
 let audioChunks: Blob[] = [];
 
-// Simple Icon Components (can be replaced with an icon library later)
+// Simple Icon Components
 const MicIcon = () => (
   <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 16 16">
     <path d="M5 3a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0V3z"/>
@@ -23,25 +23,35 @@ const StopIcon = () => (
   </svg>
 );
 
+interface ThresholdOption {
+  key: string;
+  label: string;
+  t1: number;
+  t2: number;
+}
+
+const THRESHOLD_OPTIONS: ThresholdOption[] = Array.from({ length: 10 }, (_, i) => ({
+  key: `opt${i + 1}`,
+  label: `Style ${i + 1}`,
+  t1: (i + 1) * 10 + 20, // Example: 30, 40, ..., 120
+  t2: (i + 1) * 20 + 40, // Example: 60, 80, ..., 240
+}));
+
 
 function App() {
   const [isConnectedToBackend, setIsConnectedToBackend] = useState(false);
-
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [robotStatusMessage, setRobotStatusMessage] = useState('Robot: Not connected');
   const [lastCommandResponse, setLastCommandResponse] = useState('');
 
-  // QR Code Upload States
   const [qrCodeImage, setQrCodeImage] = useState<string | null>(null);
   const [qrUploadUrl, setQrUploadUrl] = useState<string>('');
   
-  // Direct File Upload States
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Common states for uploaded image info
   const [lastUploadedImageInfo, setLastUploadedImageInfo] = useState<string>('');
   const [uploadedFilePathFromBackend, setUploadedFilePathFromBackend] = useState<string | null>(null);
 
@@ -49,8 +59,6 @@ function App() {
   const [drawingProgressMessage, setDrawingProgressMessage] = useState('');
   const [drawingProgressPercent, setDrawingProgressPercent] = useState(0);
 
-
-  // Voice & Text Interaction States
   const [isRecording, setIsRecording] = useState(false);
   const [interactionStatus, setInteractionStatus] = useState('Tap mic or type command.');
   const [rawTranscribedText, setRawTranscribedText] = useState(''); 
@@ -58,10 +66,14 @@ function App() {
   const [llmResponse, setLlmResponse] = useState('');
   const audioStreamRef = useRef<MediaStream | null>(null);
 
-  // Manual Coordinate Input States
   const [xCoord, setXCoord] = useState('');
   const [yCoord, setYCoord] = useState('');
   const [zCoord, setZCoord] = useState('');
+
+  const [showThresholdModal, setShowThresholdModal] = useState(false);
+  const [selectedThresholdKey, setSelectedThresholdKey] = useState<string>(THRESHOLD_OPTIONS[2].key); // Default to Style 3
+  const [thresholdPreviewImage, setThresholdPreviewImage] = useState<string | null>(null);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
 
 
   useEffect(() => {
@@ -83,6 +95,7 @@ function App() {
       setDrawingProgressPercent(0);
       setIsRecording(false); 
       setInteractionStatus('Backend offline. Please refresh or check server.');
+      setShowThresholdModal(false); 
     });
 
     socket.on('robot_connection_status', (data: { success: boolean, message: string }) => {
@@ -170,6 +183,17 @@ function App() {
         }
     });
 
+    socket.on('threshold_preview_image_response', (data: { image_base64?: string, error?: string }) => {
+        setIsPreviewLoading(false);
+        if (data.error) {
+            console.error("Error getting threshold preview:", data.error);
+            setThresholdPreviewImage(null);
+            alert(`Error generating preview: ${data.error}`);
+        } else if (data.image_base64) {
+            setThresholdPreviewImage(`data:image/png;base64,${data.image_base64}`);
+        }
+    });
+
     return () => { 
         if (socket) socket.disconnect(); 
         if (audioStreamRef.current) {
@@ -179,7 +203,26 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); 
 
-  // Robot Control Handlers
+  const requestThresholdPreview = useCallback((key: string) => {
+    const selectedOpt = THRESHOLD_OPTIONS.find(opt => opt.key === key);
+    if (selectedOpt && uploadedFilePathFromBackend && socket) {
+        setIsPreviewLoading(true);
+        setThresholdPreviewImage(null); // Clear previous preview
+        socket.emit('request_threshold_preview', {
+            filepath: uploadedFilePathFromBackend,
+            t1: selectedOpt.t1,
+            t2: selectedOpt.t2,
+        });
+    }
+  }, [uploadedFilePathFromBackend]);
+
+  useEffect(() => {
+    if (showThresholdModal && selectedThresholdKey && uploadedFilePathFromBackend) {
+        requestThresholdPreview(selectedThresholdKey);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedThresholdKey, showThresholdModal, uploadedFilePathFromBackend]); // Removed requestThresholdPreview to avoid re-triggering
+
   const handleConnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_connect_request', {}); }
   const handleDisconnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_disconnect_request', {}); }
   const sendGoHomeCommand = () => { if (!isDrawingActive && socket) socket.emit('send_robot_command', { type: 'go_home' }); }
@@ -237,13 +280,40 @@ function App() {
     if (isDrawingActive) { alert("A drawing is already in progress."); return; }
     if (!isRobotConnected) { alert("Please connect to the robot first."); setLastCommandResponse("Error: Robot not connected."); return; }
     if (uploadedFilePathFromBackend) {
-      const originalFilename = lastUploadedImageInfo.includes("Received: ") ? lastUploadedImageInfo.split("Received: ")[1].split(". Ready")[0] : "uploaded_image";
-      socket.emit('process_image_for_drawing', { filepath: uploadedFilePathFromBackend, original_filename: originalFilename });
-      setLastCommandResponse(`Sent request to process & draw: ${originalFilename}`);
-      setDrawingProgressMessage("Requesting image processing and drawing..."); 
-      setDrawingProgressPercent(0);
-    } else { alert("No image has been successfully uploaded to the backend yet."); setLastCommandResponse("Error: No backend image path available.");}
+      setSelectedThresholdKey(THRESHOLD_OPTIONS[2].key); // Reset to default when opening
+      setThresholdPreviewImage(null); // Clear previous preview
+      setShowThresholdModal(true); 
+    } else { 
+      alert("No image has been successfully uploaded to the backend yet."); 
+      setLastCommandResponse("Error: No backend image path available.");
+    }
   };
+
+  const confirmAndStartDrawingWithThresholds = () => {
+    if (!uploadedFilePathFromBackend) {
+        alert("Error: No image path available for drawing.");
+        setShowThresholdModal(false);
+        return;
+    }
+    const selectedOpt = THRESHOLD_OPTIONS.find(opt => opt.key === selectedThresholdKey);
+    if (!selectedOpt) {
+        alert("Invalid threshold option selected.");
+        return;
+    }
+
+    const originalFilename = lastUploadedImageInfo.includes("Received: ") ? lastUploadedImageInfo.split("Received: ")[1].split(". Ready")[0] : "uploaded_image";
+    socket.emit('process_image_for_drawing', { 
+        filepath: uploadedFilePathFromBackend, 
+        original_filename: originalFilename,
+        canny_t1: selectedOpt.t1,
+        canny_t2: selectedOpt.t2
+    });
+    setLastCommandResponse(`Sent request to process & draw: ${originalFilename} with T1=${selectedOpt.t1}, T2=${selectedOpt.t2}`);
+    setDrawingProgressMessage("Requesting image processing and drawing..."); 
+    setDrawingProgressPercent(0);
+    setShowThresholdModal(false); 
+  };
+
 
   const startRecording = async () => {
     if (isDrawingActive || !isConnectedToBackend) {
@@ -316,7 +386,6 @@ function App() {
       setInteractionStatus('Robotist is thinking...');
       if (text !== rawTranscribedText) setRawTranscribedText('');
     } else {
-      // ... (error handling as before)
       alert("Cannot send command. Backend not connected or socket issue.");
       setInteractionStatus('Backend disconnected or socket issue.');
     }
@@ -334,16 +403,14 @@ function App() {
         return;
     }
     const x = parseFloat(xCoord);
-    const y = parseFloat(yCoord); // This will be our Z (depth) for the robot
-    const z = parseFloat(zCoord); // This will be our Y (side-to-side) for the robot
+    const y = parseFloat(yCoord); 
+    const z = parseFloat(zCoord); 
 
     if (isNaN(x) || isNaN(y) || isNaN(z)) {
         alert("Invalid coordinates. Please enter numbers for X, Y (depth), and Z (side-to-side).");
         return;
     }
     if (socket) {
-        // The backend will expect {x_py, z_py, y_py}
-        // So, frontend X -> x_py, frontend Y (depth) -> z_py, frontend Z (side) -> y_py
         socket.emit('send_custom_coordinates', { x_py: x, z_py: y, y_py: z });
         setLastCommandResponse(`Sent custom coords: X=${x}, Depth=${y}, Side=${z}`);
     }
@@ -355,24 +422,36 @@ function App() {
     mainTitle: { fontSize: '2.5em', color: '#61dafb', margin: '0 0 10px 0' },
     statusText: { fontSize: '0.9em', color: isConnectedToBackend ? '#76ff03' : '#ff5252' },
     mainContentGrid: { display: 'grid', gridTemplateColumns: '1fr 2fr 1.5fr', gap: '25px', alignItems: 'start' }, 
-    section: { backgroundColor: '#2a2a2a', padding: '20px', borderRadius: '8px', marginBottom: '0px', boxShadow: '0 4px 8px rgba(0,0,0,0.2)', height: '100%' }, 
+    section: { backgroundColor: '#2a2a2a', padding: '20px', borderRadius: '8px', marginBottom: '0px', boxShadow: '0 4px 8px rgba(0,0,0,0.2)', height: '100%', display: 'flex', flexDirection: 'column' }, 
     sectionTitle: { fontSize: '1.5em', color: '#61dafb', borderBottom: '1px solid #444', paddingBottom: '10px', marginBottom: '15px' },
     button: { backgroundColor: '#007bff', color: 'white', border: 'none', padding: '10px 15px', borderRadius: '5px', cursor: 'pointer', fontSize: '1em', margin: '5px', transition: 'background-color 0.2s ease' },
     buttonDisabled: { backgroundColor: '#555', cursor: 'not-allowed' },
     micButton: { backgroundColor: isRecording ? '#dc3545' : '#007bff', width: '60px', height: '60px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' },
     textarea: { width: 'calc(100% - 22px)', padding: '10px', marginBottom: '10px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff', minHeight: '60px' },
     imageUploadContainer: { display: 'flex', flexDirection: 'column', gap: '20px'}, 
-    uploadBox: { border: '1px dashed #555', padding: '20px', borderRadius: '8px', textAlign: 'center' as const, backgroundColor: '#333', transition: 'background-color 0.2s, border-color 0.2s' },
+    uploadBox: { border: '1px dashed #555', padding: '20px', borderRadius: '8px', textAlign: 'center' as const, backgroundColor: '#333', transition: 'background-color 0.2s, border-color 0.2s', flex: 1 },
     uploadBoxDragging: { borderColor: '#007bff', backgroundColor: '#3a3a3a' },
     imagePreview: { maxWidth: '100%', maxHeight: '150px', border: '1px solid #444', borderRadius: '4px', marginTop: '10px' },
     progressBarContainer: { width: '100%', backgroundColor: '#444', borderRadius: '4px', overflow: 'hidden', marginTop: '10px' },
     progressBar: { width: `${drawingProgressPercent}%`, backgroundColor: '#61dafb', height: '20px', textAlign: 'center' as const, lineHeight: '20px', color: '#1e1e1e', transition: 'width 0.3s ease' },
     robotStatus: { padding: '10px', backgroundColor: '#333', borderRadius: '4px', fontSize: '0.9em', marginTop: '10px' },
-    llmResponseBox: { marginTop: '15px', padding: '15px', border: '1px solid #444', borderRadius: '4px', backgroundColor: '#333', whiteSpace: 'pre-wrap' as const, maxHeight: '200px', overflowY: 'auto' as const},
+    llmResponseBox: { marginTop: '15px', padding: '15px', border: '1px solid #444', borderRadius: '4px', backgroundColor: '#333', whiteSpace: 'pre-wrap' as const, maxHeight: '200px', overflowY: 'auto' as const, flexGrow: 1},
     coordInputContainer: { display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '15px', marginBottom: '15px' },
     coordInputGroup: { display: 'flex', alignItems: 'center', gap: '10px' },
     coordLabel: { minWidth: '70px', textAlign: 'right' as const, color: '#bbb' },
     coordInput: { flexGrow: 1, padding: '8px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff' },
+    modalOverlay: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 },
+    modalContent: { backgroundColor: '#2a2a2a', padding: '30px', borderRadius: '8px', boxShadow: '0 5px 15px rgba(0,0,0,0.3)', width: 'auto', minWidth: '450px', maxWidth: '600px', color: '#e0e0e0' },
+    modalTitle: { fontSize: '1.8em', color: '#61dafb', marginBottom: '20px', textAlign: 'center' as const },
+    modalColumns: { display: 'flex', gap: '20px' },
+    modalColumn: { flex: 1 },
+    modalRadioGroup: { maxHeight: '250px', overflowY: 'auto', paddingRight: '10px' },
+    modalRadioLabel: { display: 'block', marginBottom: '8px', cursor: 'pointer', padding: '8px', borderRadius: '4px', transition: 'background-color 0.2s' },
+    // modalRadioLabelHover: { backgroundColor: '#444' }, // Handled by :hover in CSS if moved
+    modalRadioLabelSelected: { backgroundColor: '#007bff', color: 'white' },
+    modalPreviewArea: { textAlign: 'center' as const, borderLeft: '1px solid #444', paddingLeft: '20px' },
+    modalPreviewImage: { maxWidth: '200px', maxHeight: '200px', border: '1px solid #555', borderRadius: '4px', backgroundColor: '#1e1e1e', minHeight: '100px' },
+    modalActions: { marginTop: '25px', textAlign: 'right' as const },
   };
 
   return (
@@ -401,11 +480,11 @@ function App() {
               <input type="number" id="x-coord" value={xCoord} onChange={(e) => setXCoord(e.target.value)} placeholder="e.g., 100" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
             </div>
             <div style={styles.coordInputGroup}>
-              <label htmlFor="y-coord" style={styles.coordLabel}>Z/Depth (mm):</label>
+              <label htmlFor="y-coord" style={styles.coordLabel}>Y/Depth (mm):</label>
               <input type="number" id="y-coord" value={yCoord} onChange={(e) => setYCoord(e.target.value)} placeholder="e.g., -150" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
             </div>
             <div style={styles.coordInputGroup}>
-              <label htmlFor="z-coord" style={styles.coordLabel}>Y (mm):</label>
+              <label htmlFor="z-coord" style={styles.coordLabel}>Z/Side (mm):</label>
               <input type="number" id="z-coord" value={zCoord} onChange={(e) => setZCoord(e.target.value)} placeholder="e.g., 50" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
             </div>
             <button onClick={handleSendCustomCoordinates} disabled={!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord} style={{...styles.button, marginTop: '10px', backgroundColor: '#17a2b8', ...((!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord) && styles.buttonDisabled)}}>
@@ -460,10 +539,10 @@ function App() {
         
         {/* Column 3: Image Input */}
         <section style={styles.section}>
-          <h2 style={styles.sectionTitle}>Image Input for Drawing</h2>
+          <h2 style={styles.sectionTitle}>Image Input</h2>
           <div style={styles.imageUploadContainer}> 
             <div style={styles.uploadBox}>
-              <h3>Connect to the same WIFI for Upload via QR Code</h3>
+              <h3>Upload via QR Code</h3>
               <button onClick={requestQrCode} disabled={!isConnectedToBackend || isDrawingActive || isRecording} style={{...styles.button, ...((!isConnectedToBackend || isDrawingActive || isRecording) && styles.buttonDisabled)}}>
                 Get QR Code
               </button>
@@ -495,8 +574,72 @@ function App() {
           {!isDrawingActive && drawingProgressMessage && !lastUploadedImageInfo.startsWith("Received:") && <p style={{textAlign: 'center', marginTop: '15px', color: '#aaa'}}>{drawingProgressMessage}</p>}
         </section>
       </div>
+
+      {/* Threshold Selection Modal */}
+      {showThresholdModal && (
+        <div style={styles.modalOverlay}>
+          <div style={styles.modalContent}>
+            <h3 style={styles.modalTitle}>Select Drawing Details</h3>
+            <div style={styles.modalColumns}>
+                <div style={{...styles.modalColumn, ...styles.modalRadioGroup}}>
+                    {THRESHOLD_OPTIONS.map(option => (
+                        <label 
+                            key={option.key} 
+                            htmlFor={option.key}
+                            style={{
+                                ...styles.modalRadioLabel,
+                                ...(selectedThresholdKey === option.key ? styles.modalRadioLabelSelected : {})
+                            }}
+                            onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = selectedThresholdKey === option.key ? '#0056b3' : '#444')}
+                            onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = selectedThresholdKey === option.key ? '#007bff' : 'transparent')}
+                        >
+                            <input 
+                                type="radio" 
+                                id={option.key} 
+                                name="thresholdOption" 
+                                value={option.key}
+                                checked={selectedThresholdKey === option.key}
+                                onChange={() => setSelectedThresholdKey(option.key)}
+                                style={{ marginRight: '10px', accentColor: '#61dafb' }}
+                            />
+                            {option.label} (T1: {option.t1}, T2: {option.t2})
+                        </label>
+                    ))}
+                </div>
+                <div style={{...styles.modalColumn, ...styles.modalPreviewArea}}>
+                    <h4>Preview:</h4>
+                    {isPreviewLoading && <p style={{color: '#aaa'}}>Loading preview...</p>}
+                    {!isPreviewLoading && thresholdPreviewImage && (
+                        <img src={thresholdPreviewImage} alt="Edge preview" style={styles.modalPreviewImage} />
+                    )}
+                    {!isPreviewLoading && !thresholdPreviewImage && (
+                        <div style={{...styles.modalPreviewImage, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#777'}}>
+                            <span>No preview available</span>
+                        </div>
+                    )}
+                </div>
+            </div>
+            <div style={styles.modalActions}>
+              <button 
+                onClick={() => setShowThresholdModal(false)} 
+                style={{...styles.button, backgroundColor: '#6c757d', marginRight: '10px'}}
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={confirmAndStartDrawingWithThresholds} 
+                style={{...styles.button, backgroundColor: '#28a745'}}
+                disabled={isPreviewLoading}
+              >
+                Start Drawing
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 export default App;
+
