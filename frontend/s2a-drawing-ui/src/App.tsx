@@ -441,23 +441,22 @@ function App() {
     coordLabel: { minWidth: '70px', textAlign: 'right' as const, color: '#bbb' },
     coordInput: { flexGrow: 1, padding: '8px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff' },
     modalOverlay: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 },
-    modalContent: { backgroundColor: '#2a2a2a', padding: '30px', borderRadius: '8px', boxShadow: '0 5px 15px rgba(0,0,0,0.3)', width: 'auto', minWidth: '450px', maxWidth: '600px', color: '#e0e0e0' },
+    modalContent: { backgroundColor: '#2a2a2a', padding: '30px', borderRadius: '8px', boxShadow: '0 5px 15px rgba(0,0,0,0.3)', width: 'auto', minWidth: '750px', maxWidth: '900px', color: '#e0e0e0' }, // Increased width
     modalTitle: { fontSize: '1.8em', color: '#61dafb', marginBottom: '20px', textAlign: 'center' as const },
     modalColumns: { display: 'flex', gap: '20px' },
     modalColumn: { flex: 1 },
-    modalRadioGroup: { maxHeight: '250px', overflowY: 'auto', paddingRight: '10px' },
+    modalRadioGroup: { maxHeight: '550px', overflowY: 'auto', paddingRight: '10px' }, // Increased height
     modalRadioLabel: { display: 'block', marginBottom: '8px', cursor: 'pointer', padding: '8px', borderRadius: '4px', transition: 'background-color 0.2s' },
-    // modalRadioLabelHover: { backgroundColor: '#444' }, // Handled by :hover in CSS if moved
     modalRadioLabelSelected: { backgroundColor: '#007bff', color: 'white' },
-    modalPreviewArea: { textAlign: 'center' as const, borderLeft: '1px solid #444', paddingLeft: '20px' },
-    modalPreviewImage: { maxWidth: '200px', maxHeight: '200px', border: '1px solid #555', borderRadius: '4px', backgroundColor: '#1e1e1e', minHeight: '100px' },
+    modalPreviewArea: { textAlign: 'center' as const, borderLeft: '1px solid #444', paddingLeft: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
+    modalPreviewImage: { maxWidth: '350px', maxHeight: '350px', border: '1px solid #555', borderRadius: '4px', backgroundColor: '#1e1e1e', minHeight: '250px' }, // Increased preview image size
     modalActions: { marginTop: '25px', textAlign: 'right' as const },
   };
 
   return (
     <div style={styles.appContainer}>
       <header style={styles.header}>
-        <h1 style={styles.mainTitle}>S2A Robotic Drawing Control</h1>
+        <h1 style={styles.mainTitle}>CamTech Robotic Drawing Control</h1>
         <p style={styles.statusText}>Backend: {isConnectedToBackend ? 'Connected' : 'Disconnected'}</p>
       </header>
 
