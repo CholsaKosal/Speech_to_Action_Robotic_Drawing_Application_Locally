@@ -1,7 +1,8 @@
 # backend/api_server.py
 from flask import Flask, request, render_template_string, jsonify, send_file
 from flask_socketio import SocketIO, emit
-from robot_interface import RobotInterface
+# The RobotInterface class definition will be included/updated here
+# as it's not a separate immersive in this context.
 import config 
 from image_processing_engine import process_image_to_robot_commands_pipeline, get_canny_edges_array 
 from voice_assistant import transcribe_audio, load_whisper_model, load_llm_model, process_command_with_llm_stream 
@@ -28,29 +29,169 @@ logging.getLogger('engineio.server').setLevel(logging.WARNING)
 logging.getLogger('socketio.server').setLevel(logging.WARNING) 
 logging.getLogger('werkzeug').setLevel(logging.WARNING) 
 
+# --- RobotInterface Class Definition (Effectively an update to robot_interface.py) ---
+class RobotInterface:
+    def __init__(self):
+        self.robot_socket = None
+        self.is_connected = False
+        # target_host and target_port will be set dynamically in connect_robot
+        self.current_target_host = None
+        self.current_target_port = None
+
+    def _format_command(self, x, z, y):
+        return f"{x:.2f},{z:.2f},{y:.2f}"
+
+    def connect_robot(self, use_real=False): # Added use_real parameter
+        if self.is_connected:
+            logging.info("Robot already connected.")
+            return True, f"Already connected to {self.current_target_host}:{self.current_target_port}"
+
+        if use_real:
+            host = config.REAL_ROBOT_HOST
+            port = config.REAL_ROBOT_PORT
+            logging.info(f"Attempting to connect to REAL ROBOT at {host}:{port}...")
+        else:
+            host = config.SIMULATION_HOST
+            port = config.SIMULATION_PORT
+            logging.info(f"Attempting to connect to SIMULATION at {host}:{port}...")
+        
+        self.current_target_host = host # Store current target
+        self.current_target_port = port
+
+        try:
+            self.robot_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.robot_socket.settimeout(5) # Connection timeout
+            self.robot_socket.connect((host, port))
+            self.robot_socket.settimeout(None) # Reset to blocking for operations
+            self.is_connected = True
+            logging.info(f"Successfully connected to {host}:{port}.")
+            return True, f"Successfully connected to {('Real Robot' if use_real else 'Simulation')} at {host}:{port}"
+        except socket.error as e:
+            self.robot_socket = None
+            self.is_connected = False
+            self.current_target_host = None
+            self.current_target_port = None
+            logging.error(f"Error connecting to {host}:{port} - {e}")
+            return False, f"Error connecting to {('Real Robot' if use_real else 'Simulation')}: {e}"
+
+    def disconnect_robot(self, graceful=True):
+        if not self.is_connected:
+            logging.info("Robot is not connected.")
+            return True, "Was not connected."
+
+        if graceful:
+            logging.info("Attempting graceful disconnect (going home first)...")
+            if self.is_connected: 
+                home_success, home_msg = self.go_home() 
+                if not home_success:
+                    logging.warning(f"Warning: Failed to go home before disconnecting: {home_msg}")
+                else:
+                    logging.info("Successfully moved to home position.")
+                    logging.info("Waiting for 2 seconds before closing socket...") # Reduced wait time
+                    time.sleep(2)
+            else: 
+                logging.warning("Cannot go home for graceful disconnect, robot is not connected.")
+
+        if self.robot_socket:
+            try:
+                self.robot_socket.close()
+            except socket.error as e:
+                logging.error(f"Error closing socket: {e}")
+            finally:
+                self.robot_socket = None
+                self.is_connected = False
+                logging.info(f"Socket closed. Disconnected from {self.current_target_host}:{self.current_target_port}.")
+                self.current_target_host = None
+                self.current_target_port = None
+        else: 
+            self.is_connected = False 
+            logging.info("No active socket to close. Marked as disconnected.")
+            self.current_target_host = None
+            self.current_target_port = None
+            
+        return True, "Disconnected from robot."
+
+    def send_command_raw(self, command_str):
+        if not self.is_connected or not self.robot_socket:
+            return False, "Not connected"
+        try:
+            logging.info(f"Sending command to {self.current_target_host}: {command_str}")
+            self.robot_socket.sendall(command_str.encode('utf-8'))
+            
+            # Set a timeout for receiving responses
+            self.robot_socket.settimeout(10) # 10-second timeout for R
+            response_r = self.robot_socket.recv(1024).decode('utf-8').strip()
+            logging.info(f"Received R-phase: '{response_r}'")
+            
+            self.robot_socket.settimeout(20) # 20-second timeout for D/E
+            response_d_or_e = self.robot_socket.recv(1024).decode('utf-8').strip()
+            logging.info(f"Received D/E-phase: '{response_d_or_e}'")
+            
+            self.robot_socket.settimeout(None) # Reset to blocking
+
+            if response_r.upper() != "R":
+                return False, f"Robot did not acknowledge (R). Got: {response_r}"
+            if response_d_or_e.upper() == "D":
+                return True, f"Command '{command_str}' successful."
+            elif response_d_or_e.upper() == "E":
+                return False, f"Command '{command_str}' failed: Robot reported error (E)."
+            else:
+                return False, f"Robot did not signal done (D) or error (E). Got: {response_d_or_e}"
+                
+        except socket.timeout:
+            logging.error(f"Socket timeout during send/recv for command: {command_str}")
+            self.disconnect_robot(graceful=False) # Force disconnect on timeout
+            return False, "Socket timeout"
+        except socket.error as e:
+            logging.error(f"Socket error during send/recv: {e}")
+            self.disconnect_robot(graceful=False) # Force disconnect
+            return False, f"Socket error: {e}"
+        except Exception as e:
+            logging.error(f"An unexpected error occurred: {e}")
+            self.disconnect_robot(graceful=False) # Force disconnect
+            return False, f"Unexpected error: {e}"
+
+    def go_home(self):
+        if not self.is_connected:
+            # Attempt to connect using default (simulation) if not connected,
+            # or let the calling function handle pre-connection.
+            # For now, assume connect_robot was called with user's choice.
+            logging.warning("go_home called but robot not connected. Frontend should ensure connection first.")
+            return False, "Cannot go home. Robot not connected."
+        
+        logging.info("Sending robot to home position...")
+        x, z, y = config.ROBOT_HOME_POSITION_PY
+        cmd_str = self._format_command(x, z, y)
+        return self.send_command_raw(cmd_str)
+
+    def move_to_position_py(self, x_py, z_py, y_py):
+        if not self.is_connected:
+            logging.warning("move_to_position_py called but robot not connected.")
+            return False, "Cannot move. Robot not connected."
+
+        cmd_str = self._format_command(x_py, z_py, y_py)
+        return self.send_command_raw(cmd_str)
+# --- End RobotInterface Class ---
+
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_very_secret_key_here!' 
-# Construct full paths for UPLOAD_FOLDER and AUDIO_TEMP_FOLDER relative to this script's location
 BASE_DIR = os.path.dirname(__file__)
 app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, config.QR_UPLOAD_FOLDER)
 app.config['AUDIO_TEMP_FOLDER_PATH'] = os.path.join(BASE_DIR, config.AUDIO_TEMP_FOLDER)
-ASSETS_DIR = os.path.join(BASE_DIR, config.ASSETS_FOLDER_NAME) # For signature image
+ASSETS_DIR = os.path.join(BASE_DIR, config.ASSETS_FOLDER_NAME) 
 
 DRAWING_HISTORY_FILE = os.path.join(BASE_DIR, "drawing_history.json")
 MAX_DRAWING_HISTORY = 5
 
 
-# Create directories if they don't exist
 for folder_path in [app.config['UPLOAD_FOLDER'], app.config['AUDIO_TEMP_FOLDER_PATH'], ASSETS_DIR]:
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
         logging.info(f"Created folder at: {folder_path}")
 
-# Construct full path for signature image
 SIGNATURE_IMAGE_FULL_PATH = os.path.join(ASSETS_DIR, config.SIGNATURE_IMAGE_FILENAME)
 
-# Load AI models
 logging.info("--- Initializing AI Models ---")
 if load_whisper_model(): logging.info("Whisper model loaded successfully.")
 else: logging.error("Whisper model FAILED to load.")
@@ -59,13 +200,14 @@ else: logging.error("LLM model FAILED to load.")
 logging.info("--- AI Model Initialization Complete ---")
 
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', max_http_buffer_size=10 * 1024 * 1024) 
-robot = RobotInterface() 
+robot = RobotInterface() # Instantiate the robot interface
 
 current_upload_session_id = None
 is_drawing_active_flag = False 
 drawing_history = [] 
 active_drawing_session_id = None 
 
+# ... (get_ui_history_summary, save_drawing_history, load_drawing_history, etc. remain the same)
 def get_ui_history_summary(history_list):
     """Converts raw history items to the summary structure expected by UI."""
     ui_summary = []
@@ -177,8 +319,6 @@ def update_drawing_status_in_history(drawing_id, status, current_command_index=N
         return True
     return False
 
-# Removed create_signature_commands() as signature is now from image
-
 load_drawing_history()
 
 UPLOAD_PAGE_TEMPLATE = """
@@ -224,7 +364,11 @@ def handle_connect():
     global drawing_history, is_drawing_active_flag, active_drawing_session_id
     logging.info(f"Client connected: {request.sid}")
     emit('response', {'data': 'Connected to Python backend!'})
-    emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Connected to robot' if robot.is_connected else 'Not connected to robot'})
+    # Send current robot connection status (might be connected from a previous session if server didn't restart)
+    emit('robot_connection_status', {
+        'success': robot.is_connected, 
+        'message': f"Connected to {robot.current_target_host}" if robot.is_connected else 'Not connected to robot'
+    })
     emit('drawing_history_updated', get_ui_history_summary(drawing_history))
 
     current_active_drawing = get_drawing_from_history(active_drawing_session_id) if active_drawing_session_id else None
@@ -253,19 +397,32 @@ def handle_connect():
 
 @socketio.on('disconnect')
 def handle_disconnect(): logging.info(f"Client disconnected: {request.sid}")
+
 @socketio.on('robot_connect_request')
-def handle_robot_connect_request(json_data):
+def handle_robot_connect_request(data): # Data from client
     global is_drawing_active_flag
-    if is_drawing_active_flag: emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'}); return
-    success, message = robot.connect_robot()
+    if is_drawing_active_flag: 
+        emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'})
+        return
+    
+    # Get the client's preference for real robot vs simulation
+    use_real = data.get('use_real_robot', config.USE_REAL_ROBOT_DEFAULT) # Default from config if not provided
+    logging.info(f"Robot connect request received. use_real_robot: {use_real}")
+    
+    success, message = robot.connect_robot(use_real=use_real)
     emit('robot_connection_status', {'success': success, 'message': message})
+
 @socketio.on('robot_disconnect_request')
 def handle_robot_disconnect_request(json_data):
     global is_drawing_active_flag
-    if is_drawing_active_flag: emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'}); return
+    if is_drawing_active_flag: 
+        emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'})
+        return
     success, message = robot.disconnect_robot(graceful=True)
     emit('robot_connection_status', {'success': robot.is_connected, 'message': message if success else "Failed to disconnect"})
 
+# ... (check_and_abort_active_drawing, handle_send_robot_command, etc. remain mostly the same)
+# Minor adjustment in handle_send_robot_command for initial connection if needed.
 def check_and_abort_active_drawing(command_description="Manual command"):
     global active_drawing_session_id, is_drawing_active_flag, drawing_history
     if active_drawing_session_id:
@@ -289,14 +446,24 @@ def handle_send_robot_command(json_data, triggered_by_llm=False):
             return False, "Drawing is active."
     elif not triggered_by_llm : 
         check_and_abort_active_drawing(f"Manual command '{json_data.get('type', 'N/A')}'")
+    
     command_type = json_data.get('type', 'raw')
     command_str = json_data.get('command_str') 
+    
+    # If robot is not connected and command is not 'go_home', attempt connection
+    # using the default from config, as specific choice is made via 'robot_connect_request'
     if not robot.is_connected and command_type not in ['go_home']: 
-        conn_success, conn_message = robot.connect_robot()
+        logging.info("Robot not connected. Attempting to connect with default settings before sending command.")
+        # For direct commands like this, it might be better to enforce connection first via UI
+        # Or, if we want to auto-connect, decide which target (real/sim) to use.
+        # For now, let's assume the user should connect first via the dedicated button.
+        # If RobotInterface.connect_robot() is called without 'use_real', it uses its internal default.
+        conn_success, conn_message = robot.connect_robot(use_real=config.USE_REAL_ROBOT_DEFAULT) # Use server default
         if not conn_success:
             if not triggered_by_llm: emit('command_response', {'success': False, 'message': f'Robot not connected & connection failed: {conn_message}', 'command_sent': command_type})
             return False, f'Robot not connected & connection failed: {conn_message}' 
-        emit('robot_connection_status', {'success': True, 'message': conn_message})
+        emit('robot_connection_status', {'success': True, 'message': conn_message}) # Update client
+        
     success, message = False, "Invalid command type"
     actual_command_sent = command_type
     if command_type == 'go_home':
@@ -310,10 +477,12 @@ def handle_send_robot_command(json_data, triggered_by_llm=False):
     elif command_type == 'raw' and command_str:
         success, message = robot.send_command_raw(command_str)
         actual_command_sent = command_str
+        
     if not triggered_by_llm: emit('command_response', {'success': success, 'message': message, 'command_sent': actual_command_sent})
-    if not robot.is_connected: emit('robot_connection_status', {'success': False, 'message': 'Disconnected'})
+    if not robot.is_connected: emit('robot_connection_status', {'success': False, 'message': 'Disconnected'}) # Update if disconnect happened
     return success, message 
 
+# ... (handle_direct_image_upload, handle_audio_chunk, handle_submit_text_to_llm, etc. remain the same)
 @socketio.on('direct_image_upload')
 def handle_direct_image_upload(data):
     global active_drawing_session_id
@@ -401,28 +570,39 @@ def handle_submit_text_to_llm(data):
 def handle_send_custom_coordinates_event(data):
     logging.info(f"--- API: Event 'send_custom_coordinates' RECEIVED with data: {data} ---")
     check_and_abort_active_drawing("Manual coordinate input")
-    if not robot.is_connected: emit('command_response', {'success': False, 'message': 'Robot not connected.'}); return
+    if not robot.is_connected: 
+        emit('command_response', {'success': False, 'message': 'Robot not connected.'})
+        return
     try:
         x_py, z_py, y_py = float(data.get('x_py')), float(data.get('z_py')), float(data.get('y_py'))
         success, message = robot.move_to_position_py(x_py, z_py, y_py)
         emit('command_response', {'success': success, 'message': message, 'command_sent': f'Custom Coords: X={x_py}, Depth={z_py}, Side={y_py}'})
         if not robot.is_connected: emit('robot_connection_status', {'success': False, 'message': 'Disconnected'})
-    except Exception as e: logging.error(f"API Error in handle_send_custom_coordinates_event: {e}", exc_info=True); emit('command_response', {'success': False, 'message': f'Server error: {e}'})
+    except Exception as e: 
+        logging.error(f"API Error in handle_send_custom_coordinates_event: {e}", exc_info=True)
+        emit('command_response', {'success': False, 'message': f'Server error: {e}'})
 
 @socketio.on('request_threshold_preview')
 def handle_request_threshold_preview(data):
     logging.info(f"--- API: Event 'request_threshold_preview' RECEIVED with data: {data} ---")
     filepath, t1, t2 = data.get('filepath'), data.get('t1'), data.get('t2')
-    if not filepath or not os.path.exists(filepath) or t1 is None or t2 is None: emit('threshold_preview_image_response', {'error': 'Invalid data for preview.'}); return
+    if not filepath or not os.path.exists(filepath) or t1 is None or t2 is None: 
+        emit('threshold_preview_image_response', {'error': 'Invalid data for preview.'})
+        return
     try:
         edges_array = get_canny_edges_array(filepath, int(t1), int(t2)) 
         if edges_array is not None:
-            _, buffer = cv2.imencode('.png', edges_array); img_base64 = base64.b64encode(buffer).decode('utf-8')
+            _, buffer = cv2.imencode('.png', edges_array)
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
             emit('threshold_preview_image_response', {'image_base64': img_base64})
-        else: emit('threshold_preview_image_response', {'error': 'Failed to generate preview.'})
-    except Exception as e: logging.error(f"API Error generating threshold preview: {e}", exc_info=True); emit('threshold_preview_image_response', {'error': f'Server error: {e}'})
+        else: 
+            emit('threshold_preview_image_response', {'error': 'Failed to generate preview.'})
+    except Exception as e: 
+        logging.error(f"API Error generating threshold preview: {e}", exc_info=True)
+        emit('threshold_preview_image_response', {'error': f'Server error: {e}'})
 
-
+# _execute_drawing_commands and subsequent functions remain the same as the previous version
+# (process_image_for_drawing, resume_drawing_request, restart_drawing_request)
 def _execute_drawing_commands(drawing_session_id_to_execute):
     global is_drawing_active_flag, active_drawing_session_id, drawing_history
 
@@ -438,11 +618,9 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
     active_drawing_session_id = drawing_session_id_to_execute 
     
     original_filename = session_data['original_filename']
-    commands_to_execute = list(session_data['robot_commands_tuples']) # Use a copy
+    commands_to_execute = list(session_data['robot_commands_tuples']) 
 
-    # --- MODIFIED SIGNATURE LOGIC ---
-    # Append signature commands by processing the signature.jpg image
-    if session_data.get('is_image_drawing', True): # Check if a signature should be appended
+    if session_data.get('is_image_drawing', True): 
         if not os.path.exists(SIGNATURE_IMAGE_FULL_PATH):
             logging.error(f"Signature image not found at {SIGNATURE_IMAGE_FULL_PATH}. Skipping signature.")
             emit('command_response', {'success': False, 'message': f"Signature image missing. Drawing '{original_filename}' without signature."})
@@ -453,7 +631,7 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
                     SIGNATURE_IMAGE_FULL_PATH, 
                     config.SIGNATURE_CANNY_THRESHOLD1, 
                     config.SIGNATURE_CANNY_THRESHOLD2,
-                    optimize=True # You might want to optimize signature paths too
+                    optimize=True 
                 )
                 if signature_robot_commands:
                     logging.info(f"Appending {len(signature_robot_commands)} signature commands (from image) to drawing '{original_filename}'.")
@@ -465,7 +643,6 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
             except Exception as sig_e:
                 logging.error(f"Error processing signature image '{config.SIGNATURE_IMAGE_FILENAME}': {sig_e}", exc_info=True)
                 emit('command_response', {'success': False, 'message': f"Error processing signature image. Drawing '{original_filename}' without signature."})
-    # --- END MODIFIED SIGNATURE LOGIC ---
 
     start_index = session_data['current_command_index']
     total_commands = session_data['total_commands'] 
@@ -477,7 +654,15 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
 
     try:
         if not robot.is_connected:
-            conn_success, conn_msg = robot.connect_robot()
+            # Attempt to connect using the choice made by the user during the initial "Connect" action
+            # This assumes robot.current_target_host/port are set if a previous connection attempt was made.
+            # If they are None, it means no connection attempt was made, so use default.
+            use_real_for_reconnect = config.USE_REAL_ROBOT_DEFAULT
+            if robot.current_target_host == config.REAL_ROBOT_HOST:
+                 use_real_for_reconnect = True
+            
+            logging.info(f"Robot not connected. Attempting to reconnect for drawing (use_real={use_real_for_reconnect})...")
+            conn_success, conn_msg = robot.connect_robot(use_real=use_real_for_reconnect)
             if not conn_success:
                 emit('command_response', {'success': False, 'message': f"Robot connection failed: {conn_msg}"})
                 is_drawing_active_flag = False; active_drawing_session_id = None
@@ -508,7 +693,7 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
             
             success, msg = robot.send_command_raw(formatted_cmd_str)
             if not success:
-                is_drawing_active_flag = False; active_drawing_session_id = None
+                is_drawing_active_flag = False; # Keep active_drawing_session_id for resume
                 update_drawing_status_in_history(drawing_session_id_to_execute, "interrupted", i)
                 emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' interrupted. Ready to resume.", 'resumable': True, 'drawing_id': drawing_session_id_to_execute, 'original_filename': original_filename, 'progress': (i / total_commands) * 100 if total_commands > 0 else 0})
                 emit('drawing_history_updated', get_ui_history_summary(drawing_history))
@@ -517,22 +702,28 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
             
         update_drawing_status_in_history(drawing_session_id_to_execute, "completed", total_commands)
         emit('command_response', {'success': True, 'message': f"Sent all {total_commands} commands for '{original_filename}'."})
-        emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete.", 'resumable': False, 'drawing_id': drawing_session_id_to_execute})
+        emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete.", 'resumable': False, 'drawing_id': drawing_session_id_to_execute}) # Ensure active:False is sent
         emit('drawing_history_updated', get_ui_history_summary(drawing_history))
         robot.go_home() 
-        is_drawing_active_flag = False; active_drawing_session_id = None
+        is_drawing_active_flag = False
+        active_drawing_session_id = None # Clear active session ID on completion
 
     except Exception as e:
         logging.error(f"Error during drawing execution for '{original_filename}': {e}", exc_info=True)
-        is_drawing_active_flag = False; active_drawing_session_id = None
+        is_drawing_active_flag = False # Keep active_drawing_session_id for resume
         current_idx = session_data.get('current_command_index', start_index) 
         update_drawing_status_in_history(drawing_session_id_to_execute, "interrupted_error", current_idx)
         emit('command_response', {'success': False, 'message': f"Error during drawing: {e}"})
         emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' failed with server error. Ready to resume.", 'resumable': True, 'drawing_id': drawing_session_id_to_execute, 'original_filename': original_filename, 'progress': (current_idx / total_commands) * 100 if total_commands > 0 else 0})
         emit('drawing_history_updated', get_ui_history_summary(drawing_history))
     finally:
-        if not is_drawing_active_flag and active_drawing_session_id == drawing_session_id_to_execute:
-            active_drawing_session_id = None 
+        # This check is important: only clear active_drawing_session_id if the drawing truly finished or was unrecoverably aborted.
+        # If it was interrupted for resume, active_drawing_session_id should persist.
+        # The 'completed' status or an explicit abort signal should lead to clearing it.
+        current_status = get_drawing_from_history(drawing_session_id_to_execute)
+        if current_status and current_status['status'] == 'completed':
+             active_drawing_session_id = None
+        # If is_drawing_active_flag is false but it wasn't a clean completion, active_drawing_session_id might still be set for resume.
         logging.info(f"Drawing execution for '{original_filename}' (ID: {drawing_session_id_to_execute}) ended. Active flag: {is_drawing_active_flag}, Active ID: {active_drawing_session_id}")
 
 
@@ -577,7 +768,7 @@ def handle_process_image_for_drawing(data):
             'canny_t2': canny_t2,
             'status': 'pending_execution', 
             'timestamp': datetime.now().isoformat(),
-            'is_image_drawing': True # Flag to indicate this includes an image (and thus should get a signature)
+            'is_image_drawing': True 
         }
         add_or_update_drawing_in_history(new_drawing_data) 
         
@@ -642,15 +833,6 @@ def handle_restart_drawing_request(data):
         logging.info(f"Restarting drawing of '{session_to_restart['original_filename']}' from the beginning.")
         session_to_restart['current_command_index'] = 0
         session_to_restart['status'] = 'pending_restart' 
-        # Re-fetch original image commands, signature will be re-appended in _execute_drawing_commands
-        # This assumes 'robot_commands_tuples' in history is the *original image commands only*
-        # If it already included a signature, this logic might need to ensure it's only image commands.
-        # For now, assuming process_image_for_drawing stores only image commands initially.
-        # If the original file path is not available, we cannot truly restart from image processing.
-        # Let's assume for now that 'robot_commands_tuples' in history is sufficient for a "command restart".
-        # If a full re-processing from the original image file is needed for restart,
-        # then `filepath_on_server` must be valid and `process_image_to_robot_commands_pipeline` called again.
-        # The current `_execute_drawing_commands` will re-add the signature from the signature.jpg.
         
         add_or_update_drawing_in_history(session_to_restart.copy()) 
 
