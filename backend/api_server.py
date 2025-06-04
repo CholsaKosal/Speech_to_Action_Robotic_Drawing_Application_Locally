@@ -2,7 +2,7 @@
 from flask import Flask, request, render_template_string, jsonify, send_file
 from flask_socketio import SocketIO, emit
 from robot_interface import RobotInterface
-import config # Now imports SIGNATURE_POINTS_RAW from config
+import config 
 from image_processing_engine import process_image_to_robot_commands_pipeline, get_canny_edges_array 
 from voice_assistant import transcribe_audio, load_whisper_model, load_llm_model, process_command_with_llm_stream 
 
@@ -31,18 +31,24 @@ logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_very_secret_key_here!' 
-app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), config.QR_UPLOAD_FOLDER)
-app.config['AUDIO_TEMP_FOLDER_PATH'] = os.path.join(os.path.dirname(__file__), config.AUDIO_TEMP_FOLDER)
+# Construct full paths for UPLOAD_FOLDER and AUDIO_TEMP_FOLDER relative to this script's location
+BASE_DIR = os.path.dirname(__file__)
+app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, config.QR_UPLOAD_FOLDER)
+app.config['AUDIO_TEMP_FOLDER_PATH'] = os.path.join(BASE_DIR, config.AUDIO_TEMP_FOLDER)
+ASSETS_DIR = os.path.join(BASE_DIR, config.ASSETS_FOLDER_NAME) # For signature image
 
-DRAWING_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "drawing_history.json")
+DRAWING_HISTORY_FILE = os.path.join(BASE_DIR, "drawing_history.json")
 MAX_DRAWING_HISTORY = 5
 
 
 # Create directories if they don't exist
-for folder_path in [app.config['UPLOAD_FOLDER'], app.config['AUDIO_TEMP_FOLDER_PATH']]:
+for folder_path in [app.config['UPLOAD_FOLDER'], app.config['AUDIO_TEMP_FOLDER_PATH'], ASSETS_DIR]:
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
         logging.info(f"Created folder at: {folder_path}")
+
+# Construct full path for signature image
+SIGNATURE_IMAGE_FULL_PATH = os.path.join(ASSETS_DIR, config.SIGNATURE_IMAGE_FILENAME)
 
 # Load AI models
 logging.info("--- Initializing AI Models ---")
@@ -171,37 +177,7 @@ def update_drawing_status_in_history(drawing_id, status, current_command_index=N
         return True
     return False
 
-def create_signature_commands():
-    """
-    Generates robot commands for drawing the signature defined in config.SIGNATURE_POINTS_RAW.
-    Returns a list of (X_py, Z_depth_py, Y_py) tuples.
-    """
-    signature_cmds = []
-    if not config.SIGNATURE_POINTS_RAW:
-        return signature_cmds
-
-    # Assuming SIGNATURE_POINTS_RAW is a flat list of (X_robot, Z_robot_side) tuples
-    # representing a single continuous stroke after initial pen down.
-    # Or, if it's structured as multiple strokes, this logic would need adjustment.
-
-    # For the first point: move pen up to it, then pen down
-    first_point_x, first_point_y_side = config.SIGNATURE_POINTS_RAW[0]
-    signature_cmds.append((first_point_x, config.PEN_UP_Z_PY, first_point_y_side))
-    signature_cmds.append((first_point_x, config.PEN_DOWN_Z_PY, first_point_y_side))
-
-    # For subsequent points, keep pen down
-    for i in range(1, len(config.SIGNATURE_POINTS_RAW)):
-        point_x, point_y_side = config.SIGNATURE_POINTS_RAW[i]
-        signature_cmds.append((point_x, config.PEN_DOWN_Z_PY, point_y_side))
-    
-    # After the last point, lift the pen
-    if config.SIGNATURE_POINTS_RAW:
-        last_point_x, last_point_y_side = config.SIGNATURE_POINTS_RAW[-1]
-        signature_cmds.append((last_point_x, config.PEN_UP_Z_PY, last_point_y_side))
-        
-    logging.info(f"Generated {len(signature_cmds)} commands for signature.")
-    return signature_cmds
-
+# Removed create_signature_commands() as signature is now from image
 
 load_drawing_history()
 
@@ -462,24 +438,37 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
     active_drawing_session_id = drawing_session_id_to_execute 
     
     original_filename = session_data['original_filename']
-    # Important: Make a copy of the commands list if it might be modified (e.g. by appending signature)
-    # For now, assuming robot_commands_tuples in history is the complete list for that specific drawing instance.
     commands_to_execute = list(session_data['robot_commands_tuples']) # Use a copy
 
-    # Check if signature needs to be appended (only for new or restarted image drawings, not for signature-only drawings)
-    # This logic might need refinement based on how you differentiate a "signature-only" drawing if that's a feature.
-    # For now, assume signature is appended to image drawings.
-    if session_data.get('is_image_drawing', True): # Add a flag to session_data if needed
-        signature_robot_commands = create_signature_commands()
-        if signature_robot_commands:
-            logging.info(f"Appending {len(signature_robot_commands)} signature commands to drawing '{original_filename}'.")
-            commands_to_execute.extend(signature_robot_commands)
-            # Update total_commands in the session_data if signature is added
-            session_data['total_commands'] = len(commands_to_execute) 
-            # No need to save history here, it will be saved before the first command of the main drawing
+    # --- MODIFIED SIGNATURE LOGIC ---
+    # Append signature commands by processing the signature.jpg image
+    if session_data.get('is_image_drawing', True): # Check if a signature should be appended
+        if not os.path.exists(SIGNATURE_IMAGE_FULL_PATH):
+            logging.error(f"Signature image not found at {SIGNATURE_IMAGE_FULL_PATH}. Skipping signature.")
+            emit('command_response', {'success': False, 'message': f"Signature image missing. Drawing '{original_filename}' without signature."})
+        else:
+            logging.info(f"Processing signature image from: {SIGNATURE_IMAGE_FULL_PATH}")
+            try:
+                signature_robot_commands = process_image_to_robot_commands_pipeline(
+                    SIGNATURE_IMAGE_FULL_PATH, 
+                    config.SIGNATURE_CANNY_THRESHOLD1, 
+                    config.SIGNATURE_CANNY_THRESHOLD2,
+                    optimize=True # You might want to optimize signature paths too
+                )
+                if signature_robot_commands:
+                    logging.info(f"Appending {len(signature_robot_commands)} signature commands (from image) to drawing '{original_filename}'.")
+                    commands_to_execute.extend(signature_robot_commands)
+                    session_data['total_commands'] = len(commands_to_execute) 
+                else:
+                    logging.warning(f"No commands generated from signature image '{config.SIGNATURE_IMAGE_FILENAME}'. Drawing without signature.")
+                    emit('command_response', {'success': False, 'message': f"Could not process signature image. Drawing '{original_filename}' without signature."})
+            except Exception as sig_e:
+                logging.error(f"Error processing signature image '{config.SIGNATURE_IMAGE_FILENAME}': {sig_e}", exc_info=True)
+                emit('command_response', {'success': False, 'message': f"Error processing signature image. Drawing '{original_filename}' without signature."})
+    # --- END MODIFIED SIGNATURE LOGIC ---
 
     start_index = session_data['current_command_index']
-    total_commands = session_data['total_commands'] # Use the potentially updated total_commands
+    total_commands = session_data['total_commands'] 
     
     logging.info(f"Executing/Resuming drawing '{original_filename}' (ID: {active_drawing_session_id}) from command {start_index + 1}/{total_commands}")
     update_drawing_status_in_history(active_drawing_session_id, "in_progress" if start_index == 0 else "in_progress_resumed", start_index)
@@ -575,23 +564,20 @@ def handle_process_image_for_drawing(data):
             emit('drawing_status_update', {'active': False, 'message': f"Failed to process '{original_filename}'.", 'resumable': False})
             return
         
-        # Signature commands are now added in _execute_drawing_commands
-        # num_cmds = len(robot_commands_tuples) # This will be updated if signature is added
-
         drawing_id = f"draw_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         
         new_drawing_data = {
             'drawing_id': drawing_id,
             'filepath_on_server': filepath_on_server,
             'original_filename': original_filename,
-            'robot_commands_tuples': robot_commands_tuples, # Image commands only at this stage
+            'robot_commands_tuples': robot_commands_tuples, 
             'current_command_index': 0,
-            'total_commands': len(robot_commands_tuples), # Initial total before signature
+            'total_commands': len(robot_commands_tuples), 
             'canny_t1': canny_t1,
             'canny_t2': canny_t2,
             'status': 'pending_execution', 
             'timestamp': datetime.now().isoformat(),
-            'is_image_drawing': True # Flag to indicate this includes an image
+            'is_image_drawing': True # Flag to indicate this includes an image (and thus should get a signature)
         }
         add_or_update_drawing_in_history(new_drawing_data) 
         
@@ -656,6 +642,16 @@ def handle_restart_drawing_request(data):
         logging.info(f"Restarting drawing of '{session_to_restart['original_filename']}' from the beginning.")
         session_to_restart['current_command_index'] = 0
         session_to_restart['status'] = 'pending_restart' 
+        # Re-fetch original image commands, signature will be re-appended in _execute_drawing_commands
+        # This assumes 'robot_commands_tuples' in history is the *original image commands only*
+        # If it already included a signature, this logic might need to ensure it's only image commands.
+        # For now, assuming process_image_for_drawing stores only image commands initially.
+        # If the original file path is not available, we cannot truly restart from image processing.
+        # Let's assume for now that 'robot_commands_tuples' in history is sufficient for a "command restart".
+        # If a full re-processing from the original image file is needed for restart,
+        # then `filepath_on_server` must be valid and `process_image_to_robot_commands_pipeline` called again.
+        # The current `_execute_drawing_commands` will re-add the signature from the signature.jpg.
+        
         add_or_update_drawing_in_history(session_to_restart.copy()) 
 
         emit('drawing_status_update', {
@@ -678,4 +674,3 @@ if __name__ == '__main__':
     app.config['SERVER_PORT'] = server_port 
     logging.info(f"Starting Python backend server (SocketIO with Flask) on port {server_port}...")
     socketio.run(app, host='0.0.0.0', port=server_port, debug=True, use_reloader=False)
-

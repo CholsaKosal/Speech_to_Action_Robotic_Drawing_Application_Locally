@@ -91,12 +91,12 @@ function App() {
   const [thresholdPreviewImage, setThresholdPreviewImage] = useState<string | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
 
-  const clearActiveDrawingState = () => {
+  const clearActiveDrawingState = useCallback(() => { // useCallback to ensure stable reference if needed
     setIsDrawingActive(false);
     setActiveDrawingId(null);
     setDrawingProgressMessage('Idle');
     setDrawingProgressPercent(0);
-  };
+  }, []); // Dependencies for useCallback, empty if no external state is used inside that changes
 
   useEffect(() => {
     socket = io(PYTHON_BACKEND_URL, { transports: ['websocket'] });
@@ -157,7 +157,7 @@ function App() {
         active: boolean, 
         message: string, 
         progress?: number, 
-        resumable?: boolean, // This indicates if the specific drawing ID is resumable
+        resumable?: boolean, 
         drawing_id?: string,
         original_filename?: string 
       }) => {
@@ -167,15 +167,16 @@ function App() {
         setDrawingProgressPercent(data.progress);
       }
 
+      // --- MODIFIED LOGIC HERE ---
       if (data.active) {
-        setIsDrawingActive(true);
-        if(data.drawing_id) setActiveDrawingId(data.drawing_id);
-      } else {
-        // If drawing is no longer active for this specific ID, or in general
-        if (activeDrawingId === data.drawing_id || !data.drawing_id) {
-            clearActiveDrawingState();
+        setIsDrawingActive(true); // Set drawing as active
+        if (data.drawing_id) {
+          setActiveDrawingId(data.drawing_id); // Track the active drawing ID
         }
+      } else { // data.active is false
+        clearActiveDrawingState(); // Always clear active state if backend says drawing is not active
       }
+      // --- END MODIFIED LOGIC ---
     });
 
     socket.on('drawing_history_updated', (history: DrawingHistoryItem[]) => {
@@ -240,7 +241,7 @@ function App() {
         }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); 
+  }, [clearActiveDrawingState]); // Added clearActiveDrawingState to dependency array of main useEffect
 
   const requestThresholdPreview = useCallback((key: string) => {
     const selectedOpt = THRESHOLD_OPTIONS.find(opt => opt.key === key);
@@ -268,11 +269,15 @@ function App() {
   const sendGoHomeCommand = () => { 
     if (!isDrawingActive && socket) {
       socket.emit('send_robot_command', { type: 'go_home' }); 
+    } else if (isDrawingActive) {
+      alert("Cannot send 'Go Home' command while drawing is active.");
     }
   }
   const sendSafeCenterCommand = () => { 
     if (!isDrawingActive && socket) {
       socket.emit('send_robot_command', { type: 'move_to_safe_center' }); 
+    } else if (isDrawingActive) {
+      alert("Cannot send 'Safe Center' command while drawing is active.");
     }
   }
   
@@ -499,7 +504,7 @@ function App() {
     section: { backgroundColor: '#2a2a2a', padding: '20px', borderRadius: '8px', boxShadow: '0 4px 8px rgba(0,0,0,0.2)', display: 'flex', flexDirection: 'column', minHeight: '300px' }, 
     sectionTitle: { fontSize: '1.5em', color: '#61dafb', borderBottom: '1px solid #444', paddingBottom: '10px', marginBottom: '15px' },
     button: { backgroundColor: '#007bff', color: 'white', border: 'none', padding: '10px 15px', borderRadius: '5px', cursor: 'pointer', fontSize: '1em', margin: '5px', transition: 'background-color 0.2s ease' },
-    buttonDisabled: { backgroundColor: '#555', cursor: 'not-allowed' },
+    buttonDisabled: { backgroundColor: '#555', cursor: 'not-allowed', opacity: 0.6 }, // Added opacity for better visual cue
     micButton: { backgroundColor: isRecording ? '#dc3545' : '#007bff', width: '60px', height: '60px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' },
     textarea: { width: 'calc(100% - 22px)', padding: '10px', marginBottom: '10px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff', minHeight: '60px' },
     imageUploadContainer: { display: 'flex', flexDirection: 'column', gap: '20px'}, 
@@ -771,4 +776,3 @@ function App() {
 }
 
 export default App;
-

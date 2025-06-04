@@ -10,6 +10,7 @@
 │   ├── rapid_code_for_controlling_the_robot_movement.txt
 │   ├── requirements.txt
 │   ├── robot_interface.py
+│   ├── signature_data.py
 │   └── voice_assistant.py
 ├── exclude_patterns.conf
 └── frontend
@@ -36,7 +37,7 @@
         ├── tsconfig.node.json
         └── vite.config.ts
 
-7 directories, 30 files
+7 directories, 31 files
 
 
 =======================================
@@ -96,6 +97,7 @@ dmypy.json
 backend/qr_uploads/
 backend/models/
 backend/audio_tmp/
+backend/drawing_history.json
 
 # Log files
 *.log
@@ -117,6 +119,7 @@ frontend/s2a-drawing-ui/yarn-error.log*
 frontend/s2a-drawing-ui/pnpm-debug.log*
 frontend/s2a-drawing-ui/lerna-debug.log*
 frontend/s2a-drawing-ui/*.local
+
 
 # If you decide to use Tauri in the future for the frontend
 # frontend/s2a-drawing-ui/src-tauri/target/
@@ -158,9 +161,8 @@ Desktop.ini
 from flask import Flask, request, render_template_string, jsonify, send_file
 from flask_socketio import SocketIO, emit
 from robot_interface import RobotInterface
-import config # Your existing config
-from image_processing_engine import process_image_to_robot_commands_pipeline
-# Import STT and LLM functions from voice_assistant
+import config # Now imports SIGNATURE_POINTS_RAW from config
+from image_processing_engine import process_image_to_robot_commands_pipeline, get_canny_edges_array 
 from voice_assistant import transcribe_audio, load_whisper_model, load_llm_model, process_command_with_llm_stream 
 
 import os
@@ -170,115 +172,205 @@ from io import BytesIO
 import base64 
 import socket
 import time 
-import logging # For more controlled logging
+import logging 
+import cv2 
+import numpy as np 
+import json 
+from datetime import datetime
 
-# Configure basic logging with timestamps
+# Configure basic logging
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(name)s - %(module)s - %(funcName)s - %(lineno)d - %(message)s'
 )
-# Reduce verbosity of external libraries if desired
 logging.getLogger('engineio.server').setLevel(logging.WARNING) 
 logging.getLogger('socketio.server').setLevel(logging.WARNING) 
-logging.getLogger('werkzeug').setLevel(logging.WARNING) # Quiets down Flask's HTTP request logs unless error
+logging.getLogger('werkzeug').setLevel(logging.WARNING) 
 
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your_very_secret_key_here!'
+app.config['SECRET_KEY'] = 'your_very_secret_key_here!' 
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), config.QR_UPLOAD_FOLDER)
 app.config['AUDIO_TEMP_FOLDER_PATH'] = os.path.join(os.path.dirname(__file__), config.AUDIO_TEMP_FOLDER)
 
-# Create upload and audio temp directories if they don't exist
-if not os.path.exists(app.config['UPLOAD_FOLDER']):
-    os.makedirs(app.config['UPLOAD_FOLDER'])
-    logging.info(f"Created image upload folder at: {app.config['UPLOAD_FOLDER']}")
+DRAWING_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "drawing_history.json")
+MAX_DRAWING_HISTORY = 5
 
-if not os.path.exists(app.config['AUDIO_TEMP_FOLDER_PATH']):
-    os.makedirs(app.config['AUDIO_TEMP_FOLDER_PATH'])
-    logging.info(f"Created temporary audio folder at: {app.config['AUDIO_TEMP_FOLDER_PATH']}")
 
-# Load AI models when the application starts
+# Create directories if they don't exist
+for folder_path in [app.config['UPLOAD_FOLDER'], app.config['AUDIO_TEMP_FOLDER_PATH']]:
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+        logging.info(f"Created folder at: {folder_path}")
+
+# Load AI models
 logging.info("--- Initializing AI Models ---")
-whisper_model_loaded = load_whisper_model()
-if whisper_model_loaded:
-    logging.info("Whisper model loaded successfully during startup.")
-else:
-    logging.error("Whisper model FAILED to load during startup.")
-
-llm_instance = load_llm_model() 
-if llm_instance:
-    logging.info("LLM model loaded successfully during startup.")
-else:
-    logging.error("LLM model FAILED to load during startup. Check voice_assistant.py and model path in config.py.")
+if load_whisper_model(): logging.info("Whisper model loaded successfully.")
+else: logging.error("Whisper model FAILED to load.")
+if load_llm_model(): logging.info("LLM model loaded successfully.")
+else: logging.error("LLM model FAILED to load.")
 logging.info("--- AI Model Initialization Complete ---")
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet',
-                    max_http_buffer_size=10 * 1024 * 1024) 
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', max_http_buffer_size=10 * 1024 * 1024) 
 robot = RobotInterface() 
 
 current_upload_session_id = None
-is_drawing_active = False 
+is_drawing_active_flag = False 
+drawing_history = [] 
+active_drawing_session_id = None 
+
+def get_ui_history_summary(history_list):
+    """Converts raw history items to the summary structure expected by UI."""
+    ui_summary = []
+    for item in history_list:
+        total_commands = item.get('total_commands', 0)
+        current_index = item.get('current_command_index', 0)
+        status = item.get('status', 'unknown')
+        
+        progress_val = 0
+        if total_commands > 0:
+            progress_val = (current_index / total_commands) * 100
+        elif status == 'completed':
+            progress_val = 100
+            
+        ui_summary.append({
+            'drawing_id': item.get('drawing_id'),
+            'original_filename': item.get('original_filename'),
+            'status': status,
+            'progress': progress_val,
+            'last_updated': item.get('last_updated')
+        })
+    return ui_summary
+
+def save_drawing_history():
+    """Saves the drawing history to a file."""
+    global drawing_history
+    try:
+        with open(DRAWING_HISTORY_FILE, 'w') as f:
+            json.dump(drawing_history, f, indent=4)
+        logging.info(f"Drawing history saved to {DRAWING_HISTORY_FILE}")
+    except IOError as e:
+        logging.error(f"Error saving drawing history: {e}")
+
+def load_drawing_history():
+    """Loads drawing history from file if it exists."""
+    global drawing_history
+    if os.path.exists(DRAWING_HISTORY_FILE):
+        try:
+            with open(DRAWING_HISTORY_FILE, 'r') as f:
+                history_data = json.load(f)
+                if isinstance(history_data, list):
+                    valid_history = []
+                    for state in history_data:
+                        if isinstance(state, dict) and all(k in state for k in ['drawing_id', 'original_filename', 'status']):
+                            valid_history.append(state)
+                        else:
+                            logging.warning(f"Invalid entry found in {DRAWING_HISTORY_FILE}, skipping: {state}")
+                    drawing_history = valid_history[:MAX_DRAWING_HISTORY] 
+                    logging.info(f"Drawing history loaded with {len(drawing_history)} entries from {DRAWING_HISTORY_FILE}.")
+                else:
+                    logging.warning(f"Invalid data format in {DRAWING_HISTORY_FILE}. Initializing empty history.")
+                    drawing_history = []
+                    if os.path.exists(DRAWING_HISTORY_FILE): os.remove(DRAWING_HISTORY_FILE) 
+        except (IOError, json.JSONDecodeError) as e:
+            logging.error(f"Error loading drawing history: {e}. Initializing empty history.")
+            drawing_history = []
+            if os.path.exists(DRAWING_HISTORY_FILE): os.remove(DRAWING_HISTORY_FILE) 
+    else:
+        logging.info("No previous drawing history file found. Initializing empty history.")
+        drawing_history = []
+
+def clear_drawing_history_file(save=True):
+    """Deletes the drawing history file and optionally saves an empty history."""
+    if os.path.exists(DRAWING_HISTORY_FILE):
+        try:
+            os.remove(DRAWING_HISTORY_FILE)
+            logging.info(f"Drawing history file {DRAWING_HISTORY_FILE} deleted.")
+        except OSError as e:
+            logging.error(f"Error deleting drawing history file: {e}")
+    if save: 
+        global drawing_history
+        drawing_history = [] 
+        save_drawing_history() 
+
+def add_or_update_drawing_in_history(drawing_data):
+    global drawing_history, active_drawing_session_id
+    if 'drawing_id' not in drawing_data:
+        drawing_data['drawing_id'] = f"draw_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    drawing_data['last_updated'] = datetime.now().isoformat()
+    found_index = next((i for i, item in enumerate(drawing_history) if item.get('drawing_id') == drawing_data['drawing_id']), -1)
+    
+    if found_index != -1: 
+        drawing_history[found_index] = drawing_data
+    else: 
+        drawing_history.insert(0, drawing_data) 
+        drawing_history = drawing_history[:MAX_DRAWING_HISTORY]
+    
+    active_drawing_session_id = drawing_data['drawing_id'] 
+    save_drawing_history()
+    return drawing_data
+
+def get_drawing_from_history(drawing_id):
+    global drawing_history
+    return next((item for item in drawing_history if item.get('drawing_id') == drawing_id), None)
+
+def update_drawing_status_in_history(drawing_id, status, current_command_index=None):
+    global drawing_history, active_drawing_session_id
+    item = get_drawing_from_history(drawing_id)
+    if item:
+        item['status'] = status
+        item['last_updated'] = datetime.now().isoformat()
+        if current_command_index is not None:
+            item['current_command_index'] = current_command_index
+        if status in ["completed", "aborted_manual_override", "aborted_new_drawing", "aborted_new_action"]:
+            if active_drawing_session_id == drawing_id:
+                active_drawing_session_id = None 
+        save_drawing_history()
+        logging.info(f"Updated status of drawing '{drawing_id}' to '{status}'.")
+        return True
+    return False
+
+def create_signature_commands():
+    """
+    Generates robot commands for drawing the signature defined in config.SIGNATURE_POINTS_RAW.
+    Returns a list of (X_py, Z_depth_py, Y_py) tuples.
+    """
+    signature_cmds = []
+    if not config.SIGNATURE_POINTS_RAW:
+        return signature_cmds
+
+    # Assuming SIGNATURE_POINTS_RAW is a flat list of (X_robot, Z_robot_side) tuples
+    # representing a single continuous stroke after initial pen down.
+    # Or, if it's structured as multiple strokes, this logic would need adjustment.
+
+    # For the first point: move pen up to it, then pen down
+    first_point_x, first_point_y_side = config.SIGNATURE_POINTS_RAW[0]
+    signature_cmds.append((first_point_x, config.PEN_UP_Z_PY, first_point_y_side))
+    signature_cmds.append((first_point_x, config.PEN_DOWN_Z_PY, first_point_y_side))
+
+    # For subsequent points, keep pen down
+    for i in range(1, len(config.SIGNATURE_POINTS_RAW)):
+        point_x, point_y_side = config.SIGNATURE_POINTS_RAW[i]
+        signature_cmds.append((point_x, config.PEN_DOWN_Z_PY, point_y_side))
+    
+    # After the last point, lift the pen
+    if config.SIGNATURE_POINTS_RAW:
+        last_point_x, last_point_y_side = config.SIGNATURE_POINTS_RAW[-1]
+        signature_cmds.append((last_point_x, config.PEN_UP_Z_PY, last_point_y_side))
+        
+    logging.info(f"Generated {len(signature_cmds)} commands for signature.")
+    return signature_cmds
+
+
+load_drawing_history()
 
 UPLOAD_PAGE_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Upload Image</title>
-    <style>
-        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #f0f0f0; }
-        .container { background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); text-align: center; }
-        input[type="file"] { margin-bottom: 15px; display: block; margin-left: auto; margin-right: auto; }
-        button { padding: 10px 15px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 1em; }
-        button:hover { background-color: #0056b3; }
-        #message { margin-top: 15px; font-weight: bold; }
-        h2 { margin-top: 0; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>Select Image to Upload</h2>
-        <form id="uploadForm" method="post" enctype="multipart/form-data">
-            <input type="file" name="image" id="imageFile" accept="image/*" required>
-            <button type="submit">Upload</button>
-        </form>
-        <div id="message"></div>
-    </div>
-    <script>
-        document.getElementById('uploadForm').addEventListener('submit', async function(event) {
-            event.preventDefault();
-            const formData = new FormData(this);
-            const messageDiv = document.getElementById('message');
-            const submitButton = this.querySelector('button[type="submit"]');
-            const fileInput = this.querySelector('input[type="file"]');
-            messageDiv.textContent = 'Uploading...';
-            submitButton.disabled = true; fileInput.disabled = true;
-            try {
-                const response = await fetch(window.location.href, { method: 'POST', body: formData });
-                const result = await response.json();
-                if (response.ok) {
-                    messageDiv.textContent = 'Success: ' + result.message + '. You can close this page.';
-                    messageDiv.style.color = 'green';
-                } else {
-                    messageDiv.textContent = 'Error: ' + (result.error || 'Upload failed. Please try again.');
-                    messageDiv.style.color = 'red';
-                    submitButton.disabled = false; fileInput.disabled = false;
-                }
-            } catch (error) {
-                messageDiv.textContent = 'Network Error: ' + error.message + '. Please try again.';
-                messageDiv.style.color = 'red';
-                submitButton.disabled = false; fileInput.disabled = false;
-            }
-        });
-    </script>
-</body>
-</html>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Upload Image</title><style>body{font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;background-color:#f0f0f0}.container{background-color:white;padding:20px;border-radius:8px;box-shadow:0 0 10px rgba(0,0,0,.1);text-align:center}input[type=file]{margin-bottom:15px;display:block;margin-left:auto;margin-right:auto}button{padding:10px 15px;background-color:#007bff;color:white;border:none;border-radius:4px;cursor:pointer;font-size:1em}button:hover{background-color:#0056b3}#message{margin-top:15px;font-weight:700}h2{margin-top:0}</style></head><body><div class=container><h2>Select Image to Upload</h2><form id=uploadForm method=post enctype=multipart/form-data><input type=file name=image id=imageFile accept=image/* required><button type=submit>Upload</button></form><div id=message></div></div><script>document.getElementById("uploadForm").addEventListener("submit",async function(e){e.preventDefault();const t=new FormData(this),s=document.getElementById("message"),a=this.querySelector('button[type="submit"]'),i=this.querySelector('input[type="file"]');s.textContent="Uploading...",a.disabled=!0,i.disabled=!0;try{const e=await fetch(window.location.href,{method:"POST",body:t}),n=await e.json();e.ok?(s.textContent="Success: "+n.message+". You can close this page.",s.style.color="green"):(s.textContent="Error: "+(n.error||"Upload failed. Please try again."),s.style.color="red",a.disabled=!1,i.disabled=!1)}catch(e){s.textContent="Network Error: "+e.message+". Please try again.",s.style.color="red",a.disabled=!1,i.disabled=!1}})</script></body></html>
 """
 
 @app.route('/qr_upload_page/<session_id>', methods=['GET', 'POST'])
 def handle_qr_upload_page(session_id):
-    global current_upload_session_id
+    global current_upload_session_id, active_drawing_session_id
     if session_id != current_upload_session_id:
         return "Invalid or expired upload session.", 403
     if request.method == 'POST':
@@ -294,74 +386,102 @@ def handle_qr_upload_page(session_id):
             filepath_on_server = os.path.join(app.config['UPLOAD_FOLDER'], filename_on_server)
             try:
                 file.save(filepath_on_server)
+                if active_drawing_session_id:
+                    update_drawing_status_in_history(active_drawing_session_id, "aborted_new_action")
+                    active_drawing_session_id = None
                 socketio.emit('qr_image_received', { 
                     'success': True, 'message': f"Image '{original_filename}' uploaded via QR.",
                     'original_filename': original_filename, 'filepath_on_server': filepath_on_server
                 })
+                socketio.emit('drawing_history_updated', get_ui_history_summary(drawing_history))
                 current_upload_session_id = None 
                 return jsonify({"message": f"Image '{original_filename}' uploaded successfully!"}), 200
             except Exception as e:
-                socketio.emit('qr_image_received', {
-                    'success': False, 'message': f"Error saving '{original_filename}' on server.",
-                    'original_filename': original_filename
-                })
+                logging.error(f"Error saving QR uploaded file: {e}", exc_info=True)
+                socketio.emit('qr_image_received', {'success': False, 'message': f"Error saving '{original_filename}' on server.", 'original_filename': original_filename })
                 return jsonify({"error": "Failed to save file on server."}), 500
     return render_template_string(UPLOAD_PAGE_TEMPLATE)
 
 @socketio.on('connect')
 def handle_connect():
+    global drawing_history, is_drawing_active_flag, active_drawing_session_id
     logging.info(f"Client connected: {request.sid}")
     emit('response', {'data': 'Connected to Python backend!'})
-    emit('robot_connection_status', {'success': robot.is_connected,
-                                     'message': 'Connected to robot' if robot.is_connected else 'Not connected to robot'})
-    emit('drawing_status_update', {'active': is_drawing_active, 'message': 'Drawing in progress' if is_drawing_active else 'Idle'})
+    emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Connected to robot' if robot.is_connected else 'Not connected to robot'})
+    emit('drawing_history_updated', get_ui_history_summary(drawing_history))
+
+    current_active_drawing = get_drawing_from_history(active_drawing_session_id) if active_drawing_session_id else None
+    if is_drawing_active_flag and current_active_drawing:
+         emit('drawing_status_update', {
+            'active': True, 
+            'message': f"Drawing of '{current_active_drawing['original_filename']}' is in progress.",
+            'resumable': True, 
+            'drawing_id': current_active_drawing['drawing_id'],
+            'original_filename': current_active_drawing['original_filename'],
+            'progress': (current_active_drawing.get('current_command_index', 0) / current_active_drawing.get('total_commands', 1)) * 100 if current_active_drawing.get('total_commands', 0) > 0 else 0
+        })
+    else: 
+        last_interrupt = next((item for item in drawing_history if item.get('status') and 'interrupted' in item.get('status')), None)
+        if last_interrupt:
+            emit('drawing_status_update', {
+                'active': False, 
+                'message': f"Interrupted drawing of '{last_interrupt['original_filename']}' is available.",
+                'resumable': True,
+                'drawing_id': last_interrupt['drawing_id'],
+                'original_filename': last_interrupt['original_filename'],
+                'progress': (last_interrupt.get('current_command_index', 0) / last_interrupt.get('total_commands', 1)) * 100 if last_interrupt.get('total_commands', 0) > 0 else 0
+            })
+        else:
+            emit('drawing_status_update', {'active': False, 'message': 'Idle', 'resumable': False})
 
 @socketio.on('disconnect')
-def handle_disconnect():
-    logging.info(f"Client disconnected: {request.sid}")
-
+def handle_disconnect(): logging.info(f"Client disconnected: {request.sid}")
 @socketio.on('robot_connect_request')
 def handle_robot_connect_request(json_data):
-    global is_drawing_active
-    if is_drawing_active:
-        emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'})
-        return
+    global is_drawing_active_flag
+    if is_drawing_active_flag: emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'}); return
     success, message = robot.connect_robot()
     emit('robot_connection_status', {'success': success, 'message': message})
-
 @socketio.on('robot_disconnect_request')
 def handle_robot_disconnect_request(json_data):
-    global is_drawing_active
-    if is_drawing_active:
-        emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'})
-        return
+    global is_drawing_active_flag
+    if is_drawing_active_flag: emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'}); return
     success, message = robot.disconnect_robot(graceful=True)
     emit('robot_connection_status', {'success': robot.is_connected, 'message': message if success else "Failed to disconnect"})
 
+def check_and_abort_active_drawing(command_description="Manual command"):
+    global active_drawing_session_id, is_drawing_active_flag, drawing_history
+    if active_drawing_session_id:
+        logging.warning(f"{command_description} received, aborting active drawing '{active_drawing_session_id}'.")
+        update_drawing_status_in_history(active_drawing_session_id, "aborted_manual_override")
+        is_drawing_active_flag = False
+        emit('drawing_status_update', {'active': False, 'message': f"Drawing aborted due to {command_description}.", 'resumable': False, 'drawing_id': active_drawing_session_id}) 
+        emit('drawing_history_updated', get_ui_history_summary(drawing_history)) 
+        return True 
+    return False
+
 @socketio.on('send_robot_command') 
 def handle_send_robot_command(json_data, triggered_by_llm=False): 
-    global is_drawing_active
-    if is_drawing_active:
+    global is_drawing_active_flag
+    if is_drawing_active_flag:
         if triggered_by_llm:
-            logging.warning("LLM tried to send command while drawing active.")
-        else:
+            logging.warning(f"LLM command received while drawing active. Aborting current drawing: {active_drawing_session_id}")
+            check_and_abort_active_drawing(f"LLM command '{json_data.get('type', 'N/A')}'")
+        else: 
             emit('command_response', {'success': False, 'message': 'Cannot send manual commands while drawing is active.', 'command_sent': json_data.get('type', 'N/A')})
-        return False, "Drawing is active." # Indicate failure
-
+            return False, "Drawing is active."
+    elif not triggered_by_llm : 
+        check_and_abort_active_drawing(f"Manual command '{json_data.get('type', 'N/A')}'")
     command_type = json_data.get('type', 'raw')
     command_str = json_data.get('command_str') 
-    
-    if not robot.is_connected and command_type not in ['go_home']:
+    if not robot.is_connected and command_type not in ['go_home']: 
         conn_success, conn_message = robot.connect_robot()
         if not conn_success:
-            if not triggered_by_llm: 
-                emit('command_response', {'success': False, 'message': f'Robot not connected & connection failed: {conn_message}', 'command_sent': command_type})
+            if not triggered_by_llm: emit('command_response', {'success': False, 'message': f'Robot not connected & connection failed: {conn_message}', 'command_sent': command_type})
             return False, f'Robot not connected & connection failed: {conn_message}' 
         emit('robot_connection_status', {'success': True, 'message': conn_message})
-
     success, message = False, "Invalid command type"
     actual_command_sent = command_type
-
     if command_type == 'go_home':
         success, message = robot.go_home()
         x_h, z_h, y_h = config.ROBOT_HOME_POSITION_PY
@@ -373,225 +493,351 @@ def handle_send_robot_command(json_data, triggered_by_llm=False):
     elif command_type == 'raw' and command_str:
         success, message = robot.send_command_raw(command_str)
         actual_command_sent = command_str
-    elif command_type == 'raw' and not command_str:
-        message = "No command_str provided for raw command."
-        actual_command_sent = "N/A"
-    
-    if not triggered_by_llm: 
-        emit('command_response', {'success': success, 'message': message, 'command_sent': actual_command_sent})
-    
-    if not robot.is_connected: 
-         emit('robot_connection_status', {'success': False, 'message': 'Disconnected (possibly due to command error/timeout)'})
-    
+    if not triggered_by_llm: emit('command_response', {'success': success, 'message': message, 'command_sent': actual_command_sent})
+    if not robot.is_connected: emit('robot_connection_status', {'success': False, 'message': 'Disconnected'})
     return success, message 
-
-
-@socketio.on('request_qr_code')
-def handle_request_qr_code(data):
-    global current_upload_session_id, is_drawing_active
-    if is_drawing_active:
-        emit('qr_code_data', {'error': 'Drawing is currently active. Cannot generate new QR code.'})
-        return
-    current_upload_session_id = str(uuid.uuid4())
-    host_ip = request.host.split(':')[0]
-    if host_ip == '127.0.0.1' or host_ip == 'localhost':
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0.1); s.connect(("8.8.8.8", 80)); host_ip = s.getsockname()[0]; s.close()
-        except Exception as e:
-            host_ip = '127.0.0.1'
-    server_port = app.config.get('SERVER_PORT', 5555) 
-    upload_url = f"http://{host_ip}:{server_port}/qr_upload_page/{current_upload_session_id}"
-    qr_img = qrcode.make(upload_url); img_io = BytesIO(); qr_img.save(img_io, 'PNG'); img_io.seek(0)
-    img_base64 = base64.b64encode(img_io.getvalue()).decode('utf-8')
-    emit('qr_code_data', {'qr_image_base64': img_base64, 'upload_url': upload_url})
 
 @socketio.on('direct_image_upload')
 def handle_direct_image_upload(data):
-    global is_drawing_active
-    if is_drawing_active:
-        emit('direct_image_upload_response', {'success': False, 'message': 'Cannot upload image while drawing is active.'})
-        return
+    global active_drawing_session_id
+    check_and_abort_active_drawing("New direct image upload") 
     original_filename = data.get('filename')
     base64_data = data.get('fileData')
-    if not original_filename or not base64_data:
+    if not original_filename or not base64_data: 
         emit('direct_image_upload_response', {'success': False, 'message': 'Missing filename or file data.'})
         return
     try:
         image_data = base64.b64decode(base64_data)
         _, f_ext = os.path.splitext(original_filename)
-        if f_ext.lower() not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+        if f_ext.lower() not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']: 
             emit('direct_image_upload_response', {'success': False, 'message': f"Invalid file type: {f_ext}", 'original_filename': original_filename})
             return
         filename_on_server = str(uuid.uuid4()) + f_ext
         filepath_on_server = os.path.join(app.config['UPLOAD_FOLDER'], filename_on_server)
         with open(filepath_on_server, 'wb') as f: f.write(image_data)
-        emit('direct_image_upload_response', {
-            'success': True, 'message': f"Image '{original_filename}' uploaded.",
-            'original_filename': original_filename, 'filepath_on_server': filepath_on_server
-        })
-    except base64.binascii.Error:
-        emit('direct_image_upload_response', {'success': False, 'message': f"Error decoding image data.", 'original_filename': original_filename})
-    except Exception:
-        emit('direct_image_upload_response', {'success': False, 'message': f"Failed to save file on server.", 'original_filename': original_filename})
-
+        emit('direct_image_upload_response', { 'success': True, 'message': f"Image '{original_filename}' uploaded.", 'original_filename': original_filename, 'filepath_on_server': filepath_on_server })
+    except Exception as e: 
+        logging.error(f"Error in direct_image_upload: {e}", exc_info=True)
+        emit('direct_image_upload_response', {'success': False, 'message': f"Server error: {e}", 'original_filename': original_filename})
 
 @socketio.on('audio_chunk') 
 def handle_audio_chunk(data):
-    logging.info("--- API: 'audio_chunk' event received ---")
-    global is_drawing_active 
-
+    logging.info(f"--- API: Event 'audio_chunk' RECEIVED with data keys: {list(data.keys())} ---")
     audio_data_b64 = data.get('audioData')
     mime_type = data.get('mimeType', 'audio/webm') 
-    
-    if not audio_data_b64:
-        logging.error("API: No audio data (audioData key) in received chunk.")
-        emit('transcription_result', {'error': 'No audio data received.'})
-        emit('llm_response_chunk', {'error': 'No audio data for LLM.', 'done': True})
-        return
-    
+    if not audio_data_b64: logging.error("API: No audio data (audioData key) in received chunk."); emit('transcription_result', {'error': 'No audio data received.'}); return
     logging.info(f"API: Received audio data. Mime type: {mime_type}. Data length (chars): {len(audio_data_b64)}")
-
     try:
         audio_bytes = base64.b64decode(audio_data_b64)
-        logging.info(f"API: Base64 decoded. Byte length: {len(audio_bytes)}")
-        
-        file_extension = ".webm"
-        if 'wav' in mime_type: file_extension = ".wav"
-        elif 'mp3' in mime_type: file_extension = ".mp3"
-        
+        file_extension = ".webm"; mime_type_lower = mime_type.lower()
+        if 'wav' in mime_type_lower: file_extension = ".wav"
+        elif 'mp3' in mime_type_lower: file_extension = ".mp3"
         temp_audio_filename = f"voice_cmd_{uuid.uuid4()}{file_extension}"
         temp_audio_filepath = os.path.join(app.config['AUDIO_TEMP_FOLDER_PATH'], temp_audio_filename)
-        
         with open(temp_audio_filepath, 'wb') as f: f.write(audio_bytes)
-        logging.info(f"API: Temporary audio file saved: {temp_audio_filepath}")
-
         transcribed_text = transcribe_audio(temp_audio_filepath) 
+        if transcribed_text is not None: emit('transcription_result', {'text': transcribed_text}) 
+        else: emit('transcription_result', {'error': 'Transcription failed on server.'})
+        try: os.remove(temp_audio_filepath)
+        except Exception as e: logging.warning(f"API Warning: Error removing temporary audio file {temp_audio_filepath}: {e}")
+    except Exception as e: logging.error(f"API Error: Error processing audio chunk: {e}", exc_info=True); emit('transcription_result', {'error': f'Server error processing audio.'})
 
-        if transcribed_text is not None:
-            logging.info(f"API: Transcription successful: '{transcribed_text}'")
-            emit('transcription_result', {'text': transcribed_text}) 
-            
-            logging.info(f"API: Streaming transcribed text to LLM: '{transcribed_text}'")
-            parsed_action_command_from_llm = None 
 
-            for llm_response_part in process_command_with_llm_stream(transcribed_text):
-                emit('llm_response_chunk', llm_response_part) 
-                if llm_response_part.get("done"):
-                    logging.info("API: LLM stream finished or error occurred during stream.")
-                    if llm_response_part.get("parsed_action"):
-                        parsed_action_command_from_llm = llm_response_part["parsed_action"]
-                    break 
-            
-            if parsed_action_command_from_llm:
-                logging.info(f"API: Processing parsed action from LLM: {parsed_action_command_from_llm}")
-                action_type = parsed_action_command_from_llm.get("type")
-                parameters = parsed_action_command_from_llm.get("parameters", {})
-
-                if is_drawing_active:
-                    logging.warning(f"API: Drawing is active. LLM command '{action_type}' will not be executed now.")
-                elif action_type == "move":
-                    target = parameters.get("target")
-                    if target == "home":
-                        logging.info("API: Executing LLM command: move home")
-                        handle_send_robot_command({'type': 'go_home'}, triggered_by_llm=True)
-                    elif target == "center":
-                        logging.info("API: Executing LLM command: move to safe center")
-                        handle_send_robot_command({'type': 'move_to_safe_center'}, triggered_by_llm=True)
-                    else:
-                        logging.warning(f"API: LLM move command with unknown target: {target}")
-                elif action_type == "draw":
-                    shape = parameters.get("shape", "unknown shape")
-                    color = parameters.get("color", "")
-                    logging.info(f"API: LLM command: draw {color} {shape}. Feature not fully implemented for direct drawing.")
-                else:
-                    logging.info(f"API: LLM identified action type '{action_type}', but no handler implemented yet.")
-        else: 
-            logging.error("API: Transcription failed.")
-            emit('transcription_result', {'error': 'Transcription failed on server.'})
-            emit('llm_response_chunk', {'error': 'Cannot process with LLM, transcription failed.', 'done': True})
-
-        try:
-            os.remove(temp_audio_filepath)
-            logging.info(f"API: Temporary audio file removed: {temp_audio_filepath}")
-        except Exception as e:
-            logging.warning(f"API Warning: Error removing temporary audio file {temp_audio_filepath}: {e}")
-
-    except base64.binascii.Error as b64e:
-        logging.error(f"API Error: Base64 decoding failed. {b64e}")
-        emit('transcription_result', {'error': 'Invalid audio data format (base64 decode).'})
-        emit('llm_response_chunk', {'error': 'Cannot process with LLM, audio data error.', 'done': True})
-    except Exception as e:
-        logging.error(f"API Error: Error processing audio chunk: {e}", exc_info=True) 
-        emit('transcription_result', {'error': f'Server error processing audio.'})
-        emit('llm_response_chunk', {'error': f'Cannot process with LLM, server error.', 'done': True})
-
-@socketio.on('process_image_for_drawing')
-def handle_process_image_for_drawing(data):
-    global is_drawing_active
-    if is_drawing_active:
-        emit('command_response', {'success': False, 'message': "Another drawing is already in progress."})
+@socketio.on('submit_text_to_llm')
+def handle_submit_text_to_llm(data):
+    global is_drawing_active_flag, active_drawing_session_id 
+    logging.info(f"--- API: Event 'submit_text_to_llm' RECEIVED with data: {data} ---") 
+    text_command = data.get('text_command')
+    if not text_command: 
+        logging.error("API: No text_command in 'submit_text_to_llm' event.")
+        emit('llm_response_chunk', {'error': 'No text command received by server.', 'done': True})
         return
-    filepath_on_server = data.get('filepath')
-    original_filename = data.get('original_filename', os.path.basename(filepath_on_server or "unknown_image"))
-    if not filepath_on_server or not os.path.exists(filepath_on_server):
-        emit('command_response', {'success': False, 'message': f"File not found: {filepath_on_server}"})
-        return
-    emit('drawing_status_update', {'active': True, 'message': f"Processing '{original_filename}'..."})
-    is_drawing_active = True
-    canny_t1 = data.get('canny_t1', config.DEFAULT_CANNY_THRESHOLD1) 
-    canny_t2 = data.get('canny_t2', config.DEFAULT_CANNY_THRESHOLD2)
+    logging.info(f"API: Processing text command for LLM: '{text_command}'")
+    parsed_action_command_from_llm = None
     try:
-        robot_commands_tuples = process_image_to_robot_commands_pipeline(
-            filepath_on_server, canny_thresh1=canny_t1, canny_thresh2=canny_t2
-        )
-        if not robot_commands_tuples:
-            emit('command_response', {'success': False, 'message': f"No drawing commands for '{original_filename}'."})
-            is_drawing_active = False 
-            emit('drawing_status_update', {'active': False, 'message': f"Failed to process '{original_filename}'."})
-            return
-        num_cmds = len(robot_commands_tuples)
-        emit('drawing_status_update', {'active': True, 'message': f"Generated {num_cmds} commands. Preparing to draw..."})
+        for llm_response_part in process_command_with_llm_stream(text_command): 
+            emit('llm_response_chunk', llm_response_part) 
+            if llm_response_part.get("done"):
+                if llm_response_part.get("parsed_action"):
+                    parsed_action_command_from_llm = llm_response_part["parsed_action"]
+                break 
+        if parsed_action_command_from_llm:
+            action_type = parsed_action_command_from_llm.get("type")
+            if action_type in ["move", "move_to_coords"]: 
+                 if check_and_abort_active_drawing(f"LLM command '{action_type}'"):
+                    logging.info(f"LLM command '{action_type}' aborted a previous drawing.")
+            parameters = parsed_action_command_from_llm.get("parameters", {})
+            if action_type == "move":
+                target = parameters.get("target")
+                if target == "home": handle_send_robot_command({'type': 'go_home'}, triggered_by_llm=True)
+                elif target == "center": handle_send_robot_command({'type': 'move_to_safe_center'}, triggered_by_llm=True)
+            elif action_type == "move_to_coords":
+                x,y,z = parameters.get("x"), parameters.get("y"), parameters.get("z")
+                if x is not None and y is not None and z is not None:
+                    handle_send_robot_command({'type': 'raw', 'command_str': robot._format_command(x, y, z)}, triggered_by_llm=True)
+    except Exception as e: 
+        logging.error(f"API Error in handle_submit_text_to_llm: {e}", exc_info=True)
+        emit('llm_response_chunk', {'error': f'Server error: {e}', 'done': True})
+
+
+@socketio.on('send_custom_coordinates')
+def handle_send_custom_coordinates_event(data):
+    logging.info(f"--- API: Event 'send_custom_coordinates' RECEIVED with data: {data} ---")
+    check_and_abort_active_drawing("Manual coordinate input")
+    if not robot.is_connected: emit('command_response', {'success': False, 'message': 'Robot not connected.'}); return
+    try:
+        x_py, z_py, y_py = float(data.get('x_py')), float(data.get('z_py')), float(data.get('y_py'))
+        success, message = robot.move_to_position_py(x_py, z_py, y_py)
+        emit('command_response', {'success': success, 'message': message, 'command_sent': f'Custom Coords: X={x_py}, Depth={z_py}, Side={y_py}'})
+        if not robot.is_connected: emit('robot_connection_status', {'success': False, 'message': 'Disconnected'})
+    except Exception as e: logging.error(f"API Error in handle_send_custom_coordinates_event: {e}", exc_info=True); emit('command_response', {'success': False, 'message': f'Server error: {e}'})
+
+@socketio.on('request_threshold_preview')
+def handle_request_threshold_preview(data):
+    logging.info(f"--- API: Event 'request_threshold_preview' RECEIVED with data: {data} ---")
+    filepath, t1, t2 = data.get('filepath'), data.get('t1'), data.get('t2')
+    if not filepath or not os.path.exists(filepath) or t1 is None or t2 is None: emit('threshold_preview_image_response', {'error': 'Invalid data for preview.'}); return
+    try:
+        edges_array = get_canny_edges_array(filepath, int(t1), int(t2)) 
+        if edges_array is not None:
+            _, buffer = cv2.imencode('.png', edges_array); img_base64 = base64.b64encode(buffer).decode('utf-8')
+            emit('threshold_preview_image_response', {'image_base64': img_base64})
+        else: emit('threshold_preview_image_response', {'error': 'Failed to generate preview.'})
+    except Exception as e: logging.error(f"API Error generating threshold preview: {e}", exc_info=True); emit('threshold_preview_image_response', {'error': f'Server error: {e}'})
+
+
+def _execute_drawing_commands(drawing_session_id_to_execute):
+    global is_drawing_active_flag, active_drawing_session_id, drawing_history
+
+    session_data = get_drawing_from_history(drawing_session_id_to_execute)
+    if not session_data:
+        logging.error(f"Drawing session {drawing_session_id_to_execute} not found in history for execution.")
+        emit('drawing_status_update', {'active': False, 'message': "Error: Drawing session not found.", 'resumable': False, 'drawing_id': drawing_session_id_to_execute})
+        is_drawing_active_flag = False
+        if active_drawing_session_id == drawing_session_id_to_execute: active_drawing_session_id = None
+        return
+
+    is_drawing_active_flag = True
+    active_drawing_session_id = drawing_session_id_to_execute 
+    
+    original_filename = session_data['original_filename']
+    # Important: Make a copy of the commands list if it might be modified (e.g. by appending signature)
+    # For now, assuming robot_commands_tuples in history is the complete list for that specific drawing instance.
+    commands_to_execute = list(session_data['robot_commands_tuples']) # Use a copy
+
+    # Check if signature needs to be appended (only for new or restarted image drawings, not for signature-only drawings)
+    # This logic might need refinement based on how you differentiate a "signature-only" drawing if that's a feature.
+    # For now, assume signature is appended to image drawings.
+    if session_data.get('is_image_drawing', True): # Add a flag to session_data if needed
+        signature_robot_commands = create_signature_commands()
+        if signature_robot_commands:
+            logging.info(f"Appending {len(signature_robot_commands)} signature commands to drawing '{original_filename}'.")
+            commands_to_execute.extend(signature_robot_commands)
+            # Update total_commands in the session_data if signature is added
+            session_data['total_commands'] = len(commands_to_execute) 
+            # No need to save history here, it will be saved before the first command of the main drawing
+
+    start_index = session_data['current_command_index']
+    total_commands = session_data['total_commands'] # Use the potentially updated total_commands
+    
+    logging.info(f"Executing/Resuming drawing '{original_filename}' (ID: {active_drawing_session_id}) from command {start_index + 1}/{total_commands}")
+    update_drawing_status_in_history(active_drawing_session_id, "in_progress" if start_index == 0 else "in_progress_resumed", start_index)
+    emit('drawing_history_updated', get_ui_history_summary(drawing_history))
+
+
+    try:
         if not robot.is_connected:
             conn_success, conn_msg = robot.connect_robot()
             if not conn_success:
                 emit('command_response', {'success': False, 'message': f"Robot connection failed: {conn_msg}"})
-                is_drawing_active = False
-                emit('drawing_status_update', {'active': False, 'message': f"Drawing failed (robot connection)."})
+                is_drawing_active_flag = False; active_drawing_session_id = None
+                update_drawing_status_in_history(drawing_session_id_to_execute, "interrupted", start_index)
+                emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' interrupted (robot connection failed).", 'resumable': True, 'drawing_id': drawing_session_id_to_execute, 'original_filename': original_filename, 'progress': (start_index / total_commands) * 100 if total_commands > 0 else 0})
+                emit('drawing_history_updated', get_ui_history_summary(drawing_history))
                 return
             emit('robot_connection_status', {'success': True, 'message': conn_msg})
-        for i, cmd_tuple in enumerate(robot_commands_tuples):
-            x_py, z_py, y_py = cmd_tuple
-            formatted_cmd_str = robot._format_command(x_py, z_py, y_py)
-            progress_message = f"Drawing '{original_filename}': Cmd {i+1}/{num_cmds}"
-            emit('drawing_status_update', {'active': True, 'message': progress_message, 'progress': (i+1)/num_cmds * 100})
+        
+        if start_index == 0: 
+            safe_x, safe_z, safe_y = config.SAFE_ABOVE_CENTER_PY
+            success_safe, msg_safe = robot.move_to_position_py(safe_x, safe_z, safe_y)
+            if not success_safe:
+                is_drawing_active_flag = False; active_drawing_session_id = None
+                update_drawing_status_in_history(drawing_session_id_to_execute, "interrupted", 0)
+                emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' aborted (safe start failed).", 'resumable': True, 'drawing_id': drawing_session_id_to_execute, 'original_filename': original_filename, 'progress': 0})
+                emit('drawing_history_updated', get_ui_history_summary(drawing_history))
+                robot.go_home(); return
+
+        for i in range(start_index, total_commands):
+            session_data['current_command_index'] = i 
+            add_or_update_drawing_in_history(session_data.copy()) 
+            
+            x_py, z_py, y_py = commands_to_execute[i] 
+            formatted_cmd_str = robot._format_command(x_py, z_py, y_py) 
+            progress_message = f"Drawing '{original_filename}': Cmd {i+1}/{total_commands}"
+            emit('drawing_status_update', {'active': True, 'message': progress_message, 'progress': ((i+1)/total_commands) * 100, 'resumable': True, 'drawing_id': active_drawing_session_id, 'original_filename': original_filename})
+            
             success, msg = robot.send_command_raw(formatted_cmd_str)
             if not success:
-                error_message = f"Error cmd {i+1} ({formatted_cmd_str}): {msg}. Aborted."
-                emit('command_response', {'success': False, 'message': error_message})
-                emit('drawing_status_update', {'active': False, 'message': f"Drawing aborted."})
-                robot.go_home() 
-                is_drawing_active = False
+                is_drawing_active_flag = False; active_drawing_session_id = None
+                update_drawing_status_in_history(drawing_session_id_to_execute, "interrupted", i)
+                emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' interrupted. Ready to resume.", 'resumable': True, 'drawing_id': drawing_session_id_to_execute, 'original_filename': original_filename, 'progress': (i / total_commands) * 100 if total_commands > 0 else 0})
+                emit('drawing_history_updated', get_ui_history_summary(drawing_history))
                 return 
-            socketio.sleep(0.05) 
-        emit('command_response', {'success': True, 'message': f"Sent all {num_cmds} commands for '{original_filename}'."})
-        emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete."})
+            socketio.sleep(0.0005) 
+            
+        update_drawing_status_in_history(drawing_session_id_to_execute, "completed", total_commands)
+        emit('command_response', {'success': True, 'message': f"Sent all {total_commands} commands for '{original_filename}'."})
+        emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete.", 'resumable': False, 'drawing_id': drawing_session_id_to_execute})
+        emit('drawing_history_updated', get_ui_history_summary(drawing_history))
+        robot.go_home() 
+        is_drawing_active_flag = False; active_drawing_session_id = None
+
     except Exception as e:
-        emit('command_response', {'success': False, 'message': f"Error in drawing pipeline: {e}"})
-        emit('drawing_status_update', {'active': False, 'message': f"Error processing/drawing."})
+        logging.error(f"Error during drawing execution for '{original_filename}': {e}", exc_info=True)
+        is_drawing_active_flag = False; active_drawing_session_id = None
+        current_idx = session_data.get('current_command_index', start_index) 
+        update_drawing_status_in_history(drawing_session_id_to_execute, "interrupted_error", current_idx)
+        emit('command_response', {'success': False, 'message': f"Error during drawing: {e}"})
+        emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' failed with server error. Ready to resume.", 'resumable': True, 'drawing_id': drawing_session_id_to_execute, 'original_filename': original_filename, 'progress': (current_idx / total_commands) * 100 if total_commands > 0 else 0})
+        emit('drawing_history_updated', get_ui_history_summary(drawing_history))
     finally:
-        is_drawing_active = False
+        if not is_drawing_active_flag and active_drawing_session_id == drawing_session_id_to_execute:
+            active_drawing_session_id = None 
+        logging.info(f"Drawing execution for '{original_filename}' (ID: {drawing_session_id_to_execute}) ended. Active flag: {is_drawing_active_flag}, Active ID: {active_drawing_session_id}")
+
+
+@socketio.on('process_image_for_drawing')
+def handle_process_image_for_drawing(data):
+    global is_drawing_active_flag, active_drawing_session_id
+    
+    if is_drawing_active_flag: 
+        emit('command_response', {'success': False, 'message': "Another drawing is already in progress or active."})
+        return
+
+    if active_drawing_session_id: 
+        update_drawing_status_in_history(active_drawing_session_id, "aborted_new_drawing")
+    active_drawing_session_id = None 
+
+    filepath_on_server = data.get('filepath')
+    original_filename = data.get('original_filename', os.path.basename(filepath_on_server or "unknown_image"))
+    if not filepath_on_server or not os.path.exists(filepath_on_server): 
+        emit('command_response', {'success': False, 'message': f"File not found: {filepath_on_server}"}); return
+    
+    canny_t1, canny_t2 = data.get('canny_t1', config.DEFAULT_CANNY_THRESHOLD1), data.get('canny_t2', config.DEFAULT_CANNY_THRESHOLD2)
+    logging.info(f"API: Processing image for new drawing: '{original_filename}' with T1={canny_t1}, T2={canny_t2}")
+    emit('drawing_status_update', {'active': True, 'message': f"Processing '{original_filename}'...", 'resumable': False}) 
+
+    try:
+        robot_commands_tuples = process_image_to_robot_commands_pipeline(filepath_on_server, canny_t1, canny_t2)
+        if not robot_commands_tuples: 
+            emit('command_response', {'success': False, 'message': f"No drawing commands for '{original_filename}'."})
+            emit('drawing_status_update', {'active': False, 'message': f"Failed to process '{original_filename}'.", 'resumable': False})
+            return
+        
+        # Signature commands are now added in _execute_drawing_commands
+        # num_cmds = len(robot_commands_tuples) # This will be updated if signature is added
+
+        drawing_id = f"draw_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        
+        new_drawing_data = {
+            'drawing_id': drawing_id,
+            'filepath_on_server': filepath_on_server,
+            'original_filename': original_filename,
+            'robot_commands_tuples': robot_commands_tuples, # Image commands only at this stage
+            'current_command_index': 0,
+            'total_commands': len(robot_commands_tuples), # Initial total before signature
+            'canny_t1': canny_t1,
+            'canny_t2': canny_t2,
+            'status': 'pending_execution', 
+            'timestamp': datetime.now().isoformat(),
+            'is_image_drawing': True # Flag to indicate this includes an image
+        }
+        add_or_update_drawing_in_history(new_drawing_data) 
+        
+        emit('drawing_status_update', {'active': True, 'message': f"Generated {len(robot_commands_tuples)} image commands. Preparing to draw '{original_filename}'.", 'resumable': True, 'drawing_id': drawing_id, 'original_filename': original_filename, 'progress': 0})
+        emit('drawing_history_updated', get_ui_history_summary(drawing_history))
+        
+        _execute_drawing_commands(drawing_id) 
+
+    except Exception as e: 
+        logging.error(f"Error in initial processing for drawing '{original_filename}': {e}", exc_info=True)
+        emit('command_response', {'success': False, 'message': f"Error processing image: {e}"})
+        emit('drawing_status_update', {'active': False, 'message': f"Error processing '{original_filename}'.", 'resumable': False})
+        active_drawing_session_id = None 
+        is_drawing_active_flag = False
+
+@socketio.on('resume_drawing_request')
+def handle_resume_drawing_request(data):
+    global is_drawing_active_flag, active_drawing_session_id
+    drawing_id_to_resume = data.get('drawing_id')
+    logging.info(f"--- API: Event 'resume_drawing_request' RECEIVED for drawing_id: {drawing_id_to_resume} ---")
+
+    if is_drawing_active_flag:
+        logging.warning(f"Resume requested for {drawing_id_to_resume}, but a drawing ('{active_drawing_session_id}') is already active.")
+        emit('drawing_status_update', {'active': True, 'message': "Cannot resume, another drawing is currently active.", 'resumable': True if active_drawing_session_id else False, 'drawing_id': active_drawing_session_id})
+        return
+
+    session_to_resume = get_drawing_from_history(drawing_id_to_resume)
+
+    if session_to_resume:
+        if session_to_resume.get('status') == 'completed':
+            logging.info(f"Drawing '{session_to_resume['original_filename']}' is already completed. Cannot resume.")
+            emit('drawing_status_update', {'active': False, 'message': f"Drawing '{session_to_resume['original_filename']}' is already completed.", 'resumable': False, 'drawing_id': drawing_id_to_resume})
+            return
+        
+        logging.info(f"Attempting to resume drawing of '{session_to_resume['original_filename']}' from command {session_to_resume['current_command_index'] + 1}")
+        emit('drawing_status_update', {
+            'active': True, 
+            'message': f"Resuming drawing of '{session_to_resume['original_filename']}'...",
+            'resumable': True,
+            'drawing_id': drawing_id_to_resume,
+            'original_filename': session_to_resume['original_filename'],
+            'progress': (session_to_resume['current_command_index'] / session_to_resume['total_commands']) * 100 if session_to_resume['total_commands'] > 0 else 0
+        })
+        _execute_drawing_commands(drawing_id_to_resume) 
+    else:
+        logging.warning(f"Resume requested for drawing_id {drawing_id_to_resume}, but no such drawing state found in history.")
+        emit('drawing_status_update', {'active': False, 'message': "Drawing session to resume not found.", 'resumable': False})
+
+@socketio.on('restart_drawing_request')
+def handle_restart_drawing_request(data):
+    global is_drawing_active_flag, active_drawing_session_id, drawing_history
+    drawing_id_to_restart = data.get('drawing_id')
+    logging.info(f"--- API: Event 'restart_drawing_request' RECEIVED for drawing_id: {drawing_id_to_restart} ---")
+
+    if is_drawing_active_flag:
+        logging.warning(f"Restart requested for {drawing_id_to_restart}, but a drawing ('{active_drawing_session_id}') is already active.")
+        emit('drawing_status_update', {'active': True, 'message': "Cannot restart, another drawing is currently active.", 'resumable': True if active_drawing_session_id else False, 'drawing_id': active_drawing_session_id})
+        return
+
+    session_to_restart = get_drawing_from_history(drawing_id_to_restart)
+    if session_to_restart:
+        logging.info(f"Restarting drawing of '{session_to_restart['original_filename']}' from the beginning.")
+        session_to_restart['current_command_index'] = 0
+        session_to_restart['status'] = 'pending_restart' 
+        add_or_update_drawing_in_history(session_to_restart.copy()) 
+
+        emit('drawing_status_update', {
+            'active': True, 
+            'message': f"Restarting drawing of '{session_to_restart['original_filename']}'...",
+            'resumable': True, 
+            'drawing_id': drawing_id_to_restart,
+            'original_filename': session_to_restart['original_filename'],
+            'progress': 0
+        })
+        emit('drawing_history_updated', get_ui_history_summary(drawing_history))
+        _execute_drawing_commands(drawing_id_to_restart)
+    else:
+        logging.warning(f"Restart requested for drawing_id {drawing_id_to_restart}, but no such drawing state found in history.")
+        emit('drawing_status_update', {'active': False, 'message': "Drawing session to restart not found.", 'resumable': False})
 
 
 if __name__ == '__main__':
     server_port = 5555 
     app.config['SERVER_PORT'] = server_port 
-
     logging.info(f"Starting Python backend server (SocketIO with Flask) on port {server_port}...")
-    logging.info(f"Frontend should connect to ws://localhost:{server_port}")
-    logging.info(f"QR code upload page will be accessible via http://<YOUR_LOCAL_IP>:{server_port}/qr_upload_page/<session_id>")
-    
     socketio.run(app, host='0.0.0.0', port=server_port, debug=True, use_reloader=False)
+
 
 --- END OF FILE: backend/api_server.py ---
 --- START OF FILE: backend/config.py ---
@@ -615,7 +861,7 @@ QR_UPLOAD_FOLDER = 'qr_uploads' # Relative to the backend directory
 # Z is typically the pen height/depth axis for drawing.
 # Y is typically the left/right axis on the paper for drawing.
 
-ROBOT_HOME_POSITION_PY = (409.328464947, -350.922061873, 30.699294352)
+ROBOT_HOME_POSITION_PY = (300, -350.922061873, 300)
 SAFE_ABOVE_CENTER_PY = (0.00, -150.0, 0.00)
 
 # --- Drawing Constants (adapted from original main.py) ---
@@ -634,9 +880,21 @@ PEN_DOWN_Z_PY = -7.0 # Pen down position (e.g., -7mm from WorkSpaceCenter1's XY 
 
 MIN_CONTOUR_LENGTH_PX = 50 # Minimum contour length in pixels to consider from image processing
 
-# Default Canny edge detection thresholds
 DEFAULT_CANNY_THRESHOLD1 = 50
 DEFAULT_CANNY_THRESHOLD2 = 150
+
+# --- Signature Points ---
+# Import from the separate signature_data.py file
+try:
+    from .signature_data import SIGNATURE_POINTS_RAW
+    # If you used SIGNATURE_STROKES_RAW, import that instead:
+    # from .signature_data import SIGNATURE_STROKES_RAW
+except ImportError:
+    # Fallback or error handling if the file/variable isn't found
+    SIGNATURE_POINTS_RAW = () # Default to empty tuple if import fails
+    # SIGNATURE_STROKES_RAW = [] 
+    print("WARNING: Could not import signature data. Signature will be empty.")
+
 
 # --- Temporary Audio File Settings ---
 AUDIO_TEMP_FOLDER = 'audio_tmp' # Relative to the backend directory
@@ -658,6 +916,7 @@ import numpy as np
 import math
 import os # For path joining if saving temp edge images
 import config # Import our configuration
+import logging # Added for consistency
 
 # --- Helper Function (from original main.py) ---
 def calculate_distance(p1, p2):
@@ -666,6 +925,46 @@ def calculate_distance(p1, p2):
     return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
 # --- Core Image Processing Functions (adapted from original main.py) ---
+
+def get_canny_edges_array(image_path_or_array, threshold1, threshold2):
+    """
+    Generates a Canny edge detected image array.
+    :param image_path_or_array: Path to the input image or a pre-loaded cv2 image array (BGR or Grayscale).
+    :param threshold1: Lower threshold for Canny edge detection.
+    :param threshold2: Upper threshold for Canny edge detection.
+    :return: NumPy array of the Canny edges, or None on failure.
+    """
+    if isinstance(image_path_or_array, str):
+        if not os.path.exists(image_path_or_array):
+            logging.error(f"Image path does not exist: {image_path_or_array}")
+            return None
+        image = cv2.imread(image_path_or_array, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            logging.error(f"Could not read image at {image_path_or_array}")
+            return None
+    elif isinstance(image_path_or_array, np.ndarray):
+        if len(image_path_or_array.shape) == 3: # BGR
+            image = cv2.cvtColor(image_path_or_array, cv2.COLOR_BGR2GRAY)
+        elif len(image_path_or_array.shape) == 2: # Already Grayscale
+            image = image_path_or_array
+        else:
+            logging.error("Invalid NumPy array format for image.")
+            return None
+    else:
+        logging.error(f"Invalid input type for get_canny_edges_array: {type(image_path_or_array)}")
+        return None
+
+    image_height, image_width = image.shape[:2]
+    if image_height == 0 or image_width == 0:
+         logging.error("Invalid image dimensions for Canny edge detection.")
+         return None
+
+    blurred = cv2.GaussianBlur(image, (5, 5), 0)
+    edges = cv2.Canny(blurred, threshold1, threshold2)
+    
+    return edges
+
+
 def get_image_contours(image_path, threshold1, threshold2, save_edge_path_prefix=None):
     """
     Convert image to contours using specific thresholds.
@@ -673,24 +972,14 @@ def get_image_contours(image_path, threshold1, threshold2, save_edge_path_prefix
     :param threshold1: Lower threshold for Canny edge detection.
     :param threshold2: Upper threshold for Canny edge detection.
     :param save_edge_path_prefix: Optional prefix to save the edge image for preview (e.g., "temp_edges").
+                                  If provided, the edge image from Canny will be saved.
     :return: List of contours (pixel coordinates), image_width, image_height, or (None, 0, 0) on failure.
     """
-    if not os.path.exists(image_path):
-        print(f"Error: Image path does not exist: {image_path}")
+    edges = get_canny_edges_array(image_path, threshold1, threshold2)
+    if edges is None:
         return None, 0, 0
-
-    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if image is None:
-        print(f"Error: Could not read image at {image_path}")
-        return None, 0, 0
-
-    image_height, image_width = image.shape[:2]
-    if image_height == 0 or image_width == 0:
-         print("Error: Invalid image dimensions.")
-         return None, 0, 0
-
-    blurred = cv2.GaussianBlur(image, (5, 5), 0)
-    edges = cv2.Canny(blurred, threshold1, threshold2)
+        
+    image_height, image_width = edges.shape[:2] # Get dimensions from the edges image
 
     if save_edge_path_prefix:
         try:
@@ -699,34 +988,31 @@ def get_image_contours(image_path, threshold1, threshold2, save_edge_path_prefix
             if edge_save_dir and not os.path.exists(edge_save_dir):
                 os.makedirs(edge_save_dir, exist_ok=True)
             
-            # Construct a unique filename for the edge image
             base, ext = os.path.splitext(os.path.basename(image_path))
             edge_filename = f"{save_edge_path_prefix}_{base}_t{threshold1}-{threshold2}.png"
             cv2.imwrite(edge_filename, edges)
-            print(f"Edge image saved to {edge_filename}")
+            logging.info(f"Edge image saved to {edge_filename} (from get_image_contours)")
         except Exception as e:
-            print(f"Failed to save edge image: {e}")
+            logging.error(f"Failed to save edge image in get_image_contours: {e}")
 
     contours_cv, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Filter contours by length and convert to list of (x,y) tuples
     contours_xy = []
     for contour in contours_cv:
         if cv2.arcLength(contour, closed=False) > config.MIN_CONTOUR_LENGTH_PX:
             points = contour.squeeze().tolist()
             if not isinstance(points, list) or not points: continue
-            if isinstance(points[0], int): # Handle single point contour
+            if isinstance(points[0], int): 
                 points = [points]
             
-            # Ensure points are valid pairs and add to list
             current_contour_points = []
             for p_arr in points:
                 if isinstance(p_arr, (list, tuple)) and len(p_arr) == 2:
                     current_contour_points.append(tuple(p_arr))
-                elif isinstance(p_arr, np.ndarray) and p_arr.shape == (2,): # Handle numpy array points
+                elif isinstance(p_arr, np.ndarray) and p_arr.shape == (2,): 
                     current_contour_points.append(tuple(p_arr.tolist()))
 
-            if current_contour_points: # Only add if we have valid points
+            if current_contour_points: 
                 contours_xy.append(current_contour_points)
                 
     return contours_xy, image_width, image_height
@@ -735,49 +1021,21 @@ def scale_contour_point(point_xy, image_width, image_height, target_width_mm, ta
     """ Scales and transforms a single (x, y) pixel coordinate to centered target (mm)."""
     x_pixel, y_pixel = point_xy
     
-    # Determine overall scale factor to fit within target dimensions while maintaining aspect ratio
     scale_x_factor = target_width_mm / image_width
     scale_y_factor = target_height_mm / image_height
     scale_factor = min(scale_x_factor, scale_y_factor)
 
-    # Calculate offsets to center the scaled image within the target area
-    scaled_img_width = image_width * scale_factor
-    scaled_img_height = image_height * scale_factor
-    offset_x_mm = (target_width_mm - scaled_img_width) / 2
-    offset_y_mm = (target_height_mm - scaled_img_height) / 2
-    
-    # Transform pixel coordinates to scaled mm, centered
-    # Image origin (0,0) is top-left. Robot drawing origin (0,0) for offsets is center.
-    # Python X (image width) maps to RAPID X offset
-    # Python Y (image height) maps to RAPID Z offset (left/right on paper)
-    
-    # Scale pixel to mm relative to image top-left
-    x_mm_from_origin = x_pixel * scale_factor
-    y_mm_from_origin = y_pixel * scale_factor
-
-    # Center it: For robot X (maps to image X), 0 is center of paper.
-    # For robot Z (maps to image Y), 0 is center of paper.
-    # RAPID X = (scaled_x_pixel - scaled_image_width/2)
-    # RAPID Z = -(scaled_y_pixel - scaled_image_height/2) (invert Y because image Y is down, paper Z might be up/right)
-    # However, your RAPID code uses Offs(WorkSpaceCenter1, x, y, z)
-    # where Python X -> RAPID x, Python Z_depth -> RAPID y, Python Y -> RAPID z.
-    # Let's assume WorkSpaceCenter1 is the center of the A4 paper.
-    # The output X_py, Y_py from this function will be the offsets for RAPID x and z.
-
-    # Convert pixel x to be relative to the center of the image
     x_centered_pixel = x_pixel - (image_width / 2)
-    # Convert pixel y to be relative to the center of the image, and invert (image y is down)
     y_centered_pixel = (image_height / 2) - y_pixel 
 
     x_py_offset = x_centered_pixel * scale_factor
-    y_py_offset = y_centered_pixel * scale_factor # This will be used as the Y-coordinate in the Python (X,Z,Y) tuple
-
+    y_py_offset = y_centered_pixel * scale_factor 
     return (x_py_offset, y_py_offset)
 
 
 def generate_robot_drawing_commands(contours_xy, image_width, image_height, optimize_paths=True):
     """ 
-    Takes list of contours (pixel coordinates), scales them, creates drawing paths (X_py, Z_py, Y_py).
+    Takes list of contours (pixel coordinates), scales them, creates drawing paths (X_py, Z_depth_py, Y_py).
     Z_py is the pen height (config.PEN_UP_Z_PY or config.PEN_DOWN_Z_PY).
     X_py and Y_py are the planar coordinates for drawing.
     """
@@ -792,17 +1050,16 @@ def generate_robot_drawing_commands(contours_xy, image_width, image_height, opti
                                 config.A4_DRAWING_AREA_WIDTH_MM, config.A4_DRAWING_AREA_HEIGHT_MM)
             for p in contour
         ]
-        if len(scaled_contour_points) >= 1: # Allow single points to be drawn
+        if len(scaled_contour_points) >= 1: 
             scaled_contours.append(scaled_contour_points)
 
     if not scaled_contours:
         return []
 
-    # Path Optimization (simplified from original, can be enhanced)
     ordered_contours = []
     if optimize_paths and scaled_contours:
         remaining_contours = list(scaled_contours)
-        current_point = (0,0) # Assume starting near center or last point of previous operation
+        current_point = (0,0) 
 
         while remaining_contours:
             best_contour_idx = -1
@@ -821,7 +1078,7 @@ def generate_robot_drawing_commands(contours_xy, image_width, image_height, opti
                     best_contour_idx = i
                     reverse_needed = False
                 
-                if dist_to_end < min_dist: # Check if starting from the end is better
+                if dist_to_end < min_dist: 
                     min_dist = dist_to_end
                     best_contour_idx = i
                     reverse_needed = True
@@ -831,31 +1088,26 @@ def generate_robot_drawing_commands(contours_xy, image_width, image_height, opti
                 if reverse_needed:
                     next_contour.reverse()
                 ordered_contours.append(next_contour)
-                current_point = next_contour[-1] # Update current point for next iteration
+                current_point = next_contour[-1] 
             else:
-                break # Should not happen if remaining_contours is not empty
+                break 
         processed_contours = ordered_contours
     else:
         processed_contours = scaled_contours
 
-    robot_commands_xyz_py = [] # List of (X_py, Z_depth_py, Y_py) tuples
+    robot_commands_xyz_py = [] 
     for contour_points in processed_contours:
         if not contour_points: continue
         
         start_x_py, start_y_py = contour_points[0]
-        # Move pen up to the start of the contour
         robot_commands_xyz_py.append((start_x_py, config.PEN_UP_Z_PY, start_y_py))
-        # Move pen down at the start of the contour
         robot_commands_xyz_py.append((start_x_py, config.PEN_DOWN_Z_PY, start_y_py))
 
-        # Draw the rest of the contour
-        for i in range(len(contour_points)): # Iterate through all points including start
+        for i in range(len(contour_points)): 
             pt_x_py, pt_y_py = contour_points[i]
-            # Add point with pen down (if it's not the very first point already added)
-            if i > 0 or len(contour_points) == 1: # For single point contours, ensure it's drawn
+            if i > 0 or len(contour_points) == 1: 
                  robot_commands_xyz_py.append((pt_x_py, config.PEN_DOWN_Z_PY, pt_y_py))
 
-        # Lift pen at the end of the contour
         end_x_py, end_y_py = contour_points[-1]
         robot_commands_xyz_py.append((end_x_py, config.PEN_UP_Z_PY, end_y_py))
         
@@ -870,62 +1122,64 @@ def process_image_to_robot_commands_pipeline(image_filepath,
     Main pipeline function to take an image path and return a list of robot drawing commands.
     Each command is a tuple (X_py, Z_depth_py, Y_py).
     """
-    print(f"Processing image: {image_filepath} with Canny thresholds: {canny_thresh1}, {canny_thresh2}")
+    logging.info(f"Processing image: {image_filepath} with Canny thresholds: {canny_thresh1}, {canny_thresh2}")
     
-    # Define a path prefix if you want to save intermediate edge images for debugging
-    # For example, in the qr_uploads directory or a dedicated 'debug_edges' directory.
-    # Ensure this directory exists if you use it.
-    # debug_edge_save_prefix = os.path.join(os.path.dirname(image_filepath), "edge_previews", os.path.basename(image_filepath))
-    debug_edge_save_prefix = None # Disable saving edge images by default
-
-    contours, img_w, img_h = get_image_contours(image_filepath, canny_thresh1, canny_thresh2, save_edge_path_prefix=debug_edge_save_prefix)
+    # The get_image_contours function now internally calls get_canny_edges_array
+    # and can save a preview if save_edge_path_prefix is set (though api_server handles preview separately now)
+    contours, img_w, img_h = get_image_contours(image_filepath, canny_thresh1, canny_thresh2, save_edge_path_prefix=None) # No separate save here
 
     if contours is None or not contours:
-        print("No contours found or error in contour extraction.")
+        logging.warning("No contours found or error in contour extraction.")
         return []
 
-    print(f"Found {len(contours)} contours. Image dimensions: {img_w}x{img_h}")
+    logging.info(f"Found {len(contours)} contours. Image dimensions: {img_w}x{img_h}")
     
     robot_drawing_cmds = generate_robot_drawing_commands(contours, img_w, img_h, optimize_paths=optimize)
     
-    print(f"Generated {len(robot_drawing_cmds)} robot drawing commands.")
+    logging.info(f"Generated {len(robot_drawing_cmds)} robot drawing commands.")
     return robot_drawing_cmds
 
 if __name__ == '__main__':
-    # Test the pipeline
-    # Create a dummy image for testing if you don't have one readily available
-    # For this test, ensure you have an image in your project, e.g., 'backend/qr_uploads/test_image.png'
-    # Or use an absolute path to an image.
+    logging.basicConfig(level=logging.INFO) # Ensure logging is configured for direct script run
     
-    # Make sure qr_uploads directory exists for the test
     if not os.path.exists(config.QR_UPLOAD_FOLDER):
         os.makedirs(config.QR_UPLOAD_FOLDER)
 
-    # Create a simple test image
-    test_image_name = "test_square.png"
+    test_image_name = "test_square_preview.png"
     test_image_path = os.path.join(config.QR_UPLOAD_FOLDER, test_image_name)
     if not os.path.exists(test_image_path):
-        img = np.zeros((200, 200, 1), dtype="uint8")
-        cv2.rectangle(img, (50, 50), (150, 150), (255), thickness=3) # White square on black
-        cv2.imwrite(test_image_path, img)
-        print(f"Created dummy test image: {test_image_path}")
+        img_arr = np.zeros((200, 200, 1), dtype="uint8")
+        cv2.rectangle(img_arr, (50, 50), (150, 150), (255), thickness=3) 
+        cv2.imwrite(test_image_path, img_arr)
+        logging.info(f"Created dummy test image: {test_image_path}")
 
     if os.path.exists(test_image_path):
-        print(f"\n--- Testing image processing pipeline with {test_image_path} ---")
-        commands = process_image_to_robot_commands_pipeline(test_image_path)
-        if commands:
-            print(f"\nFirst 5 generated commands (X_py, Z_depth_py, Y_py):")
-            for cmd in commands[:5]:
-                print(cmd)
-            print("...")
-            print(f"Last 5 generated commands (X_py, Z_depth_py, Y_py):")
-            for cmd in commands[-5:]:
-                print(cmd)
+        logging.info(f"\n--- Testing Canny Edge Array Generation for {test_image_path} ---")
+        test_t1, test_t2 = 50, 150
+        edges = get_canny_edges_array(test_image_path, test_t1, test_t2)
+        if edges is not None:
+            logging.info(f"Canny edges array generated with shape: {edges.shape}")
+            preview_save_path = os.path.join(config.QR_UPLOAD_FOLDER, f"test_canny_preview_t{test_t1}_{test_t2}.png")
+            cv2.imwrite(preview_save_path, edges)
+            logging.info(f"Saved Canny edge preview to: {preview_save_path}")
         else:
-            print("No commands generated.")
-    else:
-        print(f"Test image not found: {test_image_path}. Skipping pipeline test.")
+            logging.error("Failed to generate Canny edges array.")
 
+        logging.info(f"\n--- Testing image processing pipeline with {test_image_path} ---")
+        commands = process_image_to_robot_commands_pipeline(test_image_path, canny_thresh1=test_t1, canny_thresh2=test_t2)
+        if commands:
+            logging.info(f"\nFirst 5 generated commands (X_py, Z_depth_py, Y_py):")
+            for cmd in commands[:5]:
+                print(cmd) # Using print for cleaner tuple output
+            if len(commands) > 5:
+                logging.info("...")
+                logging.info(f"Last 5 generated commands (X_py, Z_depth_py, Y_py):")
+                for cmd in commands[-5:]:
+                    print(cmd)
+        else:
+            logging.info("No commands generated by pipeline.")
+    else:
+        logging.warning(f"Test image not found: {test_image_path}. Skipping pipeline test.")
 
 --- END OF FILE: backend/image_processing_engine.py ---
 --- START OF FILE: backend/main.py ---
@@ -2363,6 +2617,26 @@ class RobotInterface:
 # Main guard for direct testing (if __name__ == '__main__') remains the same
 # ... (previous if __name__ == '__main__' block)
 --- END OF FILE: backend/robot_interface.py ---
+--- START OF FILE: backend/signature_data.py ---
+# backend/signature_data.py
+
+# Define the raw X, Z_side coordinates for the signature.
+# The actual pen height (depth) will be handled by PEN_UP_Z_PY and PEN_DOWN_Z_PY from config.py
+# when generating the full robot commands.
+
+# If your signature is one continuous set of points after an initial pen down:
+SIGNATURE_POINTS_RAW = ((46.94,  -119.18), (46.94,-119.18), (47.06,-119.06), (47.41,-119.06), (47.53,-119.18), (47.29,-119.41), (47.29,-119.53), (47.18,-119.65), (47.18,-119.76), (47.06,-119.88), (47.06,-120.0), (46.94,-120.12), (46.94,-120.24), (46.82,-120.35), (46.59,-120.12), (46.71,-120.0), (46.71,-119.76), (46.82,-119.65), (46.82,-119.53), (46.94,-119.41), (46.94,  -119.41), (47.53,  -119.06), (47.53,-119.06), (47.53,-119.29), (47.29,-119.53), (47.29,-119.65), (47.18,-119.76), (47.18,-119.88), (47.06,-120.0), (47.06,-120.12), (46.94,-120.24), (46.94,-120.35), (46.71,-120.35), (46.71,-120.24), (46.59,-120.12), (46.71,-120.0), (46.71,-119.76), (46.82,-119.65), (46.82,-119.53), (46.94,-119.41), (46.94,-119.06), (47.53,-119.06), (47.65,-118.94), (47.65,  -118.94), (46.35,  -118.94), (46.35,-118.94), (46.47,-119.06), (46.59,-119.06), (46.59,-119.29), (46.47,-119.41), (46.47,-119.65), (46.24,-119.65), (46.24,-119.53), (46.12,-119.41), (46.12,-119.29), (46.0,-119.18), (46.0,-118.94), (46.0,  -118.94), (46.0,  -119.06), (46.0,-119.06), (46.12,-118.94), (46.35,-118.94), (46.59,-119.18), (46.59,-119.29), (46.47,-119.41), (46.47,-119.53), (46.35,-119.65), (46.24,-119.53), (46.24,-119.41), (46.0,-119.18), (46.0,  -119.18), (50.71,  -113.65), (50.71,-113.65), (50.59,-113.76), (50.47,-113.76), (50.35,-113.88), (50.24,-113.88), (50.12,-114.0), (50.0,-114.0), (49.65,-114.35), (49.53,-114.35), (48.71,-115.18), (48.71,-115.29), (48.35,-115.65), (48.35,-115.76), (48.24,-115.88), (48.24,-116.0), (48.12,-116.12), (48.12,-116.24), (48.0,-116.35), (48.0,-116.47), (47.88,-116.59), (47.88,-116.71), (47.76,-116.82), (47.76,-117.18), (47.53,-117.41), (47.53,-117.76), (47.41,-117.88), (47.41,-118.12), (47.29,-118.24), (47.29,-118.47), (47.18,-118.59), (47.18,-118.71), (47.88,-118.71), (47.88,-118.59), (48.12,-118.35), (48.12,-118.24), (48.24,-118.12), (48.24,-118.0), (48.47,-117.76), (48.47,-117.65), (48.59,-117.53), (48.59,-117.41), (48.82,-117.18), (48.82,-117.06), (48.94,-116.94), (48.94,-116.82), (49.18,-116.59), (49.18,-116.47), (49.41,-116.24), (49.41,-116.12), (49.53,-116.0), (49.53,-115.88), (49.76,-115.65), (49.76,-115.53), (49.88,-115.41), (49.88,-115.29), (50.12,-115.06), (50.12,-114.94), (50.35,-114.71), (50.35,-114.59), (50.47,-114.47), (50.47,-114.35), (50.71,-114.12), (50.71,-114.0), (50.82,-113.88), (50.47,-114.24), (50.47,-114.35), (50.35,-114.47), (50.35,-114.59), (50.12,-114.82), (50.12,-114.94), (49.88,-115.18), (49.88,-115.29), (49.76,-115.41), (49.76,-115.53), (49.53,-115.76), (49.53,-115.88), (49.41,-116.0), (49.41,-116.12), (49.18,-116.35), (49.18,-116.47), (48.94,-116.71), (48.94,-116.82), (48.82,-116.94), (48.82,-117.06), (48.59,-117.29), (48.59,-117.41), (48.47,-117.53), (48.47,-117.65), (48.24,-117.88), (48.24,-118.0), (48.12,-118.12), (48.12,-118.24), (47.88,-118.47), (47.88,-118.59), (47.76,-118.71), (47.29,-118.71), (47.18,-118.59), (47.29,-118.47), (47.29,-118.24), (47.41,-118.12), (47.41,-117.88), (47.53,-117.76), (47.53,-117.53), (47.65,-117.41), (47.65,-117.29), (47.76,-117.18), (47.76,-116.94), (47.88,-116.82), (47.88,-116.71), (48.0,-116.59), (48.0,-116.47), (48.12,-116.35), (48.12,-116.24), (48.24,-116.12), (48.24,-116.0), (48.35,-115.88), (48.35,-115.76), (48.71,-115.41), (48.71,-115.29), (49.65,-114.35), (49.76,-114.35), (50.12,-114.0), (50.24,-114.0), (50.47,-113.76), (50.59,-113.76), (50.71,-113.65), (50.94,-113.65), (50.94,  -113.65), (51.88,  -112.24), (51.88,-112.24), (51.65,-112.47), (51.65,-112.59), (51.53,-112.71), (51.53,-112.82), (51.29,-113.06), (51.29,-113.18), (51.06,-113.18), (50.94,-113.29), (50.71,-113.29), (50.59,-113.41), (50.47,-113.41), (50.35,-113.53), (50.24,-113.53), (50.0,-113.76), (49.88,-113.76), (49.65,-114.0), (49.53,-114.0), (48.24,-115.29), (48.24,-115.41), (48.12,-115.53), (48.12,-115.65), (47.88,-115.88), (47.88,-116.0), (47.76,-116.12), (47.76,-116.35), (47.65,-116.47), (47.65,-116.59), (47.41,-116.82), (47.41,-117.06), (47.29,-117.18), (47.29,-117.41), (47.18,-117.53), (47.18,-117.65), (47.06,-117.76), (47.06,-118.0), (46.94,-118.12), (46.94,-118.35), (46.82,-118.47), (46.82,-118.71), (46.47,-118.71), (46.35,-118.59), (46.0,-118.59), (45.88,-118.47), (45.76,-118.47), (45.76,-118.35), (45.65,-118.24), (45.65,-118.12), (45.53,-118.0), (45.41,-118.0), (45.29,-118.12), (45.29,-118.35), (45.41,-118.47), (45.41,-118.59), (45.53,-118.71), (45.53,-118.82), (45.65,-118.94), (45.65,-119.18), (45.76,-119.29), (45.76,-119.41), (45.88,-119.53), (45.88,-119.65), (46.12,-119.88), (46.12,-120.0), (46.24,-120.12), (46.24,-120.47), (46.12,-120.59), (46.12,-120.71), (46.0,-120.82), (46.0,-121.06), (45.88,-121.18), (45.88,-121.53), (45.76,-121.65), (45.76,-122.0), (45.65,-122.12), (45.65,-122.24), (45.53,-122.35), (45.53,-122.59), (45.41,-122.71), (45.41,-122.94), (45.29,-123.06), (45.29,-123.29), (45.18,-123.41), (45.18,-123.53), (45.06,-123.65), (45.06,-123.76), (44.94,-123.88), (44.94,-124.0), (44.82,-124.12), (44.82,-124.24), (44.71,-124.35), (44.71,-124.47), (44.59,-124.59), (44.59,-124.71), (44.71,-124.82), (44.82,-124.82), (44.94,-124.71), (44.94,-124.59), (45.06,-124.47), (45.06,-124.35), (45.18,-124.24), (45.18,-124.12), (45.29,-124.0), (45.29,-123.88), (45.41,-123.76), (45.41,-123.65), (45.53,-123.53), (45.53,-123.41), (45.65,-123.29), (45.65,-123.18), (45.76,-123.06), (45.76,-122.94), (45.88,-122.82), (45.88,-122.71), (46.0,-122.59), (46.0,-122.35), (46.12,-122.24), (46.12,-122.12), (46.35,-121.88), (46.35,-121.76), (46.59,-121.53), (46.59,-121.41), (46.71,-121.29), (46.71,-121.18), (47.06,-121.18), (47.06,-121.29), (47.41,-121.65), (47.53,-121.65), (47.88,-122.0), (48.0,-122.0), (48.12,-122.12), (48.24,-122.12), (48.35,-122.24), (48.47,-122.24), (48.59,-122.35), (48.71,-122.35), (48.94,-122.59), (49.41,-122.59), (49.53,-122.71), (50.82,-122.71), (50.94,-122.59), (51.29,-122.59), (51.41,-122.47), (51.65,-122.47), (51.76,-122.35), (51.88,-122.35), (52.0,-122.24), (52.12,-122.24), (52.24,-122.12), (52.35,-122.12), (52.47,-122.0), (52.59,-122.0), (52.71,-121.88), (52.82,-121.88), (53.06,-121.65), (53.18,-121.65), (53.41,-121.41), (53.53,-121.41), (53.88,-121.06), (54.0,-121.06), (55.18,-119.88), (55.41,-119.88), (55.76,-120.24), (55.88,-120.24), (56.0,-120.12), (56.12,-120.12), (56.71,-119.53), (56.71,-119.41), (56.94,-119.18), (56.94,-119.06), (57.06,-118.94), (57.29,-118.94), (57.41,-119.06), (57.88,-119.06), (58.0,-119.18), (59.18,-119.18), (59.18,-119.41), (59.06,-119.53), (59.06,-119.65), (58.82,-119.88), (58.82,-120.0), (58.71,-120.12), (58.71,-120.24), (58.82,-120.35), (58.94,-120.35), (59.06,-120.24), (59.06,-120.12), (59.18,-120.24), (59.29,-120.12), (59.41,-120.12), (59.53,-120.24), (59.76,-120.24), (59.88,-120.12), (60.24,-120.12), (60.35,-120.0), (60.82,-120.0), (60.94,-119.88), (61.18,-119.88), (61.29,-119.76), (61.41,-119.76), (61.53,-119.65), (61.76,-119.65), (61.88,-119.53), (62.0,-119.53), (62.12,-119.41), (62.35,-119.41), (62.59,-119.18), (62.94,-119.18), (62.94,-119.41), (62.82,-119.53), (62.82,-119.88), (63.18,-120.24), (63.41,-120.24), (64.24,-119.41), (64.24,-119.29), (64.35,-119.18), (64.35,-119.06), (64.47,-118.94), (64.71,-118.94), (64.82,-119.06), (65.29,-119.06), (65.41,-119.18), (66.59,-119.18), (66.59,-119.41), (66.35,-119.65), (66.35,-119.76), (66.24,-119.88), (66.24,-120.0), (66.0,-120.24), (66.0,-120.47), (65.88,-120.59), (65.88,-120.94), (66.24,-121.29), (66.71,-121.29), (66.82,-121.18), (67.06,-121.18), (67.18,-121.06), (67.41,-121.06), (67.65,-120.82), (67.76,-120.82), (67.88,-120.71), (68.0,-120.71), (68.12,-120.59), (68.24,-120.59), (68.35,-120.47), (68.47,-120.47), (68.71,-120.24), (68.82,-120.24), (68.94,-120.12), (69.06,-120.12), (69.18,-120.0), (69.29,-120.0), (69.53,-119.76), (69.65,-119.76), (70.0,-119.41), (70.12,-119.41), (70.35,-119.18), (70.47,-119.18), (70.59,-119.06), (70.71,-119.18), (70.71,-119.53), (70.82,-119.65), (70.82,-119.76), (70.94,-119.88), (71.06,-119.88), (71.18,-120.0), (71.76,-120.0), (71.88,-119.88), (72.24,-119.88), (72.35,-119.76), (72.59,-119.76), (72.71,-119.65), (72.82,-119.65), (72.94,-119.53), (73.06,-119.53), (73.18,-119.41), (73.29,-119.41), (73.41,-119.29), (73.65,-119.29), (73.76,-119.18), (73.76,-119.76), (73.65,-119.88), (73.65,-120.35), (73.53,-120.35), (73.29,-120.59), (73.18,-120.59), (73.06,-120.71), (73.06,-120.82), (73.29,-121.06), (73.41,-121.06), (73.88,-120.59), (73.88,-120.47), (74.0,-120.47), (74.12,-120.35), (74.24,-120.35), (74.35,-120.24), (74.47,-120.24), (74.59,-120.12), (74.71,-120.12), (74.82,-120.0), (75.06,-120.0), (75.18,-119.88), (75.29,-119.88), (75.41,-119.76), (75.53,-119.76), (75.65,-119.65), (75.76,-119.65), (75.88,-119.53), (76.12,-119.53), (76.24,-119.41), (76.35,-119.41), (76.47,-119.29), (76.59,-119.29), (76.71,-119.18), (76.94,-119.18), (76.94,-119.41), (76.71,-119.65), (76.71,-119.76), (76.59,-119.88), (76.59,-120.0), (76.35,-120.24), (76.35,-120.47), (76.24,-120.59), (76.24,-120.94), (76.59,-121.29), (77.06,-121.29), (77.18,-121.18), (77.41,-121.18), (77.53,-121.06), (77.76,-121.06), (78.0,-120.82), (78.12,-120.82), (78.24,-120.71), (78.35,-120.71), (78.47,-120.59), (78.59,-120.59), (78.71,-120.47), (78.82,-120.47), (79.06,-120.24), (79.18,-120.24), (79.29,-120.12), (79.41,-120.12), (79.53,-120.0), (79.65,-120.0), (79.88,-119.76), (80.0,-119.76), (80.35,-119.41), (80.47,-119.41), (80.71,-119.18), (80.82,-119.18), (81.06,-118.94), (81.18,-118.94), (81.41,-118.71), (81.41,-118.59), (81.29,-118.47), (81.18,-118.59), (81.06,-118.59), (80.82,-118.82), (80.71,-118.82), (80.47,-119.06), (80.35,-119.06), (80.12,-119.29), (80.0,-119.29), (79.76,-119.53), (79.65,-119.53), (79.41,-119.76), (79.29,-119.76), (79.18,-119.88), (79.06,-119.88), (78.82,-120.12), (78.71,-120.12), (78.59,-120.24), (78.47,-120.24), (78.24,-120.47), (78.12,-120.47), (78.0,-120.59), (77.88,-120.59), (77.76,-120.71), (77.41,-120.71), (77.29,-120.82), (77.06,-120.82), (76.94,-120.94), (76.59,-120.94), (76.59,-120.71), (76.71,-120.59), (76.71,-120.24), (76.82,-120.12), (76.82,-120.0), (77.06,-119.76), (77.06,-119.65), (77.18,-119.53), (77.18,-119.41), (77.29,-119.29), (77.29,-119.18), (77.53,-118.94), (77.53,-118.82), (77.65,-118.71), (77.41,-118.47), (77.29,-118.59), (77.18,-118.59), (77.06,-118.71), (76.94,-118.71), (76.82,-118.82), (76.71,-118.82), (76.59,-118.94), (76.47,-118.94), (76.35,-119.06), (76.24,-119.06), (76.12,-119.18), (76.0,-119.18), (75.88,-119.29), (75.65,-119.29), (75.53,-119.41), (75.41,-119.41), (75.29,-119.53), (75.18,-119.53), (75.06,-119.65), (74.94,-119.65), (74.82,-119.76), (74.71,-119.76), (74.59,-119.88), (74.35,-119.88), (74.24,-120.0), (74.12,-120.0), (74.12,-119.29), (74.24,-119.18), (74.24,-118.82), (74.35,-118.71), (74.35,-118.59), (74.47,-118.47), (74.47,-118.35), (74.71,-118.12), (74.94,-118.12), (74.94,-118.24), (75.18,-118.47), (75.41,-118.24), (75.41,-118.12), (75.06,-117.76), (74.71,-117.76), (74.47,-118.0), (74.35,-118.0), (74.24,-118.12), (74.24,-118.24), (74.12,-118.35), (74.12,-118.47), (74.0,-118.59), (74.0,-118.71), (73.88,-118.71), (73.65,-118.94), (73.53,-118.94), (73.41,-119.06), (73.29,-119.06), (73.18,-119.18), (72.94,-119.18), (72.82,-119.29), (72.71,-119.29), (72.59,-119.41), (72.24,-119.41), (72.12,-119.53), (71.88,-119.53), (71.76,-119.65), (71.18,-119.65), (71.06,-119.53), (71.06,-118.94), (71.18,-118.82), (71.18,-118.71), (71.29,-118.59), (71.29,-118.47), (71.41,-118.35), (71.41,-118.24), (71.29,-118.12), (70.71,-118.71), (70.59,-118.71), (70.47,-118.82), (70.35,-118.82), (70.12,-119.06), (70.0,-119.06), (69.76,-119.29), (69.65,-119.29), (69.41,-119.53), (69.29,-119.53), (69.06,-119.76), (68.94,-119.76), (68.82,-119.88), (68.71,-119.88), (68.47,-120.12), (68.35,-120.12), (68.24,-120.24), (68.12,-120.24), (67.88,-120.47), (67.76,-120.47), (67.65,-120.59), (67.53,-120.59), (67.41,-120.71), (67.06,-120.71), (66.94,-120.82), (66.71,-120.82), (66.59,-120.94), (66.24,-120.94), (66.24,-120.71), (66.35,-120.59), (66.35,-120.24), (66.47,-120.12), (66.47,-120.0), (66.71,-119.76), (66.71,-119.65), (66.82,-119.53), (66.82,-119.41), (66.94,-119.29), (66.94,-119.18), (67.18,-118.94), (67.18,-118.82), (67.41,-118.59), (67.41,-118.47), (67.76,-118.12), (67.76,-118.0), (67.88,-117.88), (67.88,-117.76), (68.24,-117.41), (68.24,-117.29), (68.47,-117.06), (68.47,-116.94), (68.59,-116.82), (70.24,-116.82), (70.35,-116.71), (70.35,-116.59), (70.24,-116.47), (69.06,-116.47), (69.06,-116.24), (69.29,-116.0), (69.29,-115.88), (69.53,-115.65), (69.41,-115.53), (69.29,-115.53), (68.94,-115.88), (68.94,-116.0), (68.71,-116.24), (68.71,-116.35), (68.59,-116.47), (67.29,-116.47), (67.18,-116.59), (67.18,-116.71), (67.29,-116.82), (68.12,-116.82), (68.12,-117.06), (67.88,-117.29), (67.88,-117.41), (67.65,-117.65), (67.65,-117.76), (67.41,-118.0), (67.41,-118.12), (67.06,-118.47), (67.06,-118.59), (66.94,-118.71), (66.71,-118.71), (66.59,-118.82), (65.41,-118.82), (65.29,-118.71), (64.71,-118.71), (64.59,-118.59), (64.59,-118.47), (64.35,-118.24), (63.88,-118.24), (63.76,-118.35), (63.53,-118.35), (63.29,-118.59), (63.18,-118.59), (63.06,-118.71), (62.94,-118.71), (62.82,-118.82), (62.71,-118.82), (62.59,-118.94), (62.47,-118.94), (62.35,-119.06), (62.24,-119.06), (62.12,-119.18), (62.0,-119.18), (61.88,-119.29), (61.53,-119.29), (61.41,-119.41), (61.29,-119.41), (61.18,-119.53), (60.94,-119.53), (60.82,-119.65), (60.35,-119.65), (60.24,-119.53), (60.12,-119.65), (60.0,-119.65), (59.88,-119.76), (59.76,-119.76), (59.65,-119.88), (59.41,-119.88), (59.29,-119.76), (59.18,-119.88), (59.29,-119.76), (59.29,-119.65), (59.88,-119.06), (60.0,-119.06), (60.47,-118.59), (60.59,-118.59), (60.71,-118.47), (60.82,-118.59), (60.82,-118.71), (60.71,-118.82), (60.71,-118.94), (60.59,-119.06), (60.59,-119.18), (60.24,-119.53), (60.35,-119.65), (60.47,-119.65), (60.82,-119.29), (60.82,-119.18), (61.06,-118.94), (61.06,-118.82), (61.18,-118.71), (61.18,-118.35), (60.94,-118.12), (60.71,-118.12), (60.47,-118.35), (60.35,-118.35), (60.12,-118.59), (60.0,-118.59), (60.0,-118.35), (60.12,-118.24), (60.12,-118.12), (60.24,-118.0), (60.24,-117.88), (60.35,-117.76), (60.35,-117.65), (60.59,-117.41), (60.59,-117.29), (60.71,-117.18), (60.71,-117.06), (60.82,-116.94), (60.82,-116.82), (60.94,-116.71), (60.94,-116.59), (61.18,-116.35), (61.18,-116.24), (61.29,-116.12), (61.29,-116.0), (61.53,-115.76), (61.53,-115.65), (61.76,-115.41), (61.76,-115.29), (62.0,-115.06), (61.76,-114.82), (61.65,-114.94), (61.65,-115.06), (61.41,-115.29), (61.41,-115.41), (61.18,-115.65), (61.18,-115.76), (60.94,-116.0), (60.94,-116.12), (60.82,-116.24), (60.82,-116.35), (60.71,-116.47), (60.71,-116.59), (60.59,-116.71), (60.59,-116.82), (60.35,-117.06), (60.35,-117.18), (60.24,-117.29), (60.24,-117.41), (60.12,-117.53), (60.12,-117.65), (59.88,-117.88), (59.88,-118.0), (59.76,-118.12), (59.76,-118.24), (59.65,-118.35), (59.65,-118.47), (59.53,-118.59), (59.53,-118.71), (59.29,-118.71), (59.18,-118.82), (58.0,-118.82), (57.88,-118.71), (57.29,-118.71), (57.18,-118.59), (57.18,-118.47), (56.94,-118.24), (56.47,-118.24), (56.35,-118.35), (56.24,-118.35), (55.65,-118.94), (55.65,-119.06), (54.47,-120.24), (54.35,-120.24), (53.65,-120.94), (53.53,-120.94), (53.18,-121.29), (53.06,-121.29), (52.82,-121.53), (52.71,-121.53), (52.47,-121.76), (52.35,-121.76), (52.24,-121.88), (52.12,-121.88), (52.0,-122.0), (51.76,-122.0), (51.65,-122.12), (51.41,-122.12), (51.29,-122.24), (50.82,-122.24), (50.71,-122.35), (49.53,-122.35), (49.41,-122.24), (48.94,-122.24), (48.82,-122.12), (48.71,-122.12), (48.59,-122.0), (48.47,-122.0), (48.35,-121.88), (48.24,-121.88), (48.0,-121.65), (47.88,-121.65), (47.18,-120.94), (47.18,-120.47), (47.29,-120.35), (47.29,-120.24), (47.41,-120.12), (47.41,-120.0), (47.65,-119.76), (47.65,-119.65), (47.76,-119.53), (47.76,-119.41), (47.88,-119.29), (47.88,-119.18), (48.0,-119.06), (48.12,-119.06), (48.24,-118.94), (48.24,-118.82), (48.35,-118.71), (48.35,-118.35), (48.59,-118.12), (48.59,-118.0), (48.82,-117.76), (48.82,-117.65), (48.94,-117.53), (48.94,-117.41), (49.18,-117.18), (49.18,-117.06), (49.29,-116.94), (49.29,-116.82), (49.53,-116.59), (49.53,-116.47), (49.76,-116.24), (49.76,-116.12), (49.88,-116.0), (49.88,-115.88), (50.0,-115.76), (50.0,-115.65), (50.24,-115.41), (50.24,-115.29), (50.47,-115.06), (50.47,-114.94), (50.59,-114.82), (50.59,-114.71), (50.82,-114.47), (50.82,-114.35), (50.94,-114.24), (50.94,-114.12), (51.18,-113.88), (51.18,-113.76), (51.29,-113.65), (51.29,-113.53), (51.41,-113.41), (51.53,-113.41), (51.65,-113.29), (52.82,-113.29), (52.94,-113.41), (53.06,-113.41), (53.18,-113.53), (53.29,-113.53), (53.29,-113.65), (53.53,-113.88), (53.53,-114.94), (53.41,-115.06), (53.41,-115.53), (53.29,-115.65), (53.29,-115.76), (53.18,-115.88), (53.18,-116.0), (52.94,-116.24), (52.94,-116.35), (52.12,-117.18), (52.0,-117.18), (51.65,-117.53), (51.53,-117.53), (51.41,-117.65), (51.29,-117.65), (51.06,-117.88), (50.94,-117.88), (50.82,-118.0), (50.59,-118.0), (50.47,-118.12), (50.24,-118.12), (50.12,-118.24), (50.0,-118.24), (49.88,-118.35), (49.65,-118.35), (49.53,-118.47), (49.18,-118.47), (49.06,-118.59), (48.71,-118.59), (48.59,-118.71), (48.71,-118.59), (49.06,-118.59), (49.18,-118.47), (49.53,-118.47), (49.65,-118.35), (49.76,-118.35), (49.88,-118.24), (50.12,-118.24), (50.24,-118.12), (50.47,-118.12), (50.59,-118.0), (50.71,-118.0), (50.82,-117.88), (50.94,-117.88), (51.18,-117.65), (51.29,-117.65), (51.41,-117.53), (51.53,-117.53), (51.88,-117.18), (52.0,-117.18), (52.94,-116.24), (52.94,-116.12), (53.18,-115.88), (53.18,-115.76), (53.29,-115.65), (53.29,-115.53), (53.41,-115.41), (53.41,-115.06), (53.53,-114.94), (53.53,-114.0), (53.29,-113.76), (53.29,-113.65), (53.18,-113.53), (53.06,-113.53), (52.82,-113.29), (51.76,-113.29), (51.65,-113.41), (51.53,-113.41), (51.29,-113.65), (51.29,-113.76), (51.18,-113.88), (51.18,-114.0), (50.94,-114.24), (50.94,-114.35), (50.82,-114.47), (50.82,-114.59), (50.59,-114.82), (50.59,-114.94), (50.47,-115.06), (50.47,-115.18), (50.24,-115.41), (50.24,-115.53), (50.0,-115.76), (50.0,-115.88), (49.88,-116.0), (49.88,-116.12), (49.76,-116.24), (49.76,-116.35), (49.53,-116.59), (49.53,-116.71), (49.29,-116.94), (49.29,-117.06), (49.18,-117.18), (49.18,-117.29), (48.94,-117.53), (48.94,-117.65), (48.82,-117.76), (48.82,-117.88), (48.59,-118.12), (48.59,-118.24), (48.35,-118.47), (48.35,-118.71), (48.24,-118.82), (48.35,-118.94), (49.06,-118.94), (49.18,-118.82), (49.41,-118.82), (49.53,-118.71), (49.88,-118.71), (50.0,-118.59), (50.24,-118.59), (50.47,-118.35), (50.71,-118.35), (50.82,-118.24), (51.06,-118.24), (51.29,-118.0), (51.41,-118.0), (51.65,-117.76), (51.76,-117.76), (51.88,-117.65), (52.0,-117.65), (52.35,-117.29), (52.47,-117.29), (53.06,-116.71), (53.06,-116.59), (53.29,-116.35), (53.29,-116.24), (53.41,-116.12), (53.41,-116.0), (53.53,-115.88), (53.53,-115.76), (53.76,-115.53), (53.76,-115.18), (53.88,-115.06), (53.88,-114.0), (53.76,-113.88), (53.76,-113.76), (53.65,-113.65), (53.65,-113.53), (53.29,-113.18), (53.18,-113.18), (53.06,-113.06), (52.94,-113.06), (52.82,-112.94), (51.76,-112.94), (51.88,-112.82), (51.88,-112.59), (52.12,-112.35), (52.12,-112.12), (52.0,-112.0), (51.88,-112.12), (51.88,  -112.12), (51.88,  -112.0), (51.88,-112.0), (51.88,-112.12), (51.65,-112.35), (51.65,-112.47), (51.53,-112.59), (51.53,-112.71), (51.29,-112.94), (51.29,-113.06), (51.18,-113.18), (51.06,-113.18), (50.94,-113.29), (50.71,-113.29), (50.59,-113.41), (50.35,-113.41), (50.24,-113.53), (50.12,-113.53), (49.88,-113.76), (49.76,-113.76), (49.53,-114.0), (49.41,-114.0), (48.24,-115.18), (48.24,-115.29), (48.12,-115.41), (48.12,-115.53), (47.88,-115.76), (47.88,-116.0), (47.76,-116.12), (47.76,-116.24), (47.65,-116.35), (47.65,-116.47), (47.53,-116.59), (47.53,-116.71), (47.41,-116.82), (47.41,-117.06), (47.29,-117.18), (47.29,-117.29), (47.18,-117.41), (47.18,-117.65), (47.06,-117.76), (47.06,-118.0), (46.94,-118.12), (46.94,-118.35), (46.82,-118.47), (46.82,-118.59), (46.71,-118.71), (46.47,-118.71), (46.35,-118.59), (46.12,-118.59), (46.0,-118.47), (45.88,-118.47), (45.76,-118.35), (45.76,-118.24), (45.65,-118.12), (45.65,-118.0), (45.29,-118.0), (45.29,-118.35), (45.41,-118.47), (45.41,-118.59), (45.53,-118.71), (45.53,-118.94), (45.65,-119.06), (45.65,-119.18), (45.76,-119.29), (45.76,-119.53), (45.88,-119.65), (45.88,-119.76), (46.12,-120.0), (46.12,-120.12), (46.24,-120.24), (46.24,-120.47), (46.12,-120.59), (46.12,-120.71), (46.0,-120.82), (46.0,-121.06), (45.88,-121.18), (45.88,-121.53), (45.76,-121.65), (45.76,-122.0), (45.65,-122.12), (45.65,-122.24), (45.53,-122.35), (45.53,-122.59), (45.41,-122.71), (45.41,-122.94), (45.29,-123.06), (45.29,-123.18), (45.18,-123.29), (45.18,-123.41), (45.06,-123.53), (45.06,-123.65), (44.94,-123.76), (44.94,-123.88), (44.82,-124.0), (44.82,-124.12), (44.71,-124.24), (44.71,-124.47), (44.59,-124.59), (44.59,-124.82), (44.94,-124.82), (44.94,-124.71), (45.06,-124.59), (45.06,-124.47), (45.18,-124.35), (45.18,-124.24), (45.29,-124.12), (45.29,-124.0), (45.41,-123.88), (45.41,-123.76), (45.53,-123.65), (45.53,-123.53), (45.65,-123.41), (45.65,-123.29), (45.76,-123.18), (45.76,-123.06), (45.88,-122.94), (45.88,-122.82), (46.0,-122.71), (46.0,-122.47), (46.12,-122.35), (46.12,-122.24), (46.35,-122.0), (46.35,-121.88), (46.59,-121.65), (46.59,-121.53), (46.71,-121.41), (46.71,-121.29), (46.82,-121.18), (46.94,-121.18), (47.06,-121.29), (47.06,-121.41), (47.29,-121.65), (47.41,-121.65), (47.76,-122.0), (47.88,-122.0), (48.0,-122.12), (48.12,-122.12), (48.24,-122.24), (48.35,-122.24), (48.47,-122.35), (48.59,-122.35), (48.71,-122.47), (48.82,-122.47), (48.94,-122.59), (49.41,-122.59), (49.53,-122.71), (50.82,-122.71), (50.94,-122.59), (51.29,-122.59), (51.41,-122.47), (51.65,-122.47), (51.76,-122.35), (52.0,-122.35), (52.12,-122.24), (52.24,-122.24), (52.35,-122.12), (52.47,-122.12), (52.59,-122.0), (52.71,-122.0), (52.82,-121.88), (52.94,-121.88), (53.18,-121.65), (53.29,-121.65), (53.53,-121.41), (53.65,-121.41), (54.0,-121.06), (54.12,-121.06), (55.29,-119.88), (55.53,-120.12), (55.65,-120.12), (55.76,-120.24), (55.88,-120.24), (56.0,-120.12), (56.24,-120.12), (56.71,-119.65), (56.71,-119.53), (56.94,-119.29), (56.94,-119.18), (57.18,-118.94), (57.29,-118.94), (57.41,-119.06), (57.88,-119.06), (58.0,-119.18), (59.06,-119.18), (59.18,-119.29), (59.18,-119.41), (58.82,-119.76), (58.82,-120.0), (58.71,-120.12), (58.71,-120.35), (59.06,-120.35), (59.29,-120.12), (59.41,-120.24), (59.76,-120.24), (59.88,-120.12), (60.24,-120.12), (60.35,-120.0), (60.82,-120.0), (60.94,-119.88), (61.18,-119.88), (61.29,-119.76), (61.53,-119.76), (61.65,-119.65), (61.76,-119.65), (61.88,-119.53), (62.12,-119.53), (62.24,-119.41), (62.35,-119.41), (62.47,-119.29), (62.59,-119.29), (62.71,-119.18), (62.82,-119.18), (62.94,-119.29), (62.94,-119.41), (62.82,-119.53), (62.82,-119.88), (62.94,-120.0), (62.94,-120.12), (63.06,-120.12), (63.18,-120.24), (63.41,-120.24), (63.53,-120.12), (63.65,-120.12), (64.24,-119.53), (64.24,-119.41), (64.35,-119.29), (64.35,-119.18), (64.59,-118.94), (64.71,-118.94), (64.82,-119.06), (65.29,-119.06), (65.41,-119.18), (66.47,-119.18), (66.59,-119.29), (66.35,-119.53), (66.35,-119.65), (66.24,-119.76), (66.24,-119.88), (66.12,-120.0), (66.12,-120.12), (66.0,-120.24), (66.0,-120.47), (65.88,-120.59), (65.88,-120.94), (66.0,-121.06), (66.0,-121.18), (66.12,-121.18), (66.24,-121.29), (66.71,-121.29), (66.82,-121.18), (67.06,-121.18), (67.18,-121.06), (67.41,-121.06), (67.53,-120.94), (67.65,-120.94), (67.76,-120.82), (67.88,-120.82), (68.0,-120.71), (68.12,-120.71), (68.24,-120.59), (68.35,-120.59), (68.47,-120.47), (68.59,-120.47), (68.82,-120.24), (68.94,-120.24), (69.06,-120.12), (69.18,-120.12), (69.29,-120.0), (69.41,-120.0), (69.65,-119.76), (69.76,-119.76), (70.12,-119.41), (70.24,-119.41), (70.59,-119.06), (70.71,-119.18), (70.71,-119.53), (70.82,-119.65), (70.82,-119.88), (71.06,-119.88), (71.18,-120.0), (71.76,-120.0), (71.88,-119.88), (72.24,-119.88), (72.35,-119.76), (72.59,-119.76), (72.71,-119.65), (72.82,-119.65), (72.94,-119.53), (73.18,-119.53), (73.29,-119.41), (73.41,-119.41), (73.53,-119.29), (73.65,-119.29), (73.76,-119.41), (73.76,-119.76), (73.65,-119.88), (73.65,-120.24), (73.53,-120.35), (73.41,-120.35), (73.18,-120.59), (73.06,-120.59), (73.06,-120.94), (73.18,-121.06), (73.53,-121.06), (73.88,-120.71), (73.88,-120.59), (74.0,-120.47), (74.12,-120.47), (74.24,-120.35), (74.35,-120.35), (74.47,-120.24), (74.59,-120.24), (74.71,-120.12), (74.82,-120.12), (74.94,-120.0), (75.06,-120.0), (75.18,-119.88), (75.41,-119.88), (75.53,-119.76), (75.65,-119.76), (75.76,-119.65), (75.88,-119.65), (76.0,-119.53), (76.12,-119.53), (76.24,-119.41), (76.35,-119.41), (76.47,-119.29), (76.59,-119.29), (76.71,-119.18), (76.82,-119.18), (76.94,-119.29), (76.71,-119.53), (76.71,-119.65), (76.59,-119.76), (76.59,-119.88), (76.47,-120.0), (76.47,-120.12), (76.35,-120.24), (76.35,-120.47), (76.24,-120.59), (76.24,-120.94), (76.35,-121.06), (76.35,-121.18), (76.47,-121.18), (76.59,-121.29), (77.06,-121.29), (77.18,-121.18), (77.41,-121.18), (77.53,-121.06), (77.76,-121.06), (77.88,-120.94), (78.0,-120.94), (78.12,-120.82), (78.24,-120.82), (78.35,-120.71), (78.47,-120.71), (78.59,-120.59), (78.71,-120.59), (78.82,-120.47), (78.94,-120.47), (79.18,-120.24), (79.29,-120.24), (79.41,-120.12), (79.53,-120.12), (79.65,-120.0), (79.76,-120.0), (80.0,-119.76), (80.12,-119.76), (80.47,-119.41), (80.59,-119.41), (80.82,-119.18), (80.94,-119.18), (81.18,-118.94), (81.29,-118.94), (81.41,-118.82), (81.53,-118.94), (81.53,-120.35), (81.65,-120.47), (81.65,-120.82), (81.76,-120.94), (81.76,-121.06), (81.88,-121.18), (81.88,-121.29), (82.0,-121.41), (82.0,-121.53), (82.24,-121.76), (82.24,-121.88), (82.35,-121.88), (82.47,-122.0), (82.82,-122.0), (82.82,-121.76), (82.35,-121.29), (82.35,-121.18), (82.12,-120.94), (82.12,-120.82), (82.0,-120.71), (82.0,-120.35), (81.88,-120.24), (81.88,-118.94), (82.0,-118.82), (82.0,-118.35), (82.12,-118.24), (82.12,-117.88), (82.24,-117.76), (82.24,-117.65), (82.35,-117.53), (82.35,-117.41), (82.47,-117.29), (82.47,-117.18), (82.59,-117.06), (82.59,-116.94), (82.71,-116.82), (82.71,-116.71), (82.94,-116.47), (82.94,-116.35), (84.0,-115.29), (84.12,-115.29), (84.24,-115.18), (84.24,-114.82), (84.12,-114.94), (83.76,-114.94), (83.41,-115.29), (83.29,-115.29), (82.94,-115.65), (82.94,-115.76), (82.59,-116.12), (82.59,-116.24), (82.35,-116.47), (82.35,-116.59), (82.24,-116.71), (82.24,-116.82), (82.12,-116.94), (82.12,-117.18), (82.0,-117.29), (82.0,-117.41), (81.88,-117.53), (81.88,-117.76), (81.76,-117.88), (81.76,-118.12), (81.65,-118.24), (81.65,-118.82), (81.53,-118.94), (81.41,-118.82), (81.41,-118.59), (81.29,-118.47), (81.18,-118.47), (80.94,-118.71), (80.82,-118.71), (80.71,-118.82), (80.59,-118.82), (80.35,-119.06), (80.24,-119.06), (80.0,-119.29), (79.88,-119.29), (79.65,-119.53), (79.53,-119.53), (79.29,-119.76), (79.18,-119.76), (79.06,-119.88), (78.94,-119.88), (78.71,-120.12), (78.59,-120.12), (78.47,-120.24), (78.35,-120.24), (78.12,-120.47), (78.0,-120.47), (77.88,-120.59), (77.76,-120.59), (77.65,-120.71), (77.41,-120.71), (77.29,-120.82), (77.06,-120.82), (76.94,-120.94), (76.71,-120.94), (76.59,-120.82), (76.59,-120.71), (76.71,-120.59), (76.71,-120.35), (76.82,-120.24), (76.82,-120.12), (77.06,-119.88), (77.06,-119.76), (77.18,-119.65), (77.18,-119.53), (77.29,-119.41), (77.29,-119.29), (77.53,-119.06), (77.53,-118.94), (77.76,-118.71), (77.76,-118.59), (78.12,-118.24), (78.12,-118.12), (78.24,-118.0), (78.24,-117.88), (78.59,-117.53), (78.59,-117.41), (78.82,-117.18), (78.82,-117.06), (79.06,-116.82), (80.71,-116.82), (80.71,-116.47), (79.53,-116.47), (79.41,-116.35), (79.65,-116.12), (79.65,-116.0), (79.88,-115.76), (79.88,-115.53), (79.53,-115.53), (79.29,-115.76), (79.29,-115.88), (79.06,-116.12), (79.06,-116.24), (78.82,-116.47), (77.53,-116.47), (77.53,-116.82), (78.35,-116.82), (78.47,-116.94), (78.24,-117.18), (78.24,-117.29), (78.0,-117.53), (78.0,-117.65), (77.76,-117.88), (77.76,-118.0), (77.18,-118.59), (77.06,-118.59), (76.94,-118.71), (76.82,-118.71), (76.71,-118.82), (76.59,-118.82), (76.47,-118.94), (76.35,-118.94), (76.24,-119.06), (76.12,-119.06), (76.0,-119.18), (75.88,-119.18), (75.76,-119.29), (75.65,-119.29), (75.53,-119.41), (75.29,-119.41), (75.18,-119.53), (75.06,-119.53), (74.94,-119.65), (74.82,-119.65), (74.71,-119.76), (74.59,-119.76), (74.47,-119.88), (74.35,-119.88), (74.24,-120.0), (74.12,-119.88), (74.12,-119.29), (74.24,-119.18), (74.24,-118.94), (74.35,-118.82), (74.35,-118.59), (74.82,-118.12), (75.06,-118.35), (75.06,-118.47), (75.29,-118.47), (75.29,-118.35), (75.41,-118.24), (75.41,-118.0), (75.29,-117.88), (75.18,-117.88), (75.06,-117.76), (74.71,-117.76), (74.59,-117.88), (74.47,-117.88), (74.35,-118.0), (74.24,-118.0), (74.24,-118.12), (74.12,-118.24), (74.12,-118.35), (74.0,-118.47), (74.0,-118.59), (73.88,-118.71), (73.76,-118.71), (73.53,-118.94), (73.41,-118.94), (73.29,-119.06), (73.18,-119.06), (73.06,-119.18), (72.94,-119.18), (72.82,-119.29), (72.59,-119.29), (72.47,-119.41), (72.24,-119.41), (72.12,-119.53), (71.88,-119.53), (71.76,-119.65), (71.29,-119.65), (71.06,-119.41), (71.06,-119.06), (71.18,-118.94), (71.18,-118.82), (71.29,-118.71), (71.29,-118.59), (71.41,-118.47), (71.41,-118.24), (71.53,-118.12), (71.18,-118.12), (70.59,-118.71), (70.47,-118.71), (70.35,-118.82), (70.24,-118.82), (70.0,-119.06), (69.88,-119.06), (69.65,-119.29), (69.53,-119.29), (69.29,-119.53), (69.18,-119.53), (68.94,-119.76), (68.82,-119.76), (68.71,-119.88), (68.59,-119.88), (68.35,-120.12), (68.24,-120.12), (68.12,-120.24), (68.0,-120.24), (67.76,-120.47), (67.65,-120.47), (67.53,-120.59), (67.41,-120.59), (67.29,-120.71), (67.06,-120.71), (66.94,-120.82), (66.71,-120.82), (66.59,-120.94), (66.35,-120.94), (66.24,-120.82), (66.24,-120.71), (66.35,-120.59), (66.35,-120.35), (66.47,-120.24), (66.47,-120.12), (66.71,-119.88), (66.71,-119.76), (66.82,-119.65), (66.82,-119.53), (66.94,-119.41), (66.94,-119.29), (67.18,-119.06), (67.18,-118.94), (67.41,-118.71), (67.41,-118.59), (67.65,-118.35), (67.65,-118.24), (67.88,-118.0), (67.88,-117.88), (68.24,-117.53), (68.24,-117.41), (68.47,-117.18), (68.47,-117.06), (68.71,-116.82), (70.35,-116.82), (70.35,-116.47), (69.18,-116.47), (69.06,-116.35), (69.29,-116.12), (69.29,-116.0), (69.53,-115.76), (69.53,-115.53), (69.18,-115.53), (68.94,-115.76), (68.94,-115.88), (68.71,-116.12), (68.71,-116.24), (68.47,-116.47), (67.18,-116.47), (67.18,-116.82), (68.0,-116.82), (68.12,-116.94), (67.88,-117.18), (67.88,-117.29), (67.65,-117.53), (67.65,-117.65), (67.41,-117.88), (67.41,-118.0), (67.18,-118.24), (67.18,-118.35), (66.82,-118.71), (66.71,-118.71), (66.59,-118.82), (65.41,-118.82), (65.29,-118.71), (64.82,-118.71), (64.47,-118.35), (64.47,-118.24), (63.88,-118.24), (63.76,-118.35), (63.53,-118.35), (63.41,-118.47), (63.29,-118.47), (63.18,-118.59), (63.06,-118.59), (62.94,-118.71), (62.82,-118.71), (62.71,-118.82), (62.59,-118.82), (62.47,-118.94), (62.35,-118.94), (62.24,-119.06), (62.12,-119.06), (62.0,-119.18), (61.88,-119.18), (61.76,-119.29), (61.53,-119.29), (61.41,-119.41), (61.29,-119.41), (61.18,-119.53), (60.94,-119.53), (60.82,-119.65), (60.71,-119.65), (60.59,-119.53), (61.06,-119.06), (61.06,-118.82), (61.18,-118.71), (61.18,-118.35), (61.06,-118.24), (61.06,-118.12), (60.59,-118.12), (60.35,-118.35), (60.12,-118.12), (60.35,-117.88), (60.35,-117.76), (60.59,-117.53), (60.59,-117.41), (60.71,-117.29), (60.71,-117.18), (60.82,-117.06), (60.82,-116.94), (60.94,-116.82), (60.94,-116.71), (61.18,-116.47), (61.18,-116.35), (61.29,-116.24), (61.29,-116.12), (61.53,-115.88), (61.53,-115.76), (61.76,-115.53), (61.76,-115.41), (62.0,-115.18), (62.0,-115.06), (61.76,-114.82), (61.65,-114.82), (61.65,-114.94), (61.41,-115.18), (61.41,-115.29), (61.18,-115.53), (61.18,-115.65), (60.94,-115.88), (60.94,-116.0), (60.82,-116.12), (60.82,-116.24), (60.71,-116.35), (60.71,-116.47), (60.59,-116.59), (60.59,-116.71), (60.35,-116.94), (60.35,-117.06), (60.24,-117.18), (60.24,-117.29), (60.12,-117.41), (60.12,-117.53), (59.88,-117.76), (59.88,-117.88), (59.76,-118.0), (59.76,-118.12), (59.65,-118.24), (59.65,-118.35), (59.53,-118.47), (59.53,-118.59), (59.41,-118.71), (59.29,-118.71), (59.18,-118.82), (58.0,-118.82), (57.88,-118.71), (57.41,-118.71), (57.06,-118.35), (57.06,-118.24), (56.47,-118.24), (56.35,-118.35), (56.12,-118.35), (55.65,-118.82), (55.65,-118.94), (54.35,-120.24), (54.24,-120.24), (53.53,-120.94), (53.41,-120.94), (53.06,-121.29), (52.94,-121.29), (52.71,-121.53), (52.59,-121.53), (52.35,-121.76), (52.24,-121.76), (52.12,-121.88), (52.0,-121.88), (51.88,-122.0), (51.76,-122.0), (51.65,-122.12), (51.41,-122.12), (51.29,-122.24), (50.82,-122.24), (50.71,-122.35), (49.53,-122.35), (49.41,-122.24), (49.06,-122.24), (48.94,-122.12), (48.82,-122.12), (48.71,-122.0), (48.59,-122.0), (48.47,-121.88), (48.35,-121.88), (48.12,-121.65), (48.0,-121.65), (47.18,-120.82), (47.18,-120.59), (47.29,-120.47), (47.29,-120.35), (47.41,-120.24), (47.41,-120.12), (47.65,-119.88), (47.65,-119.76), (47.76,-119.65), (47.76,-119.53), (47.88,-119.41), (47.88,-119.29), (48.12,-119.06), (48.35,-119.06), (48.47,-118.94), (49.06,-118.94), (49.18,-118.82), (49.41,-118.82), (49.53,-118.71), (49.88,-118.71), (50.0,-118.59), (50.24,-118.59), (50.35,-118.47), (50.47,-118.47), (50.59,-118.35), (50.71,-118.35), (50.82,-118.24), (51.06,-118.24), (51.18,-118.12), (51.29,-118.12), (51.41,-118.0), (51.53,-118.0), (51.76,-117.76), (51.88,-117.76), (52.0,-117.65), (52.12,-117.65), (52.47,-117.29), (52.59,-117.29), (53.06,-116.82), (53.06,-116.71), (53.29,-116.47), (53.29,-116.35), (53.41,-116.24), (53.41,-116.12), (53.53,-116.0), (53.53,-115.88), (53.65,-115.76), (53.65,-115.65), (53.76,-115.53), (53.76,-115.18), (53.88,-115.06), (53.88,-114.0), (53.76,-113.88), (53.76,-113.65), (53.65,-113.53), (53.65,-113.41), (53.41,-113.18), (53.18,-113.18), (53.06,-113.06), (52.94,-113.06), (52.82,-112.94), (52.0,-112.94), (51.88,-112.82), (51.88,-112.71), (52.12,-112.47), (52.12,-112.0), (52.12,  -112.0), (56.59,  -118.47), (56.59,-118.47), (56.59,-118.59), (56.47,-118.71), (56.24,-118.71), (56.12,-118.82), (56.12,-118.94), (55.88,-119.18), (55.88,-119.29), (55.76,-119.41), (55.76,-119.53), (55.65,-119.65), (55.76,-119.76), (55.76,-119.88), (56.0,-119.88), (56.35,-119.53), (56.35,-119.41), (56.59,-119.18), (56.59,-118.94), (56.71,-118.82), (56.71,-118.71), (56.59,-118.59), (56.59,  -118.59), (56.35,  -118.71), (56.35,-118.71), (56.59,-118.71), (56.71,-118.82), (56.59,-118.94), (56.59,-119.06), (56.35,-119.29), (56.35,-119.41), (55.88,-119.88), (55.65,-119.65), (55.88,-119.41), (55.88,-119.29), (56.0,-119.18), (56.0,-119.06), (56.0,  -119.06), (60.12,  -119.06), (60.12,-119.06), (60.0,-119.06), (59.29,-119.76), (59.41,-119.88), (59.65,-119.88), (59.88,-119.65), (60.0,-119.65), (60.71,-118.94), (60.71,-118.82), (60.82,-118.71), (60.82,-118.59), (60.71,-118.47), (60.71,  -118.47), (63.41,  -119.06), (63.41,-119.06), (63.41,-119.18), (63.29,-119.29), (63.29,-119.41), (63.18,-119.53), (63.18,-119.76), (63.29,-119.88), (63.76,-119.41), (63.76,-119.29), (64.0,-119.06), (64.0,-118.94), (64.12,-118.82), (63.88,-118.59), (63.88,  -118.59), (64.0,  -118.59), (64.0,-118.59), (64.12,-118.71), (64.12,-118.82), (64.0,-118.94), (64.0,-119.18), (63.76,-119.41), (63.76,-119.53), (63.41,-119.88), (63.18,-119.88), (63.18,-119.41), (63.29,-119.29), (63.29,-119.18), (63.41,-119.06), (63.41,-118.94), (63.65,-118.71), (63.76,-118.71), (64.0,-118.47), (64.0,  -118.47), (79.29,  -115.88), (79.29,-115.88), (79.29,-116.0), (79.06,-116.24), (79.06,-116.35), (78.94,-116.47), (77.65,-116.47), (77.53,-116.59), (77.53,-116.71), (77.65,-116.82), (78.47,-116.82), (78.47,-117.06), (78.24,-117.29), (78.24,-117.41), (78.0,-117.65), (78.0,-117.76), (77.76,-118.0), (77.76,-118.12), (77.41,-118.47), (77.65,-118.71), (77.76,-118.59), (77.76,-118.47), (78.12,-118.12), (78.12,-118.0), (78.24,-117.88), (78.24,-117.76), (78.59,-117.41), (78.59,-117.29), (78.82,-117.06), (78.82,-116.94), (78.94,-116.82), (80.59,-116.82), (80.71,-116.71), (80.71,-116.59), (80.59,-116.47), (79.41,-116.47), (79.41,-116.24), (79.65,-116.0), (79.65,-115.88), (79.88,-115.65), (79.76,-115.53), (79.65,-115.53), (79.65,  -115.53), (83.53,  -115.29), (83.53,-115.29), (83.41,-115.29), (82.94,-115.76), (82.94,-115.88), (82.59,-116.24), (82.59,-116.35), (82.35,-116.59), (82.35,-116.71), (82.24,-116.82), (82.24,-116.94), (82.12,-117.06), (82.12,-117.18), (82.0,-117.29), (82.0,-117.53), (81.88,-117.65), (81.88,-117.76), (81.76,-117.88), (81.76,-118.12), (81.65,-118.24), (81.65,-118.82), (81.53,-118.94), (81.53,-120.35), (81.65,-120.47), (81.65,-120.82), (81.76,-120.94), (81.76,-121.06), (82.0,-121.29), (82.0,-121.41), (82.24,-121.65), (82.24,-121.76), (82.35,-121.88), (82.47,-121.88), (82.59,-122.0), (82.71,-122.0), (82.82,-121.88), (82.35,-121.41), (82.35,-121.29), (82.12,-121.06), (82.12,-120.94), (82.0,-120.82), (82.0,-120.35), (81.88,-120.24), (81.88,-118.94), (82.0,-118.82), (82.0,-118.35), (82.12,-118.24), (82.12,-117.88), (82.24,-117.76), (82.24,-117.53), (82.35,-117.41), (82.35,-117.29), (82.47,-117.18), (82.47,-117.06), (82.59,-116.94), (82.59,-116.82), (82.71,-116.71), (82.71,-116.59), (82.94,-116.35), (82.94,-116.24), (83.88,-115.29), (84.0,-115.29), (84.24,-115.06), (84.12,-114.94), (83.88,-114.94), (83.88,  -114.94), (85.18,  -116.0), (85.18,-116.0), (85.06,-116.0), (84.94,-116.12), (84.94,-116.24), (85.18,-116.47), (85.18,-116.59), (85.29,-116.71), (85.29,-116.82), (85.41,-116.94), (85.41,-117.18), (85.53,-117.29), (85.53,-117.53), (85.76,-117.76), (86.0,-117.76), (86.35,-117.41), (86.35,-117.29), (86.24,-117.18), (86.24,-116.94), (86.12,-116.82), (86.12,-116.71), (85.88,-116.47), (85.88,-116.35), (85.76,-116.24), (85.76,-116.12), (85.41,-115.76), (85.41,  -115.76), (85.41,  -115.76), (85.41,-115.76), (85.29,-115.88), (85.18,-115.88), (85.06,-116.0), (84.94,-116.0), (84.94,-116.35), (85.18,-116.59), (85.18,-116.71), (85.29,-116.82), (85.29,-116.94), (85.41,-117.06), (85.41,-117.18), (85.53,-117.29), (85.53,-117.53), (85.65,-117.65), (85.65,-117.76), (86.12,-117.76), (86.35,-117.53), (86.35,-117.29), (86.24,-117.18), (86.24,-116.82), (86.12,-116.71), (86.12,-116.59), (85.88,-116.35), (85.88,-116.24), (85.65,-116.0), (85.65,-115.88), (85.53,-115.88), (85.53,  -115.88), (87.06,  -115.53), (87.06,-115.53), (86.82,-115.76), (87.06,-116.0), (87.06,-116.12), (87.18,-116.24), (87.18,-116.35), (87.41,-116.59), (87.41,-116.82), (87.76,-117.18), (87.88,-117.18), (88.24,-116.82), (88.24,-116.59), (88.12,-116.47), (88.12,-116.35), (88.0,-116.24), (88.0,-116.12), (87.88,-116.0), (87.88,-115.88), (87.41,-115.41), (87.29,-115.41), (87.18,-115.53), (87.18,  -115.53), (87.18,  -115.41), (87.18,-115.41), (87.06,-115.53), (86.94,-115.53), (86.94,-115.65), (86.82,-115.76), (86.82,-115.88), (87.06,-116.12), (87.06,-116.24), (87.18,-116.35), (87.18,-116.47), (87.41,-116.71), (87.41,-116.94), (87.65,-117.18), (88.0,-117.18), (88.24,-116.94), (88.24,-116.47), (88.0,-116.24), (88.0,-116.0), (87.88,-115.88), (87.88,-115.76), (87.53,-115.41), (87.53,  -115.41), (90.0,  -115.76), (90.0,-115.76), (90.0,-116.12), (89.88,-116.24), (89.88,-116.71), (89.76,-116.82), (89.76,-117.06), (89.65,-117.18), (89.65,-117.41), (89.53,-117.53), (89.53,-117.76), (89.41,-117.88), (89.41,-118.12), (89.29,-118.24), (89.29,-118.35), (89.18,-118.47), (89.18,-118.59), (89.06,-118.71), (89.06,-118.82), (88.35,-119.53), (88.24,-119.53), (88.12,-119.65), (88.0,-119.65), (87.88,-119.76), (87.76,-119.76), (87.65,-119.88), (87.53,-119.88), (87.41,-120.0), (87.29,-120.0), (87.18,-120.12), (87.06,-120.12), (86.94,-120.24), (86.82,-120.24), (86.71,-120.35), (86.47,-120.35), (86.24,-120.59), (86.35,-120.71), (86.35,-120.82), (86.59,-121.06), (86.94,-121.06), (87.06,-120.94), (87.18,-120.94), (87.29,-120.82), (87.53,-120.82), (87.76,-120.59), (88.0,-120.59), (88.24,-120.35), (88.35,-120.35), (88.71,-120.0), (88.82,-120.0), (89.65,-119.18), (89.65,-119.06), (89.88,-118.82), (89.88,-118.71), (90.0,-118.59), (90.0,-118.35), (90.24,-118.12), (90.24,-117.88), (90.35,-117.76), (90.35,-117.53), (90.47,-117.41), (90.47,-117.18), (90.59,-117.06), (90.59,-116.82), (90.71,-116.71), (90.71,-116.24), (90.82,-116.12), (90.82,-115.76), (90.71,-115.65), (90.59,-115.65), (90.47,-115.53), (90.24,-115.53), (90.24,  -115.53), (90.12,  -115.53), (90.12,-115.53), (90.12,-115.65), (90.0,-115.76), (90.0,-116.12), (89.88,-116.24), (89.88,-116.71), (89.76,-116.82), (89.76,-117.06), (89.65,-117.18), (89.65,-117.41), (89.53,-117.53), (89.53,-117.76), (89.41,-117.88), (89.41,-118.0), (89.29,-118.12), (89.29,-118.24), (89.18,-118.35), (89.18,-118.47), (89.06,-118.59), (89.06,-118.71), (88.24,-119.53), (88.12,-119.53), (88.0,-119.65), (87.88,-119.65), (87.65,-119.88), (87.41,-119.88), (87.29,-120.0), (87.18,-120.0), (87.06,-120.12), (86.94,-120.12), (86.71,-120.35), (86.35,-120.35), (86.24,-120.47), (86.24,-120.71), (86.35,-120.82), (86.35,-120.94), (86.47,-121.06), (87.06,-121.06), (87.29,-120.82), (87.65,-120.82), (87.88,-120.59), (88.0,-120.59), (88.12,-120.47), (88.24,-120.47), (88.35,-120.35), (88.47,-120.35), (88.82,-120.0), (88.94,-120.0), (89.65,-119.29), (89.65,-119.18), (89.88,-118.94), (89.88,-118.82), (90.0,-118.71), (90.0,-118.47), (90.24,-118.24), (90.24,-117.88), (90.35,-117.76), (90.35,-117.53), (90.47,-117.41), (90.47,-117.18), (90.59,-117.06), (90.59,-116.82), (90.71,-116.71), (90.71,-116.24), (90.82,-116.12), (90.82,-115.65), (90.59,-115.65), (90.47,-115.53), (90.47,  -115.53), (93.53,  -115.06), (93.53,-115.06), (93.65,-115.18), (93.76,-115.18), (94.12,-115.53), (94.12,-115.65), (94.35,-115.88), (94.35,-116.12), (94.47,-116.24), (94.47,-116.59), (94.59,-116.71), (94.59,-118.12), (94.47,-118.24), (94.47,-118.71), (94.35,-118.82), (94.35,-119.18), (94.24,-119.29), (94.24,-119.53), (94.12,-119.65), (94.12,-119.76), (94.0,-119.88), (94.0,-120.0), (93.88,-120.12), (93.88,-120.24), (93.76,-120.35), (93.76,-120.47), (92.71,-121.53), (92.59,-121.53), (92.47,-121.65), (92.35,-121.65), (92.12,-121.88), (92.24,-122.0), (92.47,-122.0), (92.59,-121.88), (92.71,-121.88), (92.94,-121.65), (93.06,-121.65), (93.76,-120.94), (93.76,-120.82), (94.0,-120.59), (94.0,-120.47), (94.12,-120.35), (94.12,-120.24), (94.35,-120.0), (94.35,-119.88), (94.47,-119.76), (94.47,-119.53), (94.59,-119.41), (94.59,-119.29), (94.71,-119.18), (94.71,-118.82), (94.82,-118.71), (94.82,-118.24), (94.94,-118.12), (94.94,-116.71), (94.82,-116.59), (94.82,-116.24), (94.71,-116.12), (94.71,-116.0), (94.59,-115.88), (94.59,-115.76), (94.47,-115.65), (94.47,-115.53), (93.76,-114.82), (93.76,  -114.82), (93.76,  -114.82), (93.76,-114.82), (93.53,-115.06), (93.53,-115.18), (93.65,-115.18), (94.12,-115.65), (94.12,-115.76), (94.35,-116.0), (94.35,-116.12), (94.47,-116.24), (94.47,-116.59), (94.59,-116.71), (94.59,-118.12), (94.47,-118.24), (94.47,-118.71), (94.35,-118.82), (94.35,-119.18), (94.24,-119.29), (94.24,-119.41), (94.12,-119.53), (94.12,-119.65), (94.0,-119.76), (94.0,-119.88), (93.88,-120.0), (93.88,-120.12), (93.76,-120.24), (93.76,-120.35), (92.59,-121.53), (92.47,-121.53), (92.35,-121.65), (92.24,-121.65), (92.12,-121.76), (92.12,-122.0), (92.59,-122.0), (92.71,-121.88), (92.82,-121.88), (93.06,-121.65), (93.18,-121.65), (93.76,-121.06), (93.76,-120.94), (94.0,-120.71), (94.0,-120.59), (94.12,-120.47), (94.12,-120.35), (94.35,-120.12), (94.35,-119.88), (94.47,-119.76), (94.47,-119.65), (94.59,-119.53), (94.59,-119.29), (94.71,-119.18), (94.71,-118.82), (94.82,-118.71), (94.82,-118.24), (94.94,-118.12), (94.94,-116.71), (94.82,-116.59), (94.82,-116.24), (94.71,-116.12), (94.71,-115.88), (94.59,-115.76), (94.59,-115.65), (94.47,-115.53), (94.47,-115.41), (93.88,-114.82), (93.88,  -114.82))
+
+# Alternatively, if your signature has multiple distinct strokes (pen lifts in between):
+# SIGNATURE_STROKES_RAW = [
+#   [ (X1_stroke1, Z_side1_stroke1), (X2_stroke1, Z_side2_stroke1), ... ], # Stroke 1
+#   [ (X1_stroke2, Z_side1_stroke2), (X2_stroke2, Z_side2_stroke2), ... ], # Stroke 2
+#   # ... more strokes
+# ]
+# If using SIGNATURE_STROKES_RAW, you'd adjust the signature command generation logic.
+# For now, we'll assume SIGNATURE_POINTS_RAW is a single, continuous path after initial pen down.
+
+--- END OF FILE: backend/signature_data.py ---
 --- START OF FILE: backend/voice_assistant.py ---
 # backend/voice_assistant.py
 import whisper
@@ -2379,13 +2653,13 @@ whisper_model = None # Global variable for the Whisper model instance
 
 def load_whisper_model():
     """Loads the Whisper model. Call this once when the server starts."""
-    global whisper_model # Declare that we are using the global variable
+    global whisper_model 
     if whisper_model is None:
         logging.info(f"Attempting to load Whisper model ({WHISPER_MODEL_SIZE})...")
         try:
             whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
             logging.info(f"Whisper model ({WHISPER_MODEL_SIZE}) loaded successfully.")
-            return whisper_model # Return the loaded model
+            return whisper_model 
         except Exception as e:
             logging.error(f"Error loading Whisper model: {e}", exc_info=True)
             whisper_model = None 
@@ -2395,10 +2669,12 @@ def load_whisper_model():
 
 def transcribe_audio(audio_filepath):
     """Transcribes the given audio file using the loaded Whisper model."""
-    global whisper_model # Ensure we're using the global instance
+    global whisper_model 
     if whisper_model is None:
         logging.error("Whisper model is not loaded. Cannot transcribe.")
-        return None
+        if load_whisper_model() is None: # Attempt to load if not loaded
+            logging.error("Failed to load Whisper model on demand.")
+            return None
     
     if not os.path.exists(audio_filepath):
         logging.error(f"Audio file not found for transcription: {audio_filepath}")
@@ -2407,6 +2683,7 @@ def transcribe_audio(audio_filepath):
     try:
         logging.info(f"Transcribing audio file: {audio_filepath} with Whisper model {WHISPER_MODEL_SIZE}...")
         start_time = time.time()
+        # Ensure fp16 is False if CPU only, can be True if GPU supports it and it's configured
         result = whisper_model.transcribe(audio_filepath, fp16=False) 
         transcription = result["text"]
         end_time = time.time()
@@ -2418,20 +2695,22 @@ def transcribe_audio(audio_filepath):
         return None
 
 # --- Llama LLM ---
-llm_instance = None # Global variable for the Llama model instance
+llm_instance = None # Global variable for the Llama model instance, set by load_llm_model
 llm_chat_history = [] 
 
 def load_llm_model():
     """Loads the Llama GGUF model. Call this once when the server starts."""
-    global llm_instance # Declare that we are using the global variable
+    global llm_instance 
     if llm_instance is None:
         model_filename = config.LLM_MODEL_FILENAME
-        model_path = os.path.join(os.path.dirname(__file__), "models", model_filename)
+        # Construct model path relative to this file's directory, then into 'models'
+        base_dir = os.path.dirname(os.path.abspath(__file__)) 
+        model_path = os.path.join(base_dir, "models", model_filename)
         
         logging.info(f"Attempting to load LLM model: {model_filename} from path: {model_path}")
         if not os.path.exists(model_path):
             logging.error(f"LLM model file NOT FOUND at: {model_path}")
-            logging.error("Please ensure the model is downloaded and LLM_MODEL_FILENAME in config.py is correct.")
+            logging.error(f"Please ensure the model is downloaded to '{os.path.join('backend', 'models')}' and LLM_MODEL_FILENAME in config.py ('{model_filename}') is correct.")
             llm_instance = None
             return None
         
@@ -2441,16 +2720,15 @@ def load_llm_model():
                 model_path=model_path,
                 n_ctx=config.LLM_N_CTX,         
                 n_gpu_layers=config.LLM_N_GPU_LAYERS, 
-                chat_format="chatml", # Explicitly set chat format for DeepSeek
-                verbose=True 
+                chat_format="chatml", 
+                verbose=True # llama.cpp verbose logging
             )
-            logging.info(f"LLM model ({model_filename}) loaded successfully into llm_instance with chat_format='chatml'.")
+            logging.info(f"LLM model ({model_filename}) loaded successfully into voice_assistant.llm_instance with chat_format='chatml'.")
             return llm_instance 
         except Exception as e:
-            logging.error(f"Error loading LLM model from {model_path}: {e}", exc_info=True)
-            # Try without explicit chat_format as a fallback if chatml causes issues with this specific GGUF
+            logging.error(f"Error loading LLM model from {model_path} with chat_format='chatml': {e}", exc_info=True)
             try:
-                logging.warning(f"Retrying LLM load without explicit chat_format for {model_filename}...")
+                logging.warning(f"Retrying LLM load for {model_filename} without explicit chat_format (auto-detection)...")
                 llm_instance = Llama(
                     model_path=model_path,
                     n_ctx=config.LLM_N_CTX,         
@@ -2464,7 +2742,7 @@ def load_llm_model():
                 llm_instance = None
                 return None
 
-    logging.info("LLM model already loaded.")
+    logging.info("LLM model already loaded (voice_assistant.llm_instance).")
     return llm_instance
 
 def process_command_with_llm_stream(text_input):
@@ -2473,164 +2751,193 @@ def process_command_with_llm_stream(text_input):
     Attempts to extract a structured command from the LLM's full response.
     """
     global llm_instance, llm_chat_history 
+    
+    logging.info(f"--- voice_assistant.process_command_with_llm_stream called with input: '{text_input}' ---")
+
     if llm_instance is None:
-        logging.error("LLM model (llm_instance) is not loaded. Cannot process command.")
-        if load_llm_model() is None: 
+        logging.error("LLM model (voice_assistant.llm_instance) is not loaded. Attempting to load now.")
+        if load_llm_model() is None: # Try to load it if it's not already
+            logging.error("Failed to load LLM model on demand in process_command_with_llm_stream.")
             yield {"error": "LLM not available (failed to load).", "done": True}
             return 
 
-    MAX_HISTORY_TURNS = 3 
-    if len(llm_chat_history) > MAX_HISTORY_TURNS * 2:
+    MAX_HISTORY_TURNS = 1 # Keep history very short for simpler models
+    if len(llm_chat_history) > MAX_HISTORY_TURNS * 2: 
         llm_chat_history = llm_chat_history[-(MAX_HISTORY_TURNS * 2):]
 
     llm_chat_history.append({"role": "user", "content": text_input})
     
+    # Simplified System Prompt - Focus on Command Extraction
     system_prompt = (
-        "## IDENTITY AND ROLE: YOU ARE ROBOTIST! ##\n"
-        "YOU ARE ROBOTIST, a specialized AI assistant that CONTROLS a physical robotic drawing arm. Your ONLY identity is Robotist. "
-        "DO NOT mention being Phi or any other AI. DO NOT say you are developed by Microsoft or any other company. YOU ARE ROBOTIST.\n"
-        "Your primary purpose is to assist users with drawing tasks and robot control through clear, friendly, and concise conversation, always as Robotist.\n\n"
-        "## ROBOTIST'S CORE FUNCTIONS ##\n"
-        "1.  **Drawing Commands:** Understand requests like 'Robotist, draw a house with a red door' or 'Robotist, sketch a flower'. When asked to draw something from description, you MUST explain that you need an image uploaded to draw from, as you cannot generate images from text alone yet. Then, guide the user to upload an image.\n"
-        "2.  **Robot Movement:** Understand and CONFIRM commands like 'Robotist, go to your home position' or 'Robotist, move to the center of the paper'. You will then initiate the robot movement.\n"
-        "3.  **Conversation (as Robotist):** Chat about drawing, your capabilities as Robotist, or provide general assistance related to your functions. Always maintain the Robotist persona.\n\n"
-        "## INTERACTION GUIDELINES & COMMAND STRUCTURE ##\n"
-        "- **Always identify as Robotist.**\n"
-        "- **Greetings:** Respond as Robotist. Example: User: 'Hello' -> Robotist: 'Hello! Robotist here. How can I help you with your drawing or robot tasks today?'\n"
-        "- **Capability Questions:** If asked 'What can you do?', respond: 'As Robotist, I can control this arm to draw from an image you upload, move the arm to specific positions, and chat about these tasks. What would you like to do?'\n"
-        "- **Action Commands (Movement):**\n"
-        "  1. ALWAYS provide a natural language spoken response FIRST. Example: 'Certainly! Moving to the home position.'\n"
-        "  2. CRITICAL FOR SYSTEM (AFTER SPOKEN RESPONSE): If it's an actionable MOVEMENT command, you MUST then append the special token `ACTION_CMD:` followed by a valid JSON object. Example: `ACTION_CMD: {\"type\": \"move\", \"parameters\": {\"target\": \"home\"}}`\n"
-        "- **Drawing Commands (from voice description):**\n"
-        "  1. Acknowledge the request. Example: 'You'd like me to draw a blue square.'\n"
-        "  2. Explain your current limitation and guide the user. Example: 'I understand you want a blue square! To draw it, I need an image. Could you please upload an image of a blue square using the QR code or the file upload option on the screen? Then I can process that for drawing.'\n"
-        "  3. For system processing, append: `ACTION_CMD: {\"type\": \"draw_request_clarification\", \"details\": \"User asked to draw [original description, e.g., blue square]. Needs image upload.\"}`\n"
-        "- **Clarification (general):** If a command is vague, ask for more details.\n"
-        "- **YOU CAN DRAW (from an image):** When an image is uploaded and the user asks to draw *that image*, confirm and prepare for that process. DO NOT say you are an AI that cannot physically draw. You are the interface to a robot that DOES draw from processed images.\n"
-        "- **Be Concise:** Keep conversational responses brief and to the point.\n\n"
-        "You are Robotist. Begin."
+        "## YOU ARE ROBOTIST - ROBOT CONTROLLER ##\n"
+        "Your primary function is to understand user commands and translate them into structured JSON for a robot arm. "
+        "You also provide brief spoken feedback.\n\n"
+        "### CORE ROBOT ACTIONS & REQUIRED OUTPUT FORMAT ###\n"
+        "For the following specific user intents, your output MUST be in this exact two-part format:\n"
+        "1.  **Spoken Confirmation:** A very short, direct confirmation.\n"
+        "2.  **System Directive (`ACTION_CMD:`):** IMMEDIATELY after the spoken confirmation, append `ACTION_CMD:` followed by the precise JSON shown below. This JSON part is for the system and IS NOT SPOKEN.\n\n"
+        "**MANDATORY EXAMPLES - FOLLOW THESE EXACTLY:**\n\n"
+        "  - User input contains: \"home\", \"go home\", \"move to home position\"\n"
+        "    Your Output: `Okay, moving home. ACTION_CMD: {\"type\": \"move\", \"parameters\": {\"target\": \"home\"}}`\n\n"
+        "  - User input contains: \"center\", \"go to center\", \"move to center position\", \"middle of paper\"\n"
+        "    Your Output: `Alright, moving to the center. ACTION_CMD: {\"type\": \"move\", \"parameters\": {\"target\": \"center\"}}`\n\n"
+        "  - User input (after image upload is confirmed by system): \"draw it\", \"start drawing\", \"go ahead and draw\"\n"
+        "    Your Output: `Starting the drawing. ACTION_CMD: {\"type\": \"draw_uploaded_image\"}`\n\n"
+        "**IMPORTANT:**\n"
+        "- If the user's command clearly matches one of the above intents, you MUST output both the spoken confirmation AND the corresponding `ACTION_CMD:` block. NO EXCEPTIONS.\n"
+        "- If the user asks to draw something from a verbal description (e.g., \"draw a cat\"), respond: `I need an image to draw from. Please upload one. ACTION_CMD: {\"type\": \"draw_request_clarification\", \"details\": \"User asked to draw from description. Needs image.\"}`\n"
+        "- For any other input (greetings, questions, unclear commands), provide a very brief, helpful response as Robotist. DO NOT output `ACTION_CMD:` for these. Example: User: \"Hello\" -> Your Output: `Hello! Robotist here.` User: \"What can you do?\" -> Your Output: `I can control the robot to move and draw from images.`\n\n"
+        "Be direct and prioritize the `ACTION_CMD:` for recognized actions. You are Robotist."
     )
     
     messages_for_llm = [
         {"role": "system", "content": system_prompt},
     ] + llm_chat_history
 
-    logging.info(f"\nStreaming to LLM ({config.LLM_MODEL_FILENAME}) with {len(messages_for_llm)} total messages in context.")
+    logging.info(f"Streaming to LLM ({config.LLM_MODEL_FILENAME}) with {len(messages_for_llm)} total messages in context. Last user message: '{text_input}'")
 
     full_assistant_response = ""
     try:
         start_time = time.time()
+        
         stream = llm_instance.create_chat_completion(
             messages=messages_for_llm,
-            max_tokens=config.LLM_MAX_TOKENS,
-            temperature=config.LLM_TEMPERATURE, 
+            max_tokens=config.LLM_MAX_TOKENS, # Max tokens for the LLM's response
+            temperature=config.LLM_TEMPERATURE, # Controls randomness: 0.0 for deterministic, ~0.7 for creative
             stream=True 
         )
         
-        logging.info("LLM stream initiated.")
-        for chunk_index, chunk in enumerate(stream):
-            delta = chunk['choices'][0]['delta']
+        logging.info("LLM stream initiated with llama.cpp.")
+        chunk_count = 0
+        for chunk_index, chunk_data in enumerate(stream):
+            chunk_count += 1
+            delta = chunk_data['choices'][0]['delta']
             content_piece = delta.get('content')
             
             if content_piece: 
+                logging.debug(f"LLM Content Piece from chunk {chunk_index}: '{content_piece}'")
                 yield {"chunk": content_piece, "done": False}
                 full_assistant_response += content_piece
+            else:
+                logging.debug(f"LLM Chunk {chunk_index} had no 'content' in delta. Delta: {delta}")
             
-            if chunk['choices'][0].get('finish_reason') is not None:
-                logging.info(f"LLM stream finished. Reason: {chunk['choices'][0]['finish_reason']}")
+            if chunk_data['choices'][0].get('finish_reason') is not None:
+                logging.info(f"LLM stream finished by model. Reason: {chunk_data['choices'][0]['finish_reason']}. Total chunks processed: {chunk_count}")
                 break 
         
         end_time = time.time()
-        logging.info(f"LLM full response streamed in {end_time - start_time:.2f} seconds.")
-        logging.info(f"LLM Final Assembled Output (raw): {full_assistant_response}")
+        logging.info(f"LLM full response assembled/streamed in {end_time - start_time:.2f} seconds. Total chunks: {chunk_count}")
+        logging.info(f"LLM Final Assembled Output (raw from stream): {full_assistant_response}")
 
         parsed_action_command = None
-        natural_language_response = full_assistant_response 
+        final_natural_language_response = full_assistant_response.strip() 
 
         action_cmd_marker = "ACTION_CMD:"
-        if action_cmd_marker in full_assistant_response:
-            parts = full_assistant_response.split(action_cmd_marker, 1)
-            natural_language_response = parts[0].strip() 
-            if not natural_language_response and "draw_request_clarification" not in parts[1]: 
-                 logging.warning("ACTION_CMD found with potentially missing natural language part. LLM might have only outputted the ACTION_CMD.")
-            
+        if action_cmd_marker in final_natural_language_response:
+            parts = final_natural_language_response.split(action_cmd_marker, 1)
+            spoken_part = parts[0].strip()
             action_json_str = parts[1].strip()
-            logging.info(f"Found ACTION_CMD marker. JSON string part: {action_json_str}")
+            
+            logging.info(f"Found ACTION_CMD marker. Potential spoken part: '{spoken_part}'. JSON string part: '{action_json_str}'")
             try:
                 json_start = action_json_str.find('{')
                 json_end = action_json_str.rfind('}')
                 if json_start != -1 and json_end != -1 and json_end > json_start:
                     potential_json = action_json_str[json_start : json_end+1]
-                    logging.info(f"Attempting to parse JSON: {potential_json}")
+                    logging.info(f"Attempting to parse JSON from ACTION_CMD: {potential_json}")
                     parsed_action_command = json.loads(potential_json)
                     logging.info(f"Successfully parsed ACTION_CMD: {parsed_action_command}")
                 else:
-                    logging.warning("Could not properly isolate JSON object within ACTION_CMD string.")
+                    logging.warning(f"Could not properly isolate JSON object within ACTION_CMD string: '{action_json_str}'")
             except json.JSONDecodeError as e:
-                logging.warning(f"JSONDecodeError parsing ACTION_CMD: {e}. String was: {action_json_str}")
-            except Exception as e:
-                logging.warning(f"Generic error parsing ACTION_CMD: {e}")
+                logging.warning(f"JSONDecodeError parsing ACTION_CMD: {e}. String was: '{action_json_str}'")
+            except Exception as e: 
+                logging.warning(f"Generic error parsing ACTION_CMD JSON: {e}. String was: '{action_json_str}'")
+
+            if not spoken_part and parsed_action_command:
+                final_natural_language_response = "Okay, processing that." 
+                logging.info(f"ACTION_CMD was present but spoken part was empty. Using generic response: '{final_natural_language_response}'")
+            else:
+                final_natural_language_response = spoken_part
         
-        llm_chat_history.append({"role": "assistant", "content": natural_language_response}) 
-        
+        if final_natural_language_response:
+            llm_chat_history.append({"role": "assistant", "content": final_natural_language_response})
+        elif full_assistant_response and not parsed_action_command: 
+             llm_chat_history.append({"role": "assistant", "content": full_assistant_response.strip()})
+             final_natural_language_response = full_assistant_response.strip() 
+        elif not full_assistant_response and not parsed_action_command : 
+            logging.warning("LLM produced an empty response and no action command.")
+            final_natural_language_response = "I'm sorry, I didn't quite understand. Could you please rephrase?" 
+            llm_chat_history.append({"role": "assistant", "content": final_natural_language_response})
+
+
         final_response_payload = {
             "chunk": "", 
             "done": True, 
-            "final_message": natural_language_response 
+            "final_message": final_natural_language_response 
         }
         if parsed_action_command:
             final_response_payload["parsed_action"] = parsed_action_command
         
+        logging.info(f"Yielding final 'done' payload: {final_response_payload}")
         yield final_response_payload
 
     except Exception as e:
-        logging.error(f"Error during LLM streaming: {e}", exc_info=True)
+        logging.error(f"Error during LLM streaming in process_command_with_llm_stream: {e}", exc_info=True)
         if llm_chat_history and llm_chat_history[-1]["role"] == "user":
             llm_chat_history.pop() 
-        yield {"error": f"LLM streaming failed.", "done": True}
+        yield {"error": f"LLM streaming failed due to server error: {str(e)}", "done": True}
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    logging.info("Voice Assistant Module - Direct Test")
-    load_whisper_model() 
-    loaded_llm = load_llm_model() 
+    logging.basicConfig(level=logging.DEBUG) 
     
-    if loaded_llm: 
-        logging.info("\n--- Testing LLM Streaming directly ---")
+    logging.info("--- Voice Assistant Module Direct Test ---")
+    
+    logging.info("\n--- Testing Whisper STT ---")
+    if load_whisper_model():
+        logging.info("Whisper model loaded. Transcription test would require an audio file.")
+    else:
+        logging.error("Whisper model failed to load. Cannot test transcription.")
+
+    logging.info("\n--- Testing LLM Streaming ---")
+    if load_llm_model(): 
         test_inputs = [
             "Hello Robotist",
             "What can you do?",
             "Robotist draw a red square",
-            "Move home"
+            "Move home",
+            "go to center of paper", 
+            "move to home position" 
         ]
-        for test_input in test_inputs:
-            logging.info(f"\nUser Input: {test_input}")
+        for test_input_idx, test_input_text in enumerate(test_inputs):
+            logging.info(f"\n--- Test Input {test_input_idx + 1}: '{test_input_text}' ---")
             llm_chat_history.clear() 
             
-            print(f"Robotist Response (Streaming for '{test_input}'): ", end="", flush=True)
-            final_parsed_action_for_test = None
-            final_natural_response_for_test = ""
-
-            for response_part in process_command_with_llm_stream(test_input):
+            print(f"Robotist Response (Streaming for '{test_input_text}'): ", end="", flush=True)
+            
+            for response_part in process_command_with_llm_stream(test_input_text):
                 if response_part.get("error"):
-                    print(f"\nError: {response_part['error']}")
+                    print(f"\nLLM Stream Error: {response_part['error']}")
                     break
                 if response_part.get("chunk"): 
-                    print(response_part["chunk"], end="", flush=True)
+                    print(response_part["chunk"], end="", flush=True) 
                 
                 if response_part.get("done"):
-                    print("\n--- Stream Ended ---")
-                    final_natural_response_for_test = response_part.get("final_message", "")
+                    print("\n--- LLM Stream Ended for this test input ---")
+                    if response_part.get("final_message"):
+                         logging.debug(f"Test: Final natural message from payload: '{response_part.get('final_message')}'")
                     if response_part.get("parsed_action"):
-                        final_parsed_action_for_test = response_part.get("parsed_action")
-                        logging.info(f"TEST: Extracted Parsed Action: {final_parsed_action_for_test}")
-                    break
+                        logging.info(f"Test: Extracted Parsed Action: {response_part.get('parsed_action')}")
+                    else:
+                        logging.info(f"Test: No parsed action extracted for this input.")
+                    break 
             print("\n") 
         llm_chat_history.clear() 
     else:
         logging.error("LLM model not loaded, skipping LLM direct test.")
 
+    logging.info("--- Voice Assistant Module Direct Test Complete ---")
 
 --- END OF FILE: backend/voice_assistant.py ---
 --- START OF FILE: frontend/README.md ---
@@ -3067,7 +3374,7 @@ export default {
 // frontend/s2a-drawing-ui/src/App.tsx
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
-import './App.css'; // Make sure to create/update this for styles
+import './App.css'; // Ensure this file exists, even if minimal
 
 const PYTHON_BACKEND_URL = 'http://localhost:5555';
 
@@ -3075,63 +3382,112 @@ let socket: Socket;
 let mediaRecorder: MediaRecorder | null = null;
 let audioChunks: Blob[] = [];
 
+// Simple Icon Components
+const MicIcon = () => (
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 16 16">
+    <path d="M5 3a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0V3z"/>
+    <path d="M3.5 6.5A.5.5 0 0 1 4 7v1a4 4 0 0 0 8 0V7a.5.5 0 0 1 1 0v1a5 5 0 0 1-4.5 4.975V15h3a.5.5 0 0 1 0 1h-7a.5.5 0 0 1 0-1h3v-2.025A5 5 0 0 1 3 8V7a.5.5 0 0 1 .5-.5z"/>
+  </svg>
+);
+
+const StopIcon = () => (
+ <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 16 16">
+    <path d="M5 3.5h6A1.5 1.5 0 0 1 12.5 5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5z"/>
+  </svg>
+);
+
+interface ThresholdOption {
+  key: string;
+  label: string;
+  t1: number;
+  t2: number;
+}
+
+const THRESHOLD_OPTIONS: ThresholdOption[] = Array.from({ length: 10 }, (_, i) => ({
+  key: `opt${i + 1}`,
+  label: `Style ${i + 1}`,
+  t1: (i + 1) * 10 + 20, 
+  t2: (i + 1) * 20 + 40, 
+}));
+
+interface DrawingHistoryItem {
+    drawing_id: string;
+    original_filename: string;
+    status: string; // e.g., "completed", "interrupted", "in_progress", "aborted_manual_override"
+    progress: number; // Percentage
+    last_updated: string; // ISO date string
+    // The backend might send more, but these are key for UI
+    robot_commands_tuples?: any[]; // For potential client-side restart logic if needed, or just for info
+    current_command_index?: number;
+    total_commands?: number;
+}
+
+
 function App() {
   const [isConnectedToBackend, setIsConnectedToBackend] = useState(false);
-  const [backendMessage, setBackendMessage] = useState('');
-
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [robotStatusMessage, setRobotStatusMessage] = useState('Robot: Not connected');
   const [lastCommandResponse, setLastCommandResponse] = useState('');
 
-  // QR Code Upload States
   const [qrCodeImage, setQrCodeImage] = useState<string | null>(null);
   const [qrUploadUrl, setQrUploadUrl] = useState<string>('');
   
-  // Direct File Upload States
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Common states for uploaded image info (from QR or Direct)
   const [lastUploadedImageInfo, setLastUploadedImageInfo] = useState<string>('');
   const [uploadedFilePathFromBackend, setUploadedFilePathFromBackend] = useState<string | null>(null);
 
-  const [isDrawingActive, setIsDrawingActive] = useState(false);
+  const [isDrawingActive, setIsDrawingActive] = useState(false); // Tracks if _execute_drawing_commands is running
+  const [activeDrawingId, setActiveDrawingId] = useState<string | null>(null); // Tracks the ID of the drawing being executed
   const [drawingProgressMessage, setDrawingProgressMessage] = useState('');
+  const [drawingProgressPercent, setDrawingProgressPercent] = useState(0);
+  
+  const [drawingHistory, setDrawingHistory] = useState<DrawingHistoryItem[]>([]);
 
-  // Voice Interaction States
+
   const [isRecording, setIsRecording] = useState(false);
-  const [voiceStatus, setVoiceStatus] = useState('Tap mic to start');
-  const [transcribedText, setTranscribedText] = useState('');
-  const [llmResponse, setLlmResponse] = useState(''); // Will accumulate streaming response
+  const [interactionStatus, setInteractionStatus] = useState('Tap mic or type command.');
+  const [rawTranscribedText, setRawTranscribedText] = useState(''); 
+  const [editableCommandText, setEditableCommandText] = useState(''); 
+  const [llmResponse, setLlmResponse] = useState('');
   const audioStreamRef = useRef<MediaStream | null>(null);
 
+  const [xCoord, setXCoord] = useState('');
+  const [yCoord, setYCoord] = useState('');
+  const [zCoord, setZCoord] = useState('');
 
-  // Effect for Socket.IO setup and event listeners
+  const [showThresholdModal, setShowThresholdModal] = useState(false);
+  const [selectedThresholdKey, setSelectedThresholdKey] = useState<string>(THRESHOLD_OPTIONS[2].key); 
+  const [thresholdPreviewImage, setThresholdPreviewImage] = useState<string | null>(null);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+
+  const clearActiveDrawingState = () => {
+    setIsDrawingActive(false);
+    setActiveDrawingId(null);
+    setDrawingProgressMessage('Idle');
+    setDrawingProgressPercent(0);
+  };
+
   useEffect(() => {
     socket = io(PYTHON_BACKEND_URL, { transports: ['websocket'] });
 
     socket.on('connect', () => {
       console.log('Frontend: Connected to Python backend via Socket.IO!');
       setIsConnectedToBackend(true);
-      setBackendMessage('Connected to Python Backend!');
+      setInteractionStatus('Tap mic or type command.');
     });
 
     socket.on('disconnect', () => {
       console.log('Frontend: Disconnected from Python backend.');
       setIsConnectedToBackend(false);
-      setBackendMessage('Disconnected from Python Backend.');
       setIsRobotConnected(false);
       setRobotStatusMessage('Robot: Disconnected (backend offline)');
-      setIsDrawingActive(false); 
-      setDrawingProgressMessage('');
-      setIsRecording(false); 
-      setVoiceStatus('Tap mic to start');
-    });
-
-    socket.on('response', (data: { data: string }) => {
-      setBackendMessage(data.data);
+      // Do not clear drawing active flags on simple disconnect, backend might still be processing or resumable
+      setInteractionStatus('Backend offline. Please refresh or check server.');
+      setShowThresholdModal(false); 
     });
 
     socket.on('robot_connection_status', (data: { success: boolean, message: string }) => {
@@ -3170,65 +3526,85 @@ function App() {
     socket.on('qr_image_received', handleImageUploadSuccess);
     socket.on('direct_image_upload_response', handleImageUploadSuccess); 
 
-    socket.on('drawing_status_update', (data: { active: boolean, message: string }) => {
-      setIsDrawingActive(data.active);
+    socket.on('drawing_status_update', (data: { 
+        active: boolean, 
+        message: string, 
+        progress?: number, 
+        resumable?: boolean, // This indicates if the specific drawing ID is resumable
+        drawing_id?: string,
+        original_filename?: string 
+      }) => {
+      
       setDrawingProgressMessage(data.message);
+      if (data.progress !== undefined) {
+        setDrawingProgressPercent(data.progress);
+      }
+
+      if (data.active) {
+        setIsDrawingActive(true);
+        if(data.drawing_id) setActiveDrawingId(data.drawing_id);
+      } else {
+        // If drawing is no longer active for this specific ID, or in general
+        if (activeDrawingId === data.drawing_id || !data.drawing_id) {
+            clearActiveDrawingState();
+        }
+      }
     });
+
+    socket.on('drawing_history_updated', (history: DrawingHistoryItem[]) => {
+        console.log("Received drawing_history_updated:", history);
+        setDrawingHistory(history || []);
+    });
+
 
     socket.on('transcription_result', (data: { text?: string, error?: string }) => {
         if (data.error) {
-            setVoiceStatus(`Transcription Error: ${data.error}`);
-            setTranscribedText('');
-            setLlmResponse(''); // Clear LLM response on transcription error
+            setInteractionStatus(`Transcription Error: ${data.error}`);
+            setRawTranscribedText('');
+            setEditableCommandText('');
+            setLlmResponse('');
         } else if (data.text) {
-            setVoiceStatus('Robotist is thinking...'); // Changed status
-            setTranscribedText(data.text);
-            setLlmResponse(''); // Clear previous LLM response before new one streams
+            setRawTranscribedText(data.text); 
+            setEditableCommandText(data.text); 
+            setLlmResponse(''); 
+            setInteractionStatus('Edit command below or send to Robotist.');
         }
     });
-
-    // New listener for streaming LLM responses
+    
     socket.on('llm_response_chunk', (data: { chunk?: string, error?: string, done: boolean, final_message?: string }) => {
         if (data.error) {
             setLlmResponse(prev => prev + `\n[Error: ${data.error}]`);
-            setVoiceStatus('LLM processing error.');
+            setInteractionStatus('LLM processing error.');
         } else if (data.chunk) {
             setLlmResponse(prev => prev + data.chunk);
             if (!data.done) {
-                setVoiceStatus('Robotist is typing...');
+                setInteractionStatus('Robotist is typing...');
             }
         }
         
         if (data.done) {
-            if (data.final_message && !data.error) { // If backend sends final assembled message
-                setLlmResponse(data.final_message); // Ensure final message is set correctly
+            if (data.final_message && !data.error) {
+                setLlmResponse(data.final_message);
             }
-            setVoiceStatus('Ready for next command.'); // Or some other final status
+            setInteractionStatus('Ready for next command.');
             if (data.error) {
-                 setVoiceStatus(`LLM Error: ${data.error}`);
-            } else if (!data.final_message && !data.chunk && !llmResponse) {
-                 // If stream ends with no content and no error, means it was just an empty completion
-                 setVoiceStatus('Robotist finished.');
+                 setInteractionStatus(`LLM Error: ${data.error}`);
+            } else if (!data.final_message && !data.chunk && llmResponse === "") { 
+                 setInteractionStatus('Robotist finished.');
             }
         }
     });
 
-    // This listener might be deprecated if all LLM responses are streamed via 'llm_response_chunk'
-    // For now, keep it as a fallback or for non-streamed LLM actions if any.
-    socket.on('llm_action_response', (data: { action?: any, message?: string, error?: string }) => {
-        console.log("Received 'llm_action_response' (potentially fallback/non-streamed):", data);
+    socket.on('threshold_preview_image_response', (data: { image_base64?: string, error?: string }) => {
+        setIsPreviewLoading(false);
         if (data.error) {
-            setVoiceStatus(`LLM Error (Non-Streamed): ${data.error}`);
-            // setLlmResponse(''); // Decide if this should overwrite streamed response
-        } else if (data.message) { 
-            setVoiceStatus('LLM processed command (Non-Streamed).');
-            // setLlmResponse(data.message); // Decide if this should overwrite
-        } else if (data.action) {
-             setVoiceStatus('LLM action received (Non-Streamed).');
-             // setLlmResponse(`Action: ${JSON.stringify(data.action)}`); // Decide
+            console.error("Error getting threshold preview:", data.error);
+            setThresholdPreviewImage(null);
+            alert(`Error generating preview: ${data.error}`);
+        } else if (data.image_base64) {
+            setThresholdPreviewImage(`data:image/png;base64,${data.image_base64}`);
         }
     });
-
 
     return () => { 
         if (socket) socket.disconnect(); 
@@ -3236,15 +3612,43 @@ function App() {
             audioStreamRef.current.getTracks().forEach(track => track.stop());
         }
     };
-  }, [llmResponse]); // Added llmResponse to dependency array for the 'done' check logic
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); 
 
-  // Robot Control Handlers
+  const requestThresholdPreview = useCallback((key: string) => {
+    const selectedOpt = THRESHOLD_OPTIONS.find(opt => opt.key === key);
+    if (selectedOpt && uploadedFilePathFromBackend && socket) {
+        setIsPreviewLoading(true);
+        setThresholdPreviewImage(null); 
+        console.log(`Requesting preview for T1=${selectedOpt.t1}, T2=${selectedOpt.t2}`);
+        socket.emit('request_threshold_preview', {
+            filepath: uploadedFilePathFromBackend,
+            t1: selectedOpt.t1,
+            t2: selectedOpt.t2,
+        });
+    }
+  }, [uploadedFilePathFromBackend]);
+
+  useEffect(() => {
+    if (showThresholdModal && selectedThresholdKey && uploadedFilePathFromBackend) {
+        requestThresholdPreview(selectedThresholdKey);
+    }
+  }, [selectedThresholdKey, showThresholdModal, uploadedFilePathFromBackend, requestThresholdPreview]); 
+
+
   const handleConnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_connect_request', {}); }
   const handleDisconnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_disconnect_request', {}); }
-  const sendGoHomeCommand = () => { if (!isDrawingActive && socket) socket.emit('send_robot_command', { type: 'go_home' }); }
-  const sendSafeCenterCommand = () => { if (!isDrawingActive && socket) socket.emit('send_robot_command', { type: 'move_to_safe_center' }); }
+  const sendGoHomeCommand = () => { 
+    if (!isDrawingActive && socket) {
+      socket.emit('send_robot_command', { type: 'go_home' }); 
+    }
+  }
+  const sendSafeCenterCommand = () => { 
+    if (!isDrawingActive && socket) {
+      socket.emit('send_robot_command', { type: 'move_to_safe_center' }); 
+    }
+  }
   
-  // QR Code Request Handler
   const requestQrCode = () => {
     if (socket && isConnectedToBackend && !isDrawingActive) {
       setQrCodeImage(null); setQrUploadUrl('Requesting QR Code...');
@@ -3254,7 +3658,6 @@ function App() {
     } else if (isDrawingActive) { alert("Cannot request QR code while drawing is in progress."); }
   };
 
-  // Direct File Input Handlers
   const processNewFile = (file: File | null) => {
     if (file && file.type.startsWith('image/')) {
       setSelectedFile(file); setImagePreviewUrl(URL.createObjectURL(file));
@@ -3294,68 +3697,110 @@ function App() {
     reader.readAsDataURL(selectedFile); 
   };
 
-  // Process and Draw
   const handleProcessAndDrawUploadedImage = () => {
     if (isDrawingActive) { alert("A drawing is already in progress."); return; }
     if (!isRobotConnected) { alert("Please connect to the robot first."); setLastCommandResponse("Error: Robot not connected."); return; }
     if (uploadedFilePathFromBackend) {
-      const originalFilename = lastUploadedImageInfo.includes("Received: ") ? lastUploadedImageInfo.split("Received: ")[1].split(". Ready")[0] : "uploaded_image";
-      socket.emit('process_image_for_drawing', { filepath: uploadedFilePathFromBackend, original_filename: originalFilename });
-      setLastCommandResponse(`Sent request to process & draw: ${originalFilename}`);
-      setDrawingProgressMessage("Requesting image processing and drawing..."); 
-    } else { alert("No image has been successfully uploaded to the backend yet."); setLastCommandResponse("Error: No backend image path available.");}
+      setSelectedThresholdKey(THRESHOLD_OPTIONS[2].key); 
+      setThresholdPreviewImage(null); 
+      setShowThresholdModal(true); 
+    } else { 
+      alert("No image has been successfully uploaded to the backend yet."); 
+      setLastCommandResponse("Error: No backend image path available.");
+    }
   };
 
-  // Voice Recording Handlers
+  const confirmAndStartDrawingWithThresholds = () => {
+    if (!uploadedFilePathFromBackend) {
+        alert("Error: No image path available for drawing.");
+        setShowThresholdModal(false);
+        return;
+    }
+    const selectedOpt = THRESHOLD_OPTIONS.find(opt => opt.key === selectedThresholdKey);
+    if (!selectedOpt) {
+        alert("Invalid threshold option selected.");
+        return;
+    }
+    const originalFilename = lastUploadedImageInfo.includes("Received: ") ? lastUploadedImageInfo.split("Received: ")[1].split(". Ready")[0] : "uploaded_image";
+    socket.emit('process_image_for_drawing', { 
+        filepath: uploadedFilePathFromBackend, 
+        original_filename: originalFilename,
+        canny_t1: selectedOpt.t1,
+        canny_t2: selectedOpt.t2
+    });
+    setLastCommandResponse(`Sent request to process & draw: ${originalFilename} with T1=${selectedOpt.t1}, T2=${selectedOpt.t2}`);
+    setDrawingProgressMessage("Requesting image processing and drawing..."); 
+    setDrawingProgressPercent(0);
+    setShowThresholdModal(false); 
+  };
+
+  const handleResumeDrawingFromHistory = (drawingId: string) => {
+    if (isDrawingActive) {
+        alert("Another drawing is already active. Cannot resume now.");
+        return;
+    }
+    if (socket && isConnectedToBackend) {
+        console.log(`Frontend: Emitting 'resume_drawing_request' for ID: ${drawingId}`);
+        socket.emit('resume_drawing_request', { drawing_id: drawingId });
+    } else {
+        alert("Cannot resume. Backend not connected.");
+    }
+  };
+
+  const handleRestartDrawingFromHistory = (drawingId: string) => {
+    if (isDrawingActive) {
+        alert("Another drawing is already active. Cannot restart now.");
+        return;
+    }
+    if (socket && isConnectedToBackend) {
+        console.log(`Frontend: Emitting 'restart_drawing_request' for ID: ${drawingId}`);
+        socket.emit('restart_drawing_request', { drawing_id: drawingId });
+    } else {
+        alert("Cannot restart. Backend not connected.");
+    }
+  };
+
+
   const startRecording = async () => {
     if (isDrawingActive || !isConnectedToBackend) {
         alert("Cannot record voice while drawing is active or backend is disconnected.");
         return;
     }
-    setVoiceStatus('Requesting mic permission...');
-    setTranscribedText('');
-    setLlmResponse(''); // Clear previous LLM response
+    setRawTranscribedText('');
+    setEditableCommandText('');
+    setLlmResponse('');
+    setInteractionStatus('Requesting mic permission...');
+
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         audioStreamRef.current = stream; 
         mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' }); 
         audioChunks = [];
 
-        mediaRecorder.ondataavailable = (event) => {
-            audioChunks.push(event.data);
-        };
-
+        mediaRecorder.ondataavailable = (event) => { audioChunks.push(event.data); };
         mediaRecorder.onstop = () => {
-            setVoiceStatus('Processing voice...'); // Initial status after stopping mic
+            setInteractionStatus('Sending audio for transcription...');
             const audioBlob = new Blob(audioChunks, { type: mediaRecorder?.mimeType });
-            
             const reader = new FileReader();
             reader.onloadend = () => {
-                const base64Audio = (reader.result as string).split(',')[1];
+                const base64Audio = (reader.result as string)?.split(',')[1];
                 if (socket && base64Audio) {
-                    console.log("Frontend: Sending audio data for transcription.");
                     socket.emit('audio_chunk', { audioData: base64Audio, mimeType: mediaRecorder?.mimeType });
-                } else {
-                    setVoiceStatus("Error: Could not send audio data.");
-                }
+                } else { setInteractionStatus("Error: Could not send audio data."); }
             };
-            reader.onerror = () => {
-                setVoiceStatus("Error reading audio blob.");
-            };
+            reader.onerror = () => { setInteractionStatus("Error reading audio blob."); };
             reader.readAsDataURL(audioBlob);
-
             if (audioStreamRef.current) {
                 audioStreamRef.current.getTracks().forEach(track => track.stop());
                 audioStreamRef.current = null;
             }
         };
-
         mediaRecorder.start();
         setIsRecording(true);
-        setVoiceStatus('Recording... Tap mic to stop.');
+        setInteractionStatus('Recording... Tap mic to stop.');
     } catch (err) {
         console.error("Error accessing microphone:", err);
-        setVoiceStatus('Mic permission denied or error.');
+        setInteractionStatus('Mic permission denied or error.');
         if (audioStreamRef.current) { 
             audioStreamRef.current.getTracks().forEach(track => track.stop());
             audioStreamRef.current = null;
@@ -3367,87 +3812,339 @@ function App() {
     if (mediaRecorder && isRecording) {
         mediaRecorder.stop();
         setIsRecording(false);
-        // Voice status will be updated by onstop handler, then by transcription_result, then by llm_response_chunk
     }
   };
 
   const handleMicButtonClick = () => {
-    if (isRecording) {
-        stopRecording();
+    if (isRecording) stopRecording();
+    else startRecording();
+  };
+
+  const submitTextToLLM = (text: string) => {
+    if (!text.trim()) {
+      alert("Command text cannot be empty.");
+      setInteractionStatus('Command empty. Tap mic or type command.');
+      return;
+    }
+    if (socket && isConnectedToBackend && socket.connected) { 
+      socket.emit('submit_text_to_llm', { text_command: text });
+      setLlmResponse(''); 
+      setInteractionStatus('Robotist is thinking...');
+      if (text !== rawTranscribedText) setRawTranscribedText('');
     } else {
-        startRecording();
+      alert("Cannot send command. Backend not connected or socket issue.");
+      setInteractionStatus('Backend disconnected or socket issue.');
     }
   };
 
+  const handleSendEditableCommand = () => { submitTextToLLM(editableCommandText); };
+
+  const handleSendCustomCoordinates = () => {
+    if (!isRobotConnected) {
+        alert("Robot not connected.");
+        return;
+    }
+    if (isDrawingActive) {
+        alert("Cannot send coordinates while drawing is active.");
+        return;
+    }
+    const x = parseFloat(xCoord);
+    const y = parseFloat(yCoord); 
+    const z = parseFloat(zCoord); 
+
+    if (isNaN(x) || isNaN(y) || isNaN(z)) {
+        alert("Invalid coordinates. Please enter numbers for X, Y (depth), and Z (side-to-side).");
+        return;
+    }
+    if (socket) {
+        socket.emit('send_custom_coordinates', { x_py: x, z_py: y, y_py: z });
+        setLastCommandResponse(`Sent custom coords: X=${x}, Depth=${y}, Side=${z}`);
+    }
+  };
+
+  const styles: { [key: string]: React.CSSProperties } = {
+    appContainer: { maxWidth: '1400px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif', color: '#e0e0e0', backgroundColor: '#1e1e1e' }, // Wider for history
+    header: { textAlign: 'center' as const, marginBottom: '30px', borderBottom: '1px solid #444', paddingBottom: '20px' },
+    mainTitle: { fontSize: '2.5em', color: '#61dafb', margin: '0 0 10px 0' },
+    statusText: { fontSize: '0.9em', color: isConnectedToBackend ? '#76ff03' : '#ff5252' },
+    mainLayoutContainer: { display: 'flex', flexDirection: 'column', gap: '25px' }, // Main sections stack vertically
+    topRowGrid: { display: 'grid', gridTemplateColumns: '1fr 2fr 1.5fr', gap: '25px', alignItems: 'start', marginBottom: '25px' }, 
+    section: { backgroundColor: '#2a2a2a', padding: '20px', borderRadius: '8px', boxShadow: '0 4px 8px rgba(0,0,0,0.2)', display: 'flex', flexDirection: 'column', minHeight: '300px' }, 
+    sectionTitle: { fontSize: '1.5em', color: '#61dafb', borderBottom: '1px solid #444', paddingBottom: '10px', marginBottom: '15px' },
+    button: { backgroundColor: '#007bff', color: 'white', border: 'none', padding: '10px 15px', borderRadius: '5px', cursor: 'pointer', fontSize: '1em', margin: '5px', transition: 'background-color 0.2s ease' },
+    buttonDisabled: { backgroundColor: '#555', cursor: 'not-allowed' },
+    micButton: { backgroundColor: isRecording ? '#dc3545' : '#007bff', width: '60px', height: '60px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' },
+    textarea: { width: 'calc(100% - 22px)', padding: '10px', marginBottom: '10px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff', minHeight: '60px' },
+    imageUploadContainer: { display: 'flex', flexDirection: 'column', gap: '20px'}, 
+    uploadBox: { border: '1px dashed #555', padding: '20px', borderRadius: '8px', textAlign: 'center' as const, backgroundColor: '#333', transition: 'background-color 0.2s, border-color 0.2s', flex: 1 },
+    uploadBoxDragging: { borderColor: '#007bff', backgroundColor: '#3a3a3a' },
+    imagePreview: { maxWidth: '100%', maxHeight: '150px', border: '1px solid #444', borderRadius: '4px', marginTop: '10px' },
+    progressBarContainer: { width: '100%', backgroundColor: '#444', borderRadius: '4px', overflow: 'hidden', marginTop: '10px' },
+    progressBar: { width: `${drawingProgressPercent}%`, backgroundColor: '#61dafb', height: '20px', textAlign: 'center' as const, lineHeight: '20px', color: '#1e1e1e', transition: 'width 0.3s ease' },
+    robotStatus: { padding: '10px', backgroundColor: '#333', borderRadius: '4px', fontSize: '0.9em', marginTop: '10px' },
+    llmResponseBox: { marginTop: '15px', padding: '15px', border: '1px solid #444', borderRadius: '4px', backgroundColor: '#333', whiteSpace: 'pre-wrap' as const, maxHeight: '200px', overflowY: 'auto' as const, flexGrow: 1},
+    coordInputContainer: { display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '15px', marginBottom: '15px' },
+    coordInputGroup: { display: 'flex', alignItems: 'center', gap: '10px' },
+    coordLabel: { minWidth: '70px', textAlign: 'right' as const, color: '#bbb' },
+    coordInput: { flexGrow: 1, padding: '8px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff' },
+    modalOverlay: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 },
+    modalContent: { backgroundColor: '#2a2a2a', padding: '30px', borderRadius: '8px', boxShadow: '0 5px 15px rgba(0,0,0,0.3)', width: 'auto', minWidth: '750px', maxWidth: '900px', color: '#e0e0e0' }, // Increased width
+    modalTitle: { fontSize: '1.8em', color: '#61dafb', marginBottom: '20px', textAlign: 'center' as const },
+    modalColumns: { display: 'flex', gap: '20px' },
+    modalColumn: { flex: 1 },
+    modalRadioGroup: { maxHeight: '550px', overflowY: 'auto', paddingRight: '10px' }, // Increased height
+    modalRadioLabel: { display: 'block', marginBottom: '8px', cursor: 'pointer', padding: '8px', borderRadius: '4px', transition: 'background-color 0.2s' },
+    modalRadioLabelSelected: { backgroundColor: '#007bff', color: 'white' },
+    modalPreviewArea: { textAlign: 'center' as const, borderLeft: '1px solid #444', paddingLeft: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
+    modalPreviewImage: { maxWidth: '350px', maxHeight: '350px', border: '1px solid #555', borderRadius: '4px', backgroundColor: '#1e1e1e', minHeight: '250px' }, // Increased preview image size
+    modalActions: { marginTop: '25px', textAlign: 'right' as const },
+    historySection: { /* Uses styles.section */ },
+    historyList: { listStyle: 'none', padding: 0, maxHeight: '400px', overflowY: 'auto'},
+    historyItem: { backgroundColor: '#333', padding: '15px', borderRadius: '6px', marginBottom: '10px', borderLeft: '5px solid #007bff' },
+    historyItemCompleted: { borderLeftColor: '#28a745' },
+    historyItemInterrupted: { borderLeftColor: '#ffc107' },
+    historyItemInProgress: { borderLeftColor: '#17a2b8' },
+    historyDetails: { fontSize: '0.9em', color: '#bbb', marginBottom: '8px' },
+    historyActions: { marginTop: '10px' },
+  };
+
   return (
-    <div className="App">
-      <h1>S2A Robotic Drawing Control</h1>
-      <p>Backend Connection: {isConnectedToBackend ? 'Connected' : 'Disconnected'}</p>
-      <hr />
+    <div style={styles.appContainer}>
+      <header style={styles.header}>
+        <h1 style={styles.mainTitle}>CamTech Robotic Drawing Control</h1>
+        <p style={styles.statusText}>Backend: {isConnectedToBackend ? 'Connected' : 'Disconnected'}</p>
+      </header>
 
-      <div className="voice-interaction-section" style={{ padding: '15px', border: '1px solid #555', borderRadius: '8px', marginBottom: '20px', textAlign: 'center' }}>
-        <h2>Voice Command</h2>
-        <button 
-            onClick={handleMicButtonClick} 
-            disabled={!isConnectedToBackend || isDrawingActive}
-            style={{
-                backgroundColor: isRecording ? '#dc3545' : '#007bff', 
-                color: 'white', padding: '10px 20px', fontSize: '1.2em',
-                borderRadius: '50%', width: '80px', height: '80px',
-                border: 'none', cursor: 'pointer', display: 'flex',
-                alignItems: 'center', justifyContent: 'center'
-            }}
-            title={isRecording ? "Stop Recording" : "Start Recording"}
-        >
-            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" fill="currentColor" viewBox="0 0 16 16">
-                <path d="M5 3a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0V3z"/>
-                <path d="M3.5 6.5A.5.5 0 0 1 4 7v1a4 4 0 0 0 8 0V7a.5.5 0 0 1 1 0v1a5 5 0 0 1-4.5 4.975V15h3a.5.5 0 0 1 0 1h-7a.5.5 0 0 1 0-1h3v-2.025A5 5 0 0 1 3 8V7a.5.5 0 0 1 .5-.5z"/>
-            </svg>
-        </button>
-        <p style={{ marginTop: '10px', minHeight: '20px' }}>{voiceStatus}</p>
-        {transcribedText && <p><b>You said:</b> {transcribedText}</p>}
-        {llmResponse && <p style={{whiteSpace: 'pre-wrap'}}><b>Robotist:</b> {llmResponse}</p>} {/* Added pre-wrap for newlines */}
-      </div>
-      
-      <hr />
-      <h2>Image Input</h2>
-      <div className="image-input-methods" style={{ display: 'flex', justifyContent: 'space-around', marginBottom: '20px' }}>
-        <div className="qr-upload-section" style={{border: '1px solid #555', padding: '15px', borderRadius: '8px', width: '45%'}}>
-          <h3>Upload via QR Code</h3>
-          <button onClick={requestQrCode} disabled={!isConnectedToBackend || isDrawingActive || isRecording}>
-            Get QR Code for Phone Upload
-          </button>
-          {qrUploadUrl && !qrCodeImage && <p style={{fontSize: '0.8em', wordBreak: 'break-all'}}><small>{qrUploadUrl}</small></p>}
-          {qrCodeImage && ( <div> <p><small>Scan to upload. URL: {qrUploadUrl}</small></p> <img src={qrCodeImage} alt="QR Code for Upload" style={{border: "1px solid #ccc", marginTop:"10px", maxWidth: '150px'}} /> </div> )}
-        </div>
-        <div className="direct-upload-section" style={{ border: isDragging ? '2px dashed #007bff' : '1px solid #555', padding: '15px', borderRadius: '8px', width: '45%', textAlign: 'center', backgroundColor: isDragging ? '#333' : 'transparent', transition: 'background-color 0.2s, border-color 0.2s', opacity: (isDrawingActive || isRecording) ? 0.5 : 1, pointerEvents: (isDrawingActive || isRecording) ? 'none' : 'auto' }}
-          onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop} >
-          <h3>Upload from Desktop</h3>
-          <input type="file" accept="image/*" onChange={handleFileSelect} ref={fileInputRef} style={{ display: 'none' }} disabled={isDrawingActive || isRecording} />
-          <button onClick={triggerFileInput} disabled={isDrawingActive || isRecording}> Choose Image File </button>
-          <p style={{fontSize: '0.9em', marginTop: '10px'}}>Or drag & drop image here</p>
-          {imagePreviewUrl && selectedFile && ( <div style={{marginTop: '15px'}}> <p>Preview:</p> <img src={imagePreviewUrl} alt="Selected preview" style={{maxWidth: '200px', maxHeight: '200px', border: '1px solid #ccc', borderRadius: '4px'}}/> <p style={{fontSize: '0.8em'}}>{selectedFile.name}</p> <button onClick={sendSelectedFileToBackend} disabled={!selectedFile || isDrawingActive || !isConnectedToBackend || isRecording} style={{marginTop: '10px'}} > Upload to Backend </button> </div> )}
-        </div>
-      </div>
-      {lastUploadedImageInfo && <p style={{color: lastUploadedImageInfo.startsWith("Received:") ? "green" : (lastUploadedImageInfo.startsWith("Error") ? "red" : "goldenrod"), fontWeight: 'bold'}}>{lastUploadedImageInfo}</p>}
-      {uploadedFilePathFromBackend && ( <button onClick={handleProcessAndDrawUploadedImage} disabled={isDrawingActive || !isRobotConnected || !isConnectedToBackend || isRecording} style={{marginTop: "10px", backgroundColor: '#28a745', color: 'white', padding: '10px 20px', fontSize: '1.1em'}} > Process & Draw Uploaded Image </button> )}
-      {isDrawingActive && <p style={{color: "cyan", fontWeight: "bold"}}>Drawing Active: {drawingProgressMessage}</p>}
-      {!isDrawingActive && drawingProgressMessage && !lastUploadedImageInfo.startsWith("Received:") && <p>{drawingProgressMessage}</p>}
+      <div style={styles.mainLayoutContainer}>
+        <div style={styles.topRowGrid}>
+          {/* Column 1: Robot Control */}
+          <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>Robot Control</h2>
+            <div style={{textAlign: 'center'}}>
+              <button onClick={handleConnectRobot} disabled={!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, ...((!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Connect to Robot </button>
+              <button onClick={handleDisconnectRobot} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, backgroundColor: '#ffc107', color: '#1e1e1e', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Disconnect Robot</button>
+              <br />
+              <button onClick={sendGoHomeCommand} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, marginTop: '10px', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Send Robot to Home </button>
+              <button onClick={sendSafeCenterCommand} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, marginTop: '10px', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Send to Safe Center </button>
+            </div>
 
-      <hr />
-      <h2>Robot Control</h2>
-      <button onClick={handleConnectRobot} disabled={!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording}> Connect to Robot </button>
-      <button onClick={handleDisconnectRobot} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording}> Disconnect (Graceful) </button>
-      <br />
-      <button onClick={sendGoHomeCommand} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{marginTop: '5px'}}> Send Robot to Home </button>
-      <button onClick={sendSafeCenterCommand} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{marginTop: '5px', marginLeft: '5px'}}> Send to Safe Center </button>
-      <p>{robotStatusMessage}</p>
-      <p>Last Command: <span style={{fontSize: '0.9em', color: '#aaa'}}>{lastCommandResponse}</span></p>
+            <div style={styles.coordInputContainer}>
+              <h3 style={{fontSize: '1.2em', color: '#ccc', marginBottom: '10px', textAlign: 'center'}}>Move to Specific Position:</h3>
+              <div style={styles.coordInputGroup}>
+                <label htmlFor="x-coord" style={styles.coordLabel}>X (mm):</label>
+                <input type="number" id="x-coord" value={xCoord} onChange={(e) => setXCoord(e.target.value)} placeholder="e.g., 100" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+              </div>
+              <div style={styles.coordInputGroup}>
+                <label htmlFor="y-coord" style={styles.coordLabel}>Y/Depth (mm):</label>
+                <input type="number" id="y-coord" value={yCoord} onChange={(e) => setYCoord(e.target.value)} placeholder="e.g., -150" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+              </div>
+              <div style={styles.coordInputGroup}>
+                <label htmlFor="z-coord" style={styles.coordLabel}>Z/Side (mm):</label>
+                <input type="number" id="z-coord" value={zCoord} onChange={(e) => setZCoord(e.target.value)} placeholder="e.g., 50" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+              </div>
+              <button onClick={handleSendCustomCoordinates} disabled={!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord} style={{...styles.button, marginTop: '10px', backgroundColor: '#17a2b8', ...((!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord) && styles.buttonDisabled)}}>
+                Send Custom Coordinates
+              </button>
+            </div>
+
+            <div style={styles.robotStatus}>
+                <p style={{margin: 0, color: isRobotConnected ? '#76ff03' : '#ffc107'}}>{robotStatusMessage}</p>
+            </div>
+            {lastCommandResponse && <p style={{fontSize: '0.9em', color: '#aaa', marginTop: '10px', textAlign: 'center'}}>Last Command: {lastCommandResponse}</p>}
+          </section>
+
+          {/* Column 2: Robotist Interaction */}
+          <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>Robotist Interaction</h2>
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: '15px' }}>
+              <button 
+                  onClick={handleMicButtonClick} 
+                  disabled={!isConnectedToBackend || isDrawingActive}
+                  style={{...styles.button, ...styles.micButton, ...( (!isConnectedToBackend || isDrawingActive) && styles.buttonDisabled) }}
+                  title={isRecording ? "Stop Recording" : "Start Voice Command"}
+              >
+                  {isRecording ? <StopIcon /> : <MicIcon />}
+              </button>
+              <p style={{ margin: '0 0 0 15px', flexGrow: 1, color: '#bbbbbb' }}>{interactionStatus}</p>
+            </div>
+
+            {rawTranscribedText && <p style={{fontSize: '0.9em', color: '#aaa', fontStyle: 'italic', marginBottom: '10px'}}>You said: "{rawTranscribedText}"</p>}
+            
+            <textarea 
+                value={editableCommandText}
+                onChange={(e) => setEditableCommandText(e.target.value)}
+                placeholder="Type command or edit transcribed text here..."
+                style={styles.textarea}
+                disabled={!isConnectedToBackend || isDrawingActive || isRecording}
+            />
+            <button 
+                onClick={handleSendEditableCommand} 
+                disabled={!editableCommandText.trim() || !isConnectedToBackend || isDrawingActive || isRecording}
+                style={{...styles.button, ...( (!editableCommandText.trim() || !isConnectedToBackend || isDrawingActive || isRecording) && styles.buttonDisabled) }}
+            >
+                Send Command to Robotist
+            </button>
+
+            {llmResponse && (
+              <div style={styles.llmResponseBox}>
+                <p style={{ margin: 0 }}><b>Robotist:</b> {llmResponse}</p>
+              </div>
+            )}
+          </section>
+          
+          {/* Column 3: Image Input */}
+          <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>Image Input</h2>
+            <div style={styles.imageUploadContainer}> 
+              <div style={styles.uploadBox}>
+                <h3>Upload via QR Code</h3>
+                <button onClick={requestQrCode} disabled={!isConnectedToBackend || isDrawingActive || isRecording} style={{...styles.button, ...((!isConnectedToBackend || isDrawingActive || isRecording) && styles.buttonDisabled)}}>
+                  Get QR Code
+                </button>
+                {qrUploadUrl && !qrCodeImage && <p style={{fontSize: '0.8em', wordBreak: 'break-all', color: '#aaa'}}><small>{qrUploadUrl}</small></p>}
+                {qrCodeImage && ( <div> <p style={{fontSize: '0.8em', color: '#aaa'}}><small>Scan to upload. URL: {qrUploadUrl}</small></p> <img src={qrCodeImage} alt="QR Code for Upload" style={styles.imagePreview} /> </div> )}
+              </div>
+              <div 
+                style={{...styles.uploadBox, ...(isDragging && styles.uploadBoxDragging), opacity: (isDrawingActive || isRecording) ? 0.6 : 1, pointerEvents: (isDrawingActive || isRecording) ? 'none' : 'auto' }}
+                onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop} 
+              >
+                <h3>Upload from Desktop</h3>
+                <input type="file" accept="image/*" onChange={handleFileSelect} ref={fileInputRef} style={{ display: 'none' }} disabled={isDrawingActive || isRecording} />
+                <button onClick={triggerFileInput} disabled={isDrawingActive || isRecording} style={{...styles.button, ...((isDrawingActive || isRecording) && styles.buttonDisabled)}}> Choose Image File </button>
+                <p style={{fontSize: '0.9em', marginTop: '10px', color: '#aaa'}}>Or drag & drop image here</p>
+                {imagePreviewUrl && selectedFile && ( <div style={{marginTop: '15px'}}> <p style={{color: '#bbb'}}>Preview:</p> <img src={imagePreviewUrl} alt="Selected preview" style={styles.imagePreview}/> <p style={{fontSize: '0.8em', color: '#aaa'}}>{selectedFile.name}</p> <button onClick={sendSelectedFileToBackend} disabled={!selectedFile || isDrawingActive || !isConnectedToBackend || isRecording} style={{...styles.button, marginTop: '10px', ...((!selectedFile || isDrawingActive || !isConnectedToBackend || isRecording) && styles.buttonDisabled)}} > Upload This Image </button> </div> )}
+              </div>
+            </div>
+            {lastUploadedImageInfo && <p style={{color: lastUploadedImageInfo.startsWith("Received:") ? "#76ff03" : (lastUploadedImageInfo.startsWith("Error") ? "#ff5252" : "#ffc107"), fontWeight: 'bold', textAlign: 'center', marginTop: '15px'}}>{lastUploadedImageInfo}</p>}
+            {uploadedFilePathFromBackend && ( <button onClick={handleProcessAndDrawUploadedImage} disabled={isDrawingActive || !isRobotConnected || !isConnectedToBackend || isRecording} style={{...styles.button, backgroundColor: '#28a745', display: 'block', margin: '20px auto', padding: '12px 25px', fontSize: '1.1em', ...((isDrawingActive || !isRobotConnected || !isConnectedToBackend || isRecording) && styles.buttonDisabled)}} > Process & Draw Uploaded Image </button> )}
+            
+            {isDrawingActive && activeDrawingId && (
+              <div style={{marginTop: '20px'}}>
+                <p style={{color: "#61dafb", fontWeight: "bold", textAlign: 'center'}}>{drawingProgressMessage}</p>
+                <div style={styles.progressBarContainer}>
+                  <div style={styles.progressBar}>{drawingProgressPercent.toFixed(0)}%</div>
+                </div>
+              </div>
+            )}
+            {!isDrawingActive && drawingProgressMessage && !lastUploadedImageInfo.startsWith("Received:") && <p style={{textAlign: 'center', marginTop: '15px', color: '#aaa'}}>{drawingProgressMessage}</p>}
+          </section>
+        </div>
+
+        {/* Drawing History Section */}
+        {drawingHistory.length > 0 && (
+            <section style={{...styles.section, ...styles.historySection, marginTop: '25px'}}>
+                <h2 style={styles.sectionTitle}>Drawing History (Last {drawingHistory.length})</h2>
+                <ul style={styles.historyList}>
+                    {drawingHistory.map(item => (
+                        <li 
+                            key={item.drawing_id} 
+                            style={{
+                                ...styles.historyItem, 
+                                ...(item.status === 'completed' ? styles.historyItemCompleted : {}),
+                                ...(item.status === 'interrupted' || item.status === 'interrupted_error' ? styles.historyItemInterrupted : {}),
+                                ...(item.status && item.status.startsWith('in_progress') ? styles.historyItemInProgress : {}),
+                            }}
+                        >
+                            <p style={{margin: '0 0 5px 0', fontWeight: 'bold', color: '#f0f0f0'}}>{item.original_filename}</p>
+                            <p style={styles.historyDetails}>Status: {item.status.replace(/_/g, ' ')}</p>
+                            {(item.status.includes('in_progress') || item.status.includes('interrupted')) && (
+                                <p style={styles.historyDetails}>Progress: {item.progress.toFixed(0)}%</p>
+                            )}
+                            <p style={styles.historyDetails}>Last Update: {new Date(item.last_updated).toLocaleString()}</p>
+                            <div style={styles.historyActions}>
+                                {(item.status.includes('interrupted') || item.status.includes('in_progress')) && item.status !== 'completed' && (
+                                    <button 
+                                        onClick={() => handleResumeDrawingFromHistory(item.drawing_id)}
+                                        style={{...styles.button, backgroundColor: '#ffc107', color: '#1e1e1e'}}
+                                        disabled={isDrawingActive || !isConnectedToBackend || !isRobotConnected}
+                                    >
+                                        Resume
+                                    </button>
+                                )}
+                                <button 
+                                    onClick={() => handleRestartDrawingFromHistory(item.drawing_id)}
+                                    style={{...styles.button, backgroundColor: '#17a2b8'}}
+                                    disabled={isDrawingActive || !isConnectedToBackend || !isRobotConnected}
+                                >
+                                    Restart
+                                </button>
+                            </div>
+                        </li>
+                    ))}
+                </ul>
+            </section>
+        )}
+
+      </div>
+
+      {/* Threshold Selection Modal */}
+      {showThresholdModal && (
+        <div style={styles.modalOverlay}>
+          <div style={styles.modalContent}>
+            <h3 style={styles.modalTitle}>Select Drawing Details</h3>
+            <div style={styles.modalColumns}>
+                <div style={{...styles.modalColumn, ...styles.modalRadioGroup}}>
+                    {THRESHOLD_OPTIONS.map(option => (
+                        <label 
+                            key={option.key} 
+                            htmlFor={option.key}
+                            style={{
+                                ...styles.modalRadioLabel,
+                                ...(selectedThresholdKey === option.key ? styles.modalRadioLabelSelected : {})
+                            }}
+                            onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = selectedThresholdKey === option.key ? '#0056b3' : '#444')}
+                            onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = selectedThresholdKey === option.key ? '#007bff' : 'transparent')}
+                        >
+                            <input 
+                                type="radio" 
+                                id={option.key} 
+                                name="thresholdOption" 
+                                value={option.key}
+                                checked={selectedThresholdKey === option.key}
+                                onChange={() => setSelectedThresholdKey(option.key)}
+                                style={{ marginRight: '10px', accentColor: '#61dafb' }}
+                            />
+                            {option.label} (T1: {option.t1}, T2: {option.t2})
+                        </label>
+                    ))}
+                </div>
+                <div style={{...styles.modalColumn, ...styles.modalPreviewArea}}>
+                    <h4>Preview:</h4>
+                    {isPreviewLoading && <p style={{color: '#aaa'}}>Loading preview...</p>}
+                    {!isPreviewLoading && thresholdPreviewImage && (
+                        <img src={thresholdPreviewImage} alt="Edge preview" style={styles.modalPreviewImage} />
+                    )}
+                    {!isPreviewLoading && !thresholdPreviewImage && (
+                        <div style={{...styles.modalPreviewImage, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#777'}}>
+                            <span>No preview available</span>
+                        </div>
+                    )}
+                </div>
+            </div>
+            <div style={styles.modalActions}>
+              <button 
+                onClick={() => setShowThresholdModal(false)} 
+                style={{...styles.button, backgroundColor: '#6c757d', marginRight: '10px'}}
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={confirmAndStartDrawingWithThresholds} 
+                style={{...styles.button, backgroundColor: '#28a745'}}
+                disabled={isPreviewLoading}
+              >
+                Start Drawing
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 export default App;
+
 
 --- END OF FILE: frontend/s2a-drawing-ui/src/App.tsx ---
 --- START OF FILE: frontend/s2a-drawing-ui/src/index.css ---
