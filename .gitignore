@@ -50,6 +50,7 @@ dmypy.json
 backend/qr_uploads/
 backend/models/
 backend/audio_tmp/
+backend/drawing_history.json
 
 # Log files
 *.log
@@ -71,6 +72,7 @@ frontend/s2a-drawing-ui/yarn-error.log*
 frontend/s2a-drawing-ui/pnpm-debug.log*
 frontend/s2a-drawing-ui/lerna-debug.log*
 frontend/s2a-drawing-ui/*.local
+
 
 # If you decide to use Tauri in the future for the frontend
 # frontend/s2a-drawing-ui/src-tauri/target/
