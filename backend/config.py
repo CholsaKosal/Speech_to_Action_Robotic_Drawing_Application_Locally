@@ -1,6 +1,6 @@
 # backend/config.py
 
-import os # Added for path joining
+import os 
 
 # --- Robot Connection Settings ---
 SIMULATION_HOST = '127.0.0.1'
@@ -8,8 +8,11 @@ SIMULATION_PORT = 55000
 REAL_ROBOT_HOST = '192.168.125.1' # Your actual robot IP
 REAL_ROBOT_PORT = 1025          # Your actual robot port
 
-# Set True to use real robot, False for simulation
-USE_REAL_ROBOT = False
+# The USE_REAL_ROBOT constant is now primarily a server-side default
+# if the client doesn't specify. The client's choice will take precedence.
+# It can also be used by other backend modules if they need a default
+# robot type assumption without client input.
+USE_REAL_ROBOT_DEFAULT = False # Default to simulation if not specified by client
 
 # --- QR Code Upload Settings ---
 QR_UPLOAD_FOLDER = 'qr_uploads' # Relative to the backend directory

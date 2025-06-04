@@ -43,8 +43,7 @@ interface DrawingHistoryItem {
     status: string; // e.g., "completed", "interrupted", "in_progress", "aborted_manual_override"
     progress: number; // Percentage
     last_updated: string; // ISO date string
-    // The backend might send more, but these are key for UI
-    robot_commands_tuples?: any[]; // For potential client-side restart logic if needed, or just for info
+    robot_commands_tuples?: any[]; 
     current_command_index?: number;
     total_commands?: number;
 }
@@ -55,6 +54,8 @@ function App() {
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [robotStatusMessage, setRobotStatusMessage] = useState('Robot: Not connected');
   const [lastCommandResponse, setLastCommandResponse] = useState('');
+
+  const [useRealRobot, setUseRealRobot] = useState(false); // New state for robot type selection
 
   const [qrCodeImage, setQrCodeImage] = useState<string | null>(null);
   const [qrUploadUrl, setQrUploadUrl] = useState<string>('');
@@ -67,8 +68,8 @@ function App() {
   const [lastUploadedImageInfo, setLastUploadedImageInfo] = useState<string>('');
   const [uploadedFilePathFromBackend, setUploadedFilePathFromBackend] = useState<string | null>(null);
 
-  const [isDrawingActive, setIsDrawingActive] = useState(false); // Tracks if _execute_drawing_commands is running
-  const [activeDrawingId, setActiveDrawingId] = useState<string | null>(null); // Tracks the ID of the drawing being executed
+  const [isDrawingActive, setIsDrawingActive] = useState(false); 
+  const [activeDrawingId, setActiveDrawingId] = useState<string | null>(null); 
   const [drawingProgressMessage, setDrawingProgressMessage] = useState('');
   const [drawingProgressPercent, setDrawingProgressPercent] = useState(0);
   
@@ -91,12 +92,12 @@ function App() {
   const [thresholdPreviewImage, setThresholdPreviewImage] = useState<string | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
 
-  const clearActiveDrawingState = useCallback(() => { // useCallback to ensure stable reference if needed
+  const clearActiveDrawingState = useCallback(() => { 
     setIsDrawingActive(false);
     setActiveDrawingId(null);
     setDrawingProgressMessage('Idle');
     setDrawingProgressPercent(0);
-  }, []); // Dependencies for useCallback, empty if no external state is used inside that changes
+  }, []); 
 
   useEffect(() => {
     socket = io(PYTHON_BACKEND_URL, { transports: ['websocket'] });
@@ -112,7 +113,6 @@ function App() {
       setIsConnectedToBackend(false);
       setIsRobotConnected(false);
       setRobotStatusMessage('Robot: Disconnected (backend offline)');
-      // Do not clear drawing active flags on simple disconnect, backend might still be processing or resumable
       setInteractionStatus('Backend offline. Please refresh or check server.');
       setShowThresholdModal(false); 
     });
@@ -167,16 +167,14 @@ function App() {
         setDrawingProgressPercent(data.progress);
       }
 
-      // --- MODIFIED LOGIC HERE ---
       if (data.active) {
-        setIsDrawingActive(true); // Set drawing as active
+        setIsDrawingActive(true); 
         if (data.drawing_id) {
-          setActiveDrawingId(data.drawing_id); // Track the active drawing ID
+          setActiveDrawingId(data.drawing_id); 
         }
-      } else { // data.active is false
-        clearActiveDrawingState(); // Always clear active state if backend says drawing is not active
+      } else { 
+        clearActiveDrawingState(); 
       }
-      // --- END MODIFIED LOGIC ---
     });
 
     socket.on('drawing_history_updated', (history: DrawingHistoryItem[]) => {
@@ -241,7 +239,7 @@ function App() {
         }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clearActiveDrawingState]); // Added clearActiveDrawingState to dependency array of main useEffect
+  }, [clearActiveDrawingState]); 
 
   const requestThresholdPreview = useCallback((key: string) => {
     const selectedOpt = THRESHOLD_OPTIONS.find(opt => opt.key === key);
@@ -264,7 +262,12 @@ function App() {
   }, [selectedThresholdKey, showThresholdModal, uploadedFilePathFromBackend, requestThresholdPreview]); 
 
 
-  const handleConnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_connect_request', {}); }
+  const handleConnectRobot = () => { 
+    if (!isDrawingActive && socket) {
+      // Send the useRealRobot state to the backend
+      socket.emit('robot_connect_request', { use_real_robot: useRealRobot }); 
+    }
+  }
   const handleDisconnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_disconnect_request', {}); }
   const sendGoHomeCommand = () => { 
     if (!isDrawingActive && socket) {
@@ -495,16 +498,16 @@ function App() {
   };
 
   const styles: { [key: string]: React.CSSProperties } = {
-    appContainer: { maxWidth: '1400px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif', color: '#e0e0e0', backgroundColor: '#1e1e1e' }, // Wider for history
+    appContainer: { maxWidth: '1400px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif', color: '#e0e0e0', backgroundColor: '#1e1e1e' }, 
     header: { textAlign: 'center' as const, marginBottom: '30px', borderBottom: '1px solid #444', paddingBottom: '20px' },
     mainTitle: { fontSize: '2.5em', color: '#61dafb', margin: '0 0 10px 0' },
     statusText: { fontSize: '0.9em', color: isConnectedToBackend ? '#76ff03' : '#ff5252' },
-    mainLayoutContainer: { display: 'flex', flexDirection: 'column', gap: '25px' }, // Main sections stack vertically
+    mainLayoutContainer: { display: 'flex', flexDirection: 'column', gap: '25px' }, 
     topRowGrid: { display: 'grid', gridTemplateColumns: '1fr 2fr 1.5fr', gap: '25px', alignItems: 'start', marginBottom: '25px' }, 
     section: { backgroundColor: '#2a2a2a', padding: '20px', borderRadius: '8px', boxShadow: '0 4px 8px rgba(0,0,0,0.2)', display: 'flex', flexDirection: 'column', minHeight: '300px' }, 
     sectionTitle: { fontSize: '1.5em', color: '#61dafb', borderBottom: '1px solid #444', paddingBottom: '10px', marginBottom: '15px' },
     button: { backgroundColor: '#007bff', color: 'white', border: 'none', padding: '10px 15px', borderRadius: '5px', cursor: 'pointer', fontSize: '1em', margin: '5px', transition: 'background-color 0.2s ease' },
-    buttonDisabled: { backgroundColor: '#555', cursor: 'not-allowed', opacity: 0.6 }, // Added opacity for better visual cue
+    buttonDisabled: { backgroundColor: '#555', cursor: 'not-allowed', opacity: 0.6 }, 
     micButton: { backgroundColor: isRecording ? '#dc3545' : '#007bff', width: '60px', height: '60px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' },
     textarea: { width: 'calc(100% - 22px)', padding: '10px', marginBottom: '10px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff', minHeight: '60px' },
     imageUploadContainer: { display: 'flex', flexDirection: 'column', gap: '20px'}, 
@@ -519,18 +522,20 @@ function App() {
     coordInputGroup: { display: 'flex', alignItems: 'center', gap: '10px' },
     coordLabel: { minWidth: '70px', textAlign: 'right' as const, color: '#bbb' },
     coordInput: { flexGrow: 1, padding: '8px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff' },
+    checkboxContainer: { display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '10px 0', color: '#ccc' }, // Style for checkbox
+    checkboxInput: { marginRight: '8px', accentColor: '#61dafb' }, // Style for checkbox input
     modalOverlay: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 },
-    modalContent: { backgroundColor: '#2a2a2a', padding: '30px', borderRadius: '8px', boxShadow: '0 5px 15px rgba(0,0,0,0.3)', width: 'auto', minWidth: '750px', maxWidth: '900px', color: '#e0e0e0' }, // Increased width
+    modalContent: { backgroundColor: '#2a2a2a', padding: '30px', borderRadius: '8px', boxShadow: '0 5px 15px rgba(0,0,0,0.3)', width: 'auto', minWidth: '750px', maxWidth: '900px', color: '#e0e0e0' },
     modalTitle: { fontSize: '1.8em', color: '#61dafb', marginBottom: '20px', textAlign: 'center' as const },
     modalColumns: { display: 'flex', gap: '20px' },
     modalColumn: { flex: 1 },
-    modalRadioGroup: { maxHeight: '550px', overflowY: 'auto', paddingRight: '10px' }, // Increased height
+    modalRadioGroup: { maxHeight: '550px', overflowY: 'auto', paddingRight: '10px' }, 
     modalRadioLabel: { display: 'block', marginBottom: '8px', cursor: 'pointer', padding: '8px', borderRadius: '4px', transition: 'background-color 0.2s' },
     modalRadioLabelSelected: { backgroundColor: '#007bff', color: 'white' },
     modalPreviewArea: { textAlign: 'center' as const, borderLeft: '1px solid #444', paddingLeft: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
-    modalPreviewImage: { maxWidth: '350px', maxHeight: '350px', border: '1px solid #555', borderRadius: '4px', backgroundColor: '#1e1e1e', minHeight: '250px' }, // Increased preview image size
+    modalPreviewImage: { maxWidth: '350px', maxHeight: '350px', border: '1px solid #555', borderRadius: '4px', backgroundColor: '#1e1e1e', minHeight: '250px' }, 
     modalActions: { marginTop: '25px', textAlign: 'right' as const },
-    historySection: { /* Uses styles.section */ },
+    historySection: { },
     historyList: { listStyle: 'none', padding: 0, maxHeight: '400px', overflowY: 'auto'},
     historyItem: { backgroundColor: '#333', padding: '15px', borderRadius: '6px', marginBottom: '10px', borderLeft: '5px solid #007bff' },
     historyItemCompleted: { borderLeftColor: '#28a745' },
@@ -552,6 +557,19 @@ function App() {
           {/* Column 1: Robot Control */}
           <section style={styles.section}>
             <h2 style={styles.sectionTitle}>Robot Control</h2>
+            <div style={styles.checkboxContainer}> {/* Checkbox for robot type */}
+              <input 
+                type="checkbox" 
+                id="robotType" 
+                checked={useRealRobot} 
+                onChange={(e) => setUseRealRobot(e.target.checked)}
+                disabled={isRobotConnected || isDrawingActive || isRecording}
+                style={styles.checkboxInput}
+              />
+              <label htmlFor="robotType" style={{cursor: (isRobotConnected || isDrawingActive || isRecording) ? 'not-allowed' : 'pointer'}}>
+                Connect to Real Robot (Unchecked = Simulation)
+              </label>
+            </div>
             <div style={{textAlign: 'center'}}>
               <button onClick={handleConnectRobot} disabled={!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, ...((!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Connect to Robot </button>
               <button onClick={handleDisconnectRobot} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, backgroundColor: '#ffc107', color: '#1e1e1e', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Disconnect Robot</button>
