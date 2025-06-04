@@ -1,5 +1,7 @@
 # backend/config.py
 
+import os # Added for path joining
+
 # --- Robot Connection Settings ---
 SIMULATION_HOST = '127.0.0.1'
 SIMULATION_PORT = 55000
@@ -40,17 +42,20 @@ MIN_CONTOUR_LENGTH_PX = 50 # Minimum contour length in pixels to consider from i
 DEFAULT_CANNY_THRESHOLD1 = 50
 DEFAULT_CANNY_THRESHOLD2 = 150
 
-# --- Signature Points ---
-# Import from the separate signature_data.py file
-try:
-    from .signature_data import SIGNATURE_POINTS_RAW
-    # If you used SIGNATURE_STROKES_RAW, import that instead:
-    # from .signature_data import SIGNATURE_STROKES_RAW
-except ImportError:
-    # Fallback or error handling if the file/variable isn't found
-    SIGNATURE_POINTS_RAW = () # Default to empty tuple if import fails
-    # SIGNATURE_STROKES_RAW = [] 
-    print("WARNING: Could not import signature data. Signature will be empty.")
+# --- Signature Settings ---
+# Path to the signature image, relative to the backend directory
+ASSETS_FOLDER_NAME = 'assets'
+SIGNATURE_IMAGE_FILENAME = "signature.jpg" # Ensure this file is in backend/assets/
+
+# Canny thresholds for processing the signature image.
+# These can be tuned for optimal results with your specific signature.jpg
+SIGNATURE_CANNY_THRESHOLD1 = 50
+SIGNATURE_CANNY_THRESHOLD2 = 150
+# You might want to make these thresholds different from the default image processing
+# if your signature image requires different settings for optimal edge detection.
+# For example, if the signature is very clean, lower thresholds might be better.
+# SIGNATURE_CANNY_THRESHOLD1 = 30
+# SIGNATURE_CANNY_THRESHOLD2 = 100
 
 
 # --- Temporary Audio File Settings ---
@@ -58,7 +63,8 @@ AUDIO_TEMP_FOLDER = 'audio_tmp' # Relative to the backend directory
 
 # --- LLM Settings ---
 # IMPORTANT: Replace with the actual filename of your downloaded GGUF model
-LLM_MODEL_FILENAME = "deepseek-llm-7b-chat.Q4_K_M.gguf"
+# LLM_MODEL_FILENAME = "deepseek-llm-7b-chat.Q4_K_M.gguf"
+LLM_MODEL_FILENAME = ""
 LLM_MAX_TOKENS = 512 # Max tokens for LLM response
 LLM_TEMPERATURE = 0.3 # Temperature for LLM response
 LLM_N_CTX = 2048 # Context window size for the LLM
