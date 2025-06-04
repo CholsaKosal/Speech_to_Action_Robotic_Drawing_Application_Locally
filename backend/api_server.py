@@ -2,7 +2,7 @@
 from flask import Flask, request, render_template_string, jsonify, send_file
 from flask_socketio import SocketIO, emit
 from robot_interface import RobotInterface
-import config 
+import config # Now imports SIGNATURE_POINTS_RAW from config
 from image_processing_engine import process_image_to_robot_commands_pipeline, get_canny_edges_array 
 from voice_assistant import transcribe_audio, load_whisper_model, load_llm_model, process_command_with_llm_stream 
 
@@ -112,11 +112,11 @@ def load_drawing_history():
                 else:
                     logging.warning(f"Invalid data format in {DRAWING_HISTORY_FILE}. Initializing empty history.")
                     drawing_history = []
-                    if os.path.exists(DRAWING_HISTORY_FILE): os.remove(DRAWING_HISTORY_FILE) # remove corrupted file
+                    if os.path.exists(DRAWING_HISTORY_FILE): os.remove(DRAWING_HISTORY_FILE) 
         except (IOError, json.JSONDecodeError) as e:
             logging.error(f"Error loading drawing history: {e}. Initializing empty history.")
             drawing_history = []
-            if os.path.exists(DRAWING_HISTORY_FILE): os.remove(DRAWING_HISTORY_FILE) # remove corrupted file
+            if os.path.exists(DRAWING_HISTORY_FILE): os.remove(DRAWING_HISTORY_FILE) 
     else:
         logging.info("No previous drawing history file found. Initializing empty history.")
         drawing_history = []
@@ -131,8 +131,8 @@ def clear_drawing_history_file(save=True):
             logging.error(f"Error deleting drawing history file: {e}")
     if save: 
         global drawing_history
-        drawing_history = [] # Clear the in-memory history too
-        save_drawing_history() # This will save an empty list
+        drawing_history = [] 
+        save_drawing_history() 
 
 def add_or_update_drawing_in_history(drawing_data):
     global drawing_history, active_drawing_session_id
@@ -170,6 +170,38 @@ def update_drawing_status_in_history(drawing_id, status, current_command_index=N
         logging.info(f"Updated status of drawing '{drawing_id}' to '{status}'.")
         return True
     return False
+
+def create_signature_commands():
+    """
+    Generates robot commands for drawing the signature defined in config.SIGNATURE_POINTS_RAW.
+    Returns a list of (X_py, Z_depth_py, Y_py) tuples.
+    """
+    signature_cmds = []
+    if not config.SIGNATURE_POINTS_RAW:
+        return signature_cmds
+
+    # Assuming SIGNATURE_POINTS_RAW is a flat list of (X_robot, Z_robot_side) tuples
+    # representing a single continuous stroke after initial pen down.
+    # Or, if it's structured as multiple strokes, this logic would need adjustment.
+
+    # For the first point: move pen up to it, then pen down
+    first_point_x, first_point_y_side = config.SIGNATURE_POINTS_RAW[0]
+    signature_cmds.append((first_point_x, config.PEN_UP_Z_PY, first_point_y_side))
+    signature_cmds.append((first_point_x, config.PEN_DOWN_Z_PY, first_point_y_side))
+
+    # For subsequent points, keep pen down
+    for i in range(1, len(config.SIGNATURE_POINTS_RAW)):
+        point_x, point_y_side = config.SIGNATURE_POINTS_RAW[i]
+        signature_cmds.append((point_x, config.PEN_DOWN_Z_PY, point_y_side))
+    
+    # After the last point, lift the pen
+    if config.SIGNATURE_POINTS_RAW:
+        last_point_x, last_point_y_side = config.SIGNATURE_POINTS_RAW[-1]
+        signature_cmds.append((last_point_x, config.PEN_UP_Z_PY, last_point_y_side))
+        
+    logging.info(f"Generated {len(signature_cmds)} commands for signature.")
+    return signature_cmds
+
 
 load_drawing_history()
 
@@ -243,7 +275,6 @@ def handle_connect():
         else:
             emit('drawing_status_update', {'active': False, 'message': 'Idle', 'resumable': False})
 
-# ... (disconnect, robot_connect_request, robot_disconnect_request are fine) ...
 @socketio.on('disconnect')
 def handle_disconnect(): logging.info(f"Client disconnected: {request.sid}")
 @socketio.on('robot_connect_request')
@@ -264,7 +295,6 @@ def check_and_abort_active_drawing(command_description="Manual command"):
     if active_drawing_session_id:
         logging.warning(f"{command_description} received, aborting active drawing '{active_drawing_session_id}'.")
         update_drawing_status_in_history(active_drawing_session_id, "aborted_manual_override")
-        # active_drawing_session_id is cleared by update_drawing_status_in_history
         is_drawing_active_flag = False
         emit('drawing_status_update', {'active': False, 'message': f"Drawing aborted due to {command_description}.", 'resumable': False, 'drawing_id': active_drawing_session_id}) 
         emit('drawing_history_updated', get_ui_history_summary(drawing_history)) 
@@ -283,7 +313,6 @@ def handle_send_robot_command(json_data, triggered_by_llm=False):
             return False, "Drawing is active."
     elif not triggered_by_llm : 
         check_and_abort_active_drawing(f"Manual command '{json_data.get('type', 'N/A')}'")
-    # ... (rest of the function)
     command_type = json_data.get('type', 'raw')
     command_str = json_data.get('command_str') 
     if not robot.is_connected and command_type not in ['go_home']: 
@@ -312,29 +341,26 @@ def handle_send_robot_command(json_data, triggered_by_llm=False):
 @socketio.on('direct_image_upload')
 def handle_direct_image_upload(data):
     global active_drawing_session_id
-    # ... (rest of the function, but ensure active_drawing_session_id is handled)
-    check_and_abort_active_drawing("New direct image upload") # This will also emit history update
+    check_and_abort_active_drawing("New direct image upload") 
     original_filename = data.get('filename')
     base64_data = data.get('fileData')
-    if not original_filename or not base64_data: # ... (error handling)
+    if not original_filename or not base64_data: 
         emit('direct_image_upload_response', {'success': False, 'message': 'Missing filename or file data.'})
         return
     try:
         image_data = base64.b64decode(base64_data)
         _, f_ext = os.path.splitext(original_filename)
-        if f_ext.lower() not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']: # ... (error handling)
+        if f_ext.lower() not in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']: 
             emit('direct_image_upload_response', {'success': False, 'message': f"Invalid file type: {f_ext}", 'original_filename': original_filename})
             return
         filename_on_server = str(uuid.uuid4()) + f_ext
         filepath_on_server = os.path.join(app.config['UPLOAD_FOLDER'], filename_on_server)
         with open(filepath_on_server, 'wb') as f: f.write(image_data)
         emit('direct_image_upload_response', { 'success': True, 'message': f"Image '{original_filename}' uploaded.", 'original_filename': original_filename, 'filepath_on_server': filepath_on_server })
-        # No need to emit history here if check_and_abort did it, or if it's handled by new drawing process
-    except Exception as e: # ... (error handling)
+    except Exception as e: 
         logging.error(f"Error in direct_image_upload: {e}", exc_info=True)
         emit('direct_image_upload_response', {'success': False, 'message': f"Server error: {e}", 'original_filename': original_filename})
 
-# ... (handle_audio_chunk remains the same)
 @socketio.on('audio_chunk') 
 def handle_audio_chunk(data):
     logging.info(f"--- API: Event 'audio_chunk' RECEIVED with data keys: {list(data.keys())} ---")
@@ -358,13 +384,12 @@ def handle_audio_chunk(data):
     except Exception as e: logging.error(f"API Error: Error processing audio chunk: {e}", exc_info=True); emit('transcription_result', {'error': f'Server error processing audio.'})
 
 
-# ... (handle_submit_text_to_llm needs to call check_and_abort_active_drawing if LLM action is an override)
 @socketio.on('submit_text_to_llm')
 def handle_submit_text_to_llm(data):
-    global is_drawing_active_flag, active_drawing_session_id # Ensure these are accessible
+    global is_drawing_active_flag, active_drawing_session_id 
     logging.info(f"--- API: Event 'submit_text_to_llm' RECEIVED with data: {data} ---") 
     text_command = data.get('text_command')
-    if not text_command: # ... (error handling)
+    if not text_command: 
         logging.error("API: No text_command in 'submit_text_to_llm' event.")
         emit('llm_response_chunk', {'error': 'No text command received by server.', 'done': True})
         return
@@ -379,10 +404,9 @@ def handle_submit_text_to_llm(data):
                 break 
         if parsed_action_command_from_llm:
             action_type = parsed_action_command_from_llm.get("type")
-            if action_type in ["move", "move_to_coords"]: # Add other LLM actions that should override
+            if action_type in ["move", "move_to_coords"]: 
                  if check_and_abort_active_drawing(f"LLM command '{action_type}'"):
                     logging.info(f"LLM command '{action_type}' aborted a previous drawing.")
-            # ... (rest of LLM action handling)
             parameters = parsed_action_command_from_llm.get("parameters", {})
             if action_type == "move":
                 target = parameters.get("target")
@@ -392,7 +416,7 @@ def handle_submit_text_to_llm(data):
                 x,y,z = parameters.get("x"), parameters.get("y"), parameters.get("z")
                 if x is not None and y is not None and z is not None:
                     handle_send_robot_command({'type': 'raw', 'command_str': robot._format_command(x, y, z)}, triggered_by_llm=True)
-    except Exception as e: # ... (error handling)
+    except Exception as e: 
         logging.error(f"API Error in handle_submit_text_to_llm: {e}", exc_info=True)
         emit('llm_response_chunk', {'error': f'Server error: {e}', 'done': True})
 
@@ -438,9 +462,24 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
     active_drawing_session_id = drawing_session_id_to_execute 
     
     original_filename = session_data['original_filename']
-    commands = session_data['robot_commands_tuples']
+    # Important: Make a copy of the commands list if it might be modified (e.g. by appending signature)
+    # For now, assuming robot_commands_tuples in history is the complete list for that specific drawing instance.
+    commands_to_execute = list(session_data['robot_commands_tuples']) # Use a copy
+
+    # Check if signature needs to be appended (only for new or restarted image drawings, not for signature-only drawings)
+    # This logic might need refinement based on how you differentiate a "signature-only" drawing if that's a feature.
+    # For now, assume signature is appended to image drawings.
+    if session_data.get('is_image_drawing', True): # Add a flag to session_data if needed
+        signature_robot_commands = create_signature_commands()
+        if signature_robot_commands:
+            logging.info(f"Appending {len(signature_robot_commands)} signature commands to drawing '{original_filename}'.")
+            commands_to_execute.extend(signature_robot_commands)
+            # Update total_commands in the session_data if signature is added
+            session_data['total_commands'] = len(commands_to_execute) 
+            # No need to save history here, it will be saved before the first command of the main drawing
+
     start_index = session_data['current_command_index']
-    total_commands = session_data['total_commands']
+    total_commands = session_data['total_commands'] # Use the potentially updated total_commands
     
     logging.info(f"Executing/Resuming drawing '{original_filename}' (ID: {active_drawing_session_id}) from command {start_index + 1}/{total_commands}")
     update_drawing_status_in_history(active_drawing_session_id, "in_progress" if start_index == 0 else "in_progress_resumed", start_index)
@@ -471,10 +510,9 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
 
         for i in range(start_index, total_commands):
             session_data['current_command_index'] = i 
-            # Status remains 'in_progress' or 'in_progress_resumed'
-            add_or_update_drawing_in_history(session_data.copy()) # Persist progress
+            add_or_update_drawing_in_history(session_data.copy()) 
             
-            x_py, z_py, y_py = commands[i] 
+            x_py, z_py, y_py = commands_to_execute[i] 
             formatted_cmd_str = robot._format_command(x_py, z_py, y_py) 
             progress_message = f"Drawing '{original_filename}': Cmd {i+1}/{total_commands}"
             emit('drawing_status_update', {'active': True, 'message': progress_message, 'progress': ((i+1)/total_commands) * 100, 'resumable': True, 'drawing_id': active_drawing_session_id, 'original_filename': original_filename})
@@ -498,7 +536,7 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
     except Exception as e:
         logging.error(f"Error during drawing execution for '{original_filename}': {e}", exc_info=True)
         is_drawing_active_flag = False; active_drawing_session_id = None
-        current_idx = session_data.get('current_command_index', start_index) # Use last known good index
+        current_idx = session_data.get('current_command_index', start_index) 
         update_drawing_status_in_history(drawing_session_id_to_execute, "interrupted_error", current_idx)
         emit('command_response', {'success': False, 'message': f"Error during drawing: {e}"})
         emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' failed with server error. Ready to resume.", 'resumable': True, 'drawing_id': drawing_session_id_to_execute, 'original_filename': original_filename, 'progress': (current_idx / total_commands) * 100 if total_commands > 0 else 0})
@@ -517,7 +555,7 @@ def handle_process_image_for_drawing(data):
         emit('command_response', {'success': False, 'message': "Another drawing is already in progress or active."})
         return
 
-    if active_drawing_session_id: # If there was a previously active (e.g. interrupted) session
+    if active_drawing_session_id: 
         update_drawing_status_in_history(active_drawing_session_id, "aborted_new_drawing")
     active_drawing_session_id = None 
 
@@ -537,24 +575,27 @@ def handle_process_image_for_drawing(data):
             emit('drawing_status_update', {'active': False, 'message': f"Failed to process '{original_filename}'.", 'resumable': False})
             return
         
-        num_cmds = len(robot_commands_tuples)
+        # Signature commands are now added in _execute_drawing_commands
+        # num_cmds = len(robot_commands_tuples) # This will be updated if signature is added
+
         drawing_id = f"draw_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         
         new_drawing_data = {
             'drawing_id': drawing_id,
             'filepath_on_server': filepath_on_server,
             'original_filename': original_filename,
-            'robot_commands_tuples': robot_commands_tuples,
+            'robot_commands_tuples': robot_commands_tuples, # Image commands only at this stage
             'current_command_index': 0,
-            'total_commands': num_cmds,
+            'total_commands': len(robot_commands_tuples), # Initial total before signature
             'canny_t1': canny_t1,
             'canny_t2': canny_t2,
-            'status': 'pending_execution', # Initial status before _execute_drawing_commands
-            'timestamp': datetime.now().isoformat()
+            'status': 'pending_execution', 
+            'timestamp': datetime.now().isoformat(),
+            'is_image_drawing': True # Flag to indicate this includes an image
         }
         add_or_update_drawing_in_history(new_drawing_data) 
         
-        emit('drawing_status_update', {'active': True, 'message': f"Generated {num_cmds} commands. Preparing to draw '{original_filename}'.", 'resumable': True, 'drawing_id': drawing_id, 'original_filename': original_filename, 'progress': 0})
+        emit('drawing_status_update', {'active': True, 'message': f"Generated {len(robot_commands_tuples)} image commands. Preparing to draw '{original_filename}'.", 'resumable': True, 'drawing_id': drawing_id, 'original_filename': original_filename, 'progress': 0})
         emit('drawing_history_updated', get_ui_history_summary(drawing_history))
         
         _execute_drawing_commands(drawing_id) 
@@ -586,7 +627,6 @@ def handle_resume_drawing_request(data):
             return
         
         logging.info(f"Attempting to resume drawing of '{session_to_resume['original_filename']}' from command {session_to_resume['current_command_index'] + 1}")
-        # Status will be updated by _execute_drawing_commands
         emit('drawing_status_update', {
             'active': True, 
             'message': f"Resuming drawing of '{session_to_resume['original_filename']}'...",
@@ -595,7 +635,6 @@ def handle_resume_drawing_request(data):
             'original_filename': session_to_resume['original_filename'],
             'progress': (session_to_resume['current_command_index'] / session_to_resume['total_commands']) * 100 if session_to_resume['total_commands'] > 0 else 0
         })
-        # No need to emit history here, _execute_drawing_commands will handle it via add_or_update
         _execute_drawing_commands(drawing_id_to_resume) 
     else:
         logging.warning(f"Resume requested for drawing_id {drawing_id_to_resume}, but no such drawing state found in history.")
@@ -616,7 +655,7 @@ def handle_restart_drawing_request(data):
     if session_to_restart:
         logging.info(f"Restarting drawing of '{session_to_restart['original_filename']}' from the beginning.")
         session_to_restart['current_command_index'] = 0
-        session_to_restart['status'] = 'pending_restart' # Mark for restart
+        session_to_restart['status'] = 'pending_restart' 
         add_or_update_drawing_in_history(session_to_restart.copy()) 
 
         emit('drawing_status_update', {

@@ -37,9 +37,21 @@ PEN_DOWN_Z_PY = -7.0 # Pen down position (e.g., -7mm from WorkSpaceCenter1's XY 
 
 MIN_CONTOUR_LENGTH_PX = 50 # Minimum contour length in pixels to consider from image processing
 
-# Default Canny edge detection thresholds
 DEFAULT_CANNY_THRESHOLD1 = 50
 DEFAULT_CANNY_THRESHOLD2 = 150
+
+# --- Signature Points ---
+# Import from the separate signature_data.py file
+try:
+    from .signature_data import SIGNATURE_POINTS_RAW
+    # If you used SIGNATURE_STROKES_RAW, import that instead:
+    # from .signature_data import SIGNATURE_STROKES_RAW
+except ImportError:
+    # Fallback or error handling if the file/variable isn't found
+    SIGNATURE_POINTS_RAW = () # Default to empty tuple if import fails
+    # SIGNATURE_STROKES_RAW = [] 
+    print("WARNING: Could not import signature data. Signature will be empty.")
+
 
 # --- Temporary Audio File Settings ---
 AUDIO_TEMP_FOLDER = 'audio_tmp' # Relative to the backend directory
