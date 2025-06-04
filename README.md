@@ -1,7 +1,4 @@
-(This project will change into webapp due to computational resource constrain)
-
-
-# Speech to Action Robotic Drawing Application
+# Speech to Action Robotic Drawing Application (Locally)
 
 ## Introduction to the project
 
