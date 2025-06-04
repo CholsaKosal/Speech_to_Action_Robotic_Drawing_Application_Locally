@@ -37,9 +37,16 @@ const THRESHOLD_OPTIONS: ThresholdOption[] = Array.from({ length: 10 }, (_, i) =
   t2: (i + 1) * 20 + 40, 
 }));
 
-interface ResumableDrawingInfo {
+interface DrawingHistoryItem {
+    drawing_id: string;
     original_filename: string;
-    progress: number;
+    status: string; // e.g., "completed", "interrupted", "in_progress", "aborted_manual_override"
+    progress: number; // Percentage
+    last_updated: string; // ISO date string
+    // The backend might send more, but these are key for UI
+    robot_commands_tuples?: any[]; // For potential client-side restart logic if needed, or just for info
+    current_command_index?: number;
+    total_commands?: number;
 }
 
 
@@ -60,10 +67,12 @@ function App() {
   const [lastUploadedImageInfo, setLastUploadedImageInfo] = useState<string>('');
   const [uploadedFilePathFromBackend, setUploadedFilePathFromBackend] = useState<string | null>(null);
 
-  const [isDrawingActive, setIsDrawingActive] = useState(false);
+  const [isDrawingActive, setIsDrawingActive] = useState(false); // Tracks if _execute_drawing_commands is running
+  const [activeDrawingId, setActiveDrawingId] = useState<string | null>(null); // Tracks the ID of the drawing being executed
   const [drawingProgressMessage, setDrawingProgressMessage] = useState('');
   const [drawingProgressPercent, setDrawingProgressPercent] = useState(0);
-  const [resumableDrawingInfo, setResumableDrawingInfo] = useState<ResumableDrawingInfo | null>(null);
+  
+  const [drawingHistory, setDrawingHistory] = useState<DrawingHistoryItem[]>([]);
 
 
   const [isRecording, setIsRecording] = useState(false);
@@ -82,8 +91,11 @@ function App() {
   const [thresholdPreviewImage, setThresholdPreviewImage] = useState<string | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
 
-  const clearResumableState = () => {
-    setResumableDrawingInfo(null);
+  const clearActiveDrawingState = () => {
+    setIsDrawingActive(false);
+    setActiveDrawingId(null);
+    setDrawingProgressMessage('Idle');
+    setDrawingProgressPercent(0);
   };
 
   useEffect(() => {
@@ -93,7 +105,6 @@ function App() {
       console.log('Frontend: Connected to Python backend via Socket.IO!');
       setIsConnectedToBackend(true);
       setInteractionStatus('Tap mic or type command.');
-      // Backend will send resumable state if any on connect
     });
 
     socket.on('disconnect', () => {
@@ -101,13 +112,9 @@ function App() {
       setIsConnectedToBackend(false);
       setIsRobotConnected(false);
       setRobotStatusMessage('Robot: Disconnected (backend offline)');
-      setIsDrawingActive(false); 
-      setDrawingProgressMessage('');
-      setDrawingProgressPercent(0);
-      setIsRecording(false); 
+      // Do not clear drawing active flags on simple disconnect, backend might still be processing or resumable
       setInteractionStatus('Backend offline. Please refresh or check server.');
       setShowThresholdModal(false); 
-      // Do not clear resumableDrawingInfo here, allow to persist across disconnects if backend remembers
     });
 
     socket.on('robot_connection_status', (data: { success: boolean, message: string }) => {
@@ -129,7 +136,6 @@ function App() {
         setSelectedFile(null); setImagePreviewUrl(null);
       }
       setLastUploadedImageInfo(''); setUploadedFilePathFromBackend(null);
-      clearResumableState(); // New QR request clears resumable state
     });
 
     const handleImageUploadSuccess = (data: { success: boolean, message: string, original_filename?: string, filepath_on_server?: string}) => {
@@ -138,7 +144,6 @@ function App() {
         setUploadedFilePathFromBackend(data.filepath_on_server);
         setQrCodeImage(null); setQrUploadUrl('');
         setSelectedFile(null); setImagePreviewUrl(null); 
-        clearResumableState(); // New image upload clears resumable state
       } else {
         setLastUploadedImageInfo(`Upload Info: ${data.message}`);
         setUploadedFilePathFromBackend(null);
@@ -148,22 +153,36 @@ function App() {
     socket.on('qr_image_received', handleImageUploadSuccess);
     socket.on('direct_image_upload_response', handleImageUploadSuccess); 
 
-    socket.on('drawing_status_update', (data: { active: boolean, message: string, progress?: number, resumable?: boolean, original_filename?: string }) => {
-      setIsDrawingActive(data.active);
+    socket.on('drawing_status_update', (data: { 
+        active: boolean, 
+        message: string, 
+        progress?: number, 
+        resumable?: boolean, // This indicates if the specific drawing ID is resumable
+        drawing_id?: string,
+        original_filename?: string 
+      }) => {
+      
       setDrawingProgressMessage(data.message);
       if (data.progress !== undefined) {
         setDrawingProgressPercent(data.progress);
       }
-      if (!data.active) { 
-        setDrawingProgressPercent(0); // Reset progress bar if drawing is not active
-      }
 
-      if (data.resumable && data.original_filename) {
-        setResumableDrawingInfo({ original_filename: data.original_filename, progress: data.progress || 0 });
-      } else if (!data.active && !data.resumable) { // Drawing finished or was cleared
-        clearResumableState();
+      if (data.active) {
+        setIsDrawingActive(true);
+        if(data.drawing_id) setActiveDrawingId(data.drawing_id);
+      } else {
+        // If drawing is no longer active for this specific ID, or in general
+        if (activeDrawingId === data.drawing_id || !data.drawing_id) {
+            clearActiveDrawingState();
+        }
       }
     });
+
+    socket.on('drawing_history_updated', (history: DrawingHistoryItem[]) => {
+        console.log("Received drawing_history_updated:", history);
+        setDrawingHistory(history || []);
+    });
+
 
     socket.on('transcription_result', (data: { text?: string, error?: string }) => {
         if (data.error) {
@@ -248,13 +267,11 @@ function App() {
   const handleDisconnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_disconnect_request', {}); }
   const sendGoHomeCommand = () => { 
     if (!isDrawingActive && socket) {
-      clearResumableState();
       socket.emit('send_robot_command', { type: 'go_home' }); 
     }
   }
   const sendSafeCenterCommand = () => { 
     if (!isDrawingActive && socket) {
-      clearResumableState();
       socket.emit('send_robot_command', { type: 'move_to_safe_center' }); 
     }
   }
@@ -264,7 +281,6 @@ function App() {
       setQrCodeImage(null); setQrUploadUrl('Requesting QR Code...');
       setSelectedFile(null); setImagePreviewUrl(null); 
       setLastUploadedImageInfo(''); setUploadedFilePathFromBackend(null);
-      clearResumableState();
       socket.emit('request_qr_code', {});
     } else if (isDrawingActive) { alert("Cannot request QR code while drawing is in progress."); }
   };
@@ -274,7 +290,6 @@ function App() {
       setSelectedFile(file); setImagePreviewUrl(URL.createObjectURL(file));
       setQrCodeImage(null); setQrUploadUrl('');
       setLastUploadedImageInfo(''); setUploadedFilePathFromBackend(null);
-      clearResumableState();
     } else {
       setSelectedFile(null); setImagePreviewUrl(null);
       if (file) { alert('Please select/drop an image file.'); }
@@ -302,7 +317,6 @@ function App() {
       const base64Data = (e.target?.result as string)?.split(',')[1];
       if (base64Data) {
         setLastUploadedImageInfo(`Sending ${selectedFile.name} to backend...`);
-        clearResumableState();
         socket.emit('direct_image_upload', { filename: selectedFile.name, fileData: base64Data });
       } else { alert("Could not read file data."); setLastUploadedImageInfo("Error reading file.");}
     };
@@ -314,7 +328,6 @@ function App() {
     if (isDrawingActive) { alert("A drawing is already in progress."); return; }
     if (!isRobotConnected) { alert("Please connect to the robot first."); setLastCommandResponse("Error: Robot not connected."); return; }
     if (uploadedFilePathFromBackend) {
-      clearResumableState(); // Starting a new drawing process clears any old resumable state
       setSelectedThresholdKey(THRESHOLD_OPTIONS[2].key); 
       setThresholdPreviewImage(null); 
       setShowThresholdModal(true); 
@@ -335,7 +348,6 @@ function App() {
         alert("Invalid threshold option selected.");
         return;
     }
-    clearResumableState(); // Ensure any previous resumable state is cleared before starting new
     const originalFilename = lastUploadedImageInfo.includes("Received: ") ? lastUploadedImageInfo.split("Received: ")[1].split(". Ready")[0] : "uploaded_image";
     socket.emit('process_image_for_drawing', { 
         filepath: uploadedFilePathFromBackend, 
@@ -349,14 +361,29 @@ function App() {
     setShowThresholdModal(false); 
   };
 
-  const handleResumeDrawing = () => {
-    if (resumableDrawingInfo && socket && isConnectedToBackend) {
-        console.log("Frontend: Emitting 'resume_drawing_request'");
-        socket.emit('resume_drawing_request', {});
-        setDrawingProgressMessage(`Attempting to resume drawing of '${resumableDrawingInfo.original_filename}'...`);
-        // Resumable info will be cleared by backend or on new drawing status update
+  const handleResumeDrawingFromHistory = (drawingId: string) => {
+    if (isDrawingActive) {
+        alert("Another drawing is already active. Cannot resume now.");
+        return;
+    }
+    if (socket && isConnectedToBackend) {
+        console.log(`Frontend: Emitting 'resume_drawing_request' for ID: ${drawingId}`);
+        socket.emit('resume_drawing_request', { drawing_id: drawingId });
     } else {
-        alert("No resumable drawing found or backend not connected.");
+        alert("Cannot resume. Backend not connected.");
+    }
+  };
+
+  const handleRestartDrawingFromHistory = (drawingId: string) => {
+    if (isDrawingActive) {
+        alert("Another drawing is already active. Cannot restart now.");
+        return;
+    }
+    if (socket && isConnectedToBackend) {
+        console.log(`Frontend: Emitting 'restart_drawing_request' for ID: ${drawingId}`);
+        socket.emit('restart_drawing_request', { drawing_id: drawingId });
+    } else {
+        alert("Cannot restart. Backend not connected.");
     }
   };
 
@@ -427,7 +454,6 @@ function App() {
       return;
     }
     if (socket && isConnectedToBackend && socket.connected) { 
-      clearResumableState(); // Sending a new LLM command clears resumable state
       socket.emit('submit_text_to_llm', { text_command: text });
       setLlmResponse(''); 
       setInteractionStatus('Robotist is thinking...');
@@ -458,19 +484,19 @@ function App() {
         return;
     }
     if (socket) {
-        clearResumableState(); // Manual coordinate send clears resumable state
         socket.emit('send_custom_coordinates', { x_py: x, z_py: y, y_py: z });
         setLastCommandResponse(`Sent custom coords: X=${x}, Depth=${y}, Side=${z}`);
     }
   };
 
   const styles: { [key: string]: React.CSSProperties } = {
-    appContainer: { maxWidth: '1200px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif', color: '#e0e0e0', backgroundColor: '#1e1e1e' },
+    appContainer: { maxWidth: '1400px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif', color: '#e0e0e0', backgroundColor: '#1e1e1e' }, // Wider for history
     header: { textAlign: 'center' as const, marginBottom: '30px', borderBottom: '1px solid #444', paddingBottom: '20px' },
     mainTitle: { fontSize: '2.5em', color: '#61dafb', margin: '0 0 10px 0' },
     statusText: { fontSize: '0.9em', color: isConnectedToBackend ? '#76ff03' : '#ff5252' },
-    mainContentGrid: { display: 'grid', gridTemplateColumns: '1fr 2fr 1.5fr', gap: '25px', alignItems: 'start' }, 
-    section: { backgroundColor: '#2a2a2a', padding: '20px', borderRadius: '8px', marginBottom: '0px', boxShadow: '0 4px 8px rgba(0,0,0,0.2)', height: '100%', display: 'flex', flexDirection: 'column' }, 
+    mainLayoutContainer: { display: 'flex', flexDirection: 'column', gap: '25px' }, // Main sections stack vertically
+    topRowGrid: { display: 'grid', gridTemplateColumns: '1fr 2fr 1.5fr', gap: '25px', alignItems: 'start', marginBottom: '25px' }, 
+    section: { backgroundColor: '#2a2a2a', padding: '20px', borderRadius: '8px', boxShadow: '0 4px 8px rgba(0,0,0,0.2)', display: 'flex', flexDirection: 'column', minHeight: '300px' }, 
     sectionTitle: { fontSize: '1.5em', color: '#61dafb', borderBottom: '1px solid #444', paddingBottom: '10px', marginBottom: '15px' },
     button: { backgroundColor: '#007bff', color: 'white', border: 'none', padding: '10px 15px', borderRadius: '5px', cursor: 'pointer', fontSize: '1em', margin: '5px', transition: 'background-color 0.2s ease' },
     buttonDisabled: { backgroundColor: '#555', cursor: 'not-allowed' },
@@ -499,7 +525,14 @@ function App() {
     modalPreviewArea: { textAlign: 'center' as const, borderLeft: '1px solid #444', paddingLeft: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
     modalPreviewImage: { maxWidth: '350px', maxHeight: '350px', border: '1px solid #555', borderRadius: '4px', backgroundColor: '#1e1e1e', minHeight: '250px' }, // Increased preview image size
     modalActions: { marginTop: '25px', textAlign: 'right' as const },
-    resumeButton: { backgroundColor: '#ffc107', color: '#1e1e1e', marginTop: '10px' }
+    historySection: { /* Uses styles.section */ },
+    historyList: { listStyle: 'none', padding: 0, maxHeight: '400px', overflowY: 'auto'},
+    historyItem: { backgroundColor: '#333', padding: '15px', borderRadius: '6px', marginBottom: '10px', borderLeft: '5px solid #007bff' },
+    historyItemCompleted: { borderLeftColor: '#28a745' },
+    historyItemInterrupted: { borderLeftColor: '#ffc107' },
+    historyItemInProgress: { borderLeftColor: '#17a2b8' },
+    historyDetails: { fontSize: '0.9em', color: '#bbb', marginBottom: '8px' },
+    historyActions: { marginTop: '10px' },
   };
 
   return (
@@ -509,134 +542,166 @@ function App() {
         <p style={styles.statusText}>Backend: {isConnectedToBackend ? 'Connected' : 'Disconnected'}</p>
       </header>
 
-      {/* Resumable Drawing Info and Button */}
-      {resumableDrawingInfo && !isDrawingActive && (
-        <div style={{...styles.section, marginBottom: '20px', padding: '15px', backgroundColor: '#3e2723', border: '1px solid #ffc107'}}>
-            <h3 style={{...styles.sectionTitle, color: '#ffc107', borderBottomColor: '#ffc107'}}>Interrupted Drawing Detected</h3>
-            <p>Drawing of "<strong>{resumableDrawingInfo.original_filename}</strong>" was interrupted at {resumableDrawingInfo.progress.toFixed(0)}%.</p>
-            <button 
-                onClick={handleResumeDrawing} 
-                style={{...styles.button, ...styles.resumeButton}}
-                disabled={!isConnectedToBackend || !isRobotConnected}
-            >
-                Resume Drawing
-            </button>
-        </div>
-      )}
-
-
-      <div style={styles.mainContentGrid}>
-        {/* Column 1: Robot Control */}
-        <section style={styles.section}>
-          <h2 style={styles.sectionTitle}>Robot Control</h2>
-          <div style={{textAlign: 'center'}}>
-            <button onClick={handleConnectRobot} disabled={!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, ...((!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Connect to Robot </button>
-            <button onClick={handleDisconnectRobot} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, backgroundColor: '#ffc107', color: '#1e1e1e', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Disconnect Robot</button>
-            <br />
-            <button onClick={sendGoHomeCommand} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, marginTop: '10px', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Send Robot to Home </button>
-            <button onClick={sendSafeCenterCommand} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, marginTop: '10px', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Send to Safe Center </button>
-          </div>
-
-          <div style={styles.coordInputContainer}>
-            <h3 style={{fontSize: '1.2em', color: '#ccc', marginBottom: '10px', textAlign: 'center'}}>Move to Specific Position:</h3>
-            <div style={styles.coordInputGroup}>
-              <label htmlFor="x-coord" style={styles.coordLabel}>X (mm):</label>
-              <input type="number" id="x-coord" value={xCoord} onChange={(e) => setXCoord(e.target.value)} placeholder="e.g., 100" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+      <div style={styles.mainLayoutContainer}>
+        <div style={styles.topRowGrid}>
+          {/* Column 1: Robot Control */}
+          <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>Robot Control</h2>
+            <div style={{textAlign: 'center'}}>
+              <button onClick={handleConnectRobot} disabled={!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, ...((!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Connect to Robot </button>
+              <button onClick={handleDisconnectRobot} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, backgroundColor: '#ffc107', color: '#1e1e1e', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Disconnect Robot</button>
+              <br />
+              <button onClick={sendGoHomeCommand} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, marginTop: '10px', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Send Robot to Home </button>
+              <button onClick={sendSafeCenterCommand} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, marginTop: '10px', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Send to Safe Center </button>
             </div>
-            <div style={styles.coordInputGroup}>
-              <label htmlFor="y-coord" style={styles.coordLabel}>Y/Depth (mm):</label>
-              <input type="number" id="y-coord" value={yCoord} onChange={(e) => setYCoord(e.target.value)} placeholder="e.g., -150" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
-            </div>
-            <div style={styles.coordInputGroup}>
-              <label htmlFor="z-coord" style={styles.coordLabel}>Z/Side (mm):</label>
-              <input type="number" id="z-coord" value={zCoord} onChange={(e) => setZCoord(e.target.value)} placeholder="e.g., 50" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
-            </div>
-            <button onClick={handleSendCustomCoordinates} disabled={!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord} style={{...styles.button, marginTop: '10px', backgroundColor: '#17a2b8', ...((!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord) && styles.buttonDisabled)}}>
-              Send Custom Coordinates
-            </button>
-          </div>
 
-          <div style={styles.robotStatus}>
-              <p style={{margin: 0, color: isRobotConnected ? '#76ff03' : '#ffc107'}}>{robotStatusMessage}</p>
-          </div>
-          {lastCommandResponse && <p style={{fontSize: '0.9em', color: '#aaa', marginTop: '10px', textAlign: 'center'}}>Last Command: {lastCommandResponse}</p>}
-        </section>
-
-        {/* Column 2: Robotist Interaction */}
-        <section style={styles.section}>
-          <h2 style={styles.sectionTitle}>Robotist Interaction</h2>
-          <div style={{ display: 'flex', alignItems: 'center', marginBottom: '15px' }}>
-            <button 
-                onClick={handleMicButtonClick} 
-                disabled={!isConnectedToBackend || isDrawingActive}
-                style={{...styles.button, ...styles.micButton, ...( (!isConnectedToBackend || isDrawingActive) && styles.buttonDisabled) }}
-                title={isRecording ? "Stop Recording" : "Start Voice Command"}
-            >
-                {isRecording ? <StopIcon /> : <MicIcon />}
-            </button>
-            <p style={{ margin: '0 0 0 15px', flexGrow: 1, color: '#bbbbbb' }}>{interactionStatus}</p>
-          </div>
-
-          {rawTranscribedText && <p style={{fontSize: '0.9em', color: '#aaa', fontStyle: 'italic', marginBottom: '10px'}}>You said: "{rawTranscribedText}"</p>}
-          
-          <textarea 
-              value={editableCommandText}
-              onChange={(e) => setEditableCommandText(e.target.value)}
-              placeholder="Type command or edit transcribed text here..."
-              style={styles.textarea}
-              disabled={!isConnectedToBackend || isDrawingActive || isRecording}
-          />
-          <button 
-              onClick={handleSendEditableCommand} 
-              disabled={!editableCommandText.trim() || !isConnectedToBackend || isDrawingActive || isRecording}
-              style={{...styles.button, ...( (!editableCommandText.trim() || !isConnectedToBackend || isDrawingActive || isRecording) && styles.buttonDisabled) }}
-          >
-              Send Command to Robotist
-          </button>
-
-          {llmResponse && (
-            <div style={styles.llmResponseBox}>
-              <p style={{ margin: 0 }}><b>Robotist:</b> {llmResponse}</p>
-            </div>
-          )}
-        </section>
-        
-        {/* Column 3: Image Input */}
-        <section style={styles.section}>
-          <h2 style={styles.sectionTitle}>Image Input</h2>
-          <div style={styles.imageUploadContainer}> 
-            <div style={styles.uploadBox}>
-              <h3>Upload via QR Code</h3>
-              <button onClick={requestQrCode} disabled={!isConnectedToBackend || isDrawingActive || isRecording} style={{...styles.button, ...((!isConnectedToBackend || isDrawingActive || isRecording) && styles.buttonDisabled)}}>
-                Get QR Code
+            <div style={styles.coordInputContainer}>
+              <h3 style={{fontSize: '1.2em', color: '#ccc', marginBottom: '10px', textAlign: 'center'}}>Move to Specific Position:</h3>
+              <div style={styles.coordInputGroup}>
+                <label htmlFor="x-coord" style={styles.coordLabel}>X (mm):</label>
+                <input type="number" id="x-coord" value={xCoord} onChange={(e) => setXCoord(e.target.value)} placeholder="e.g., 100" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+              </div>
+              <div style={styles.coordInputGroup}>
+                <label htmlFor="y-coord" style={styles.coordLabel}>Y/Depth (mm):</label>
+                <input type="number" id="y-coord" value={yCoord} onChange={(e) => setYCoord(e.target.value)} placeholder="e.g., -150" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+              </div>
+              <div style={styles.coordInputGroup}>
+                <label htmlFor="z-coord" style={styles.coordLabel}>Z/Side (mm):</label>
+                <input type="number" id="z-coord" value={zCoord} onChange={(e) => setZCoord(e.target.value)} placeholder="e.g., 50" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+              </div>
+              <button onClick={handleSendCustomCoordinates} disabled={!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord} style={{...styles.button, marginTop: '10px', backgroundColor: '#17a2b8', ...((!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord) && styles.buttonDisabled)}}>
+                Send Custom Coordinates
               </button>
-              {qrUploadUrl && !qrCodeImage && <p style={{fontSize: '0.8em', wordBreak: 'break-all', color: '#aaa'}}><small>{qrUploadUrl}</small></p>}
-              {qrCodeImage && ( <div> <p style={{fontSize: '0.8em', color: '#aaa'}}><small>Scan to upload. URL: {qrUploadUrl}</small></p> <img src={qrCodeImage} alt="QR Code for Upload" style={styles.imagePreview} /> </div> )}
             </div>
-            <div 
-              style={{...styles.uploadBox, ...(isDragging && styles.uploadBoxDragging), opacity: (isDrawingActive || isRecording) ? 0.6 : 1, pointerEvents: (isDrawingActive || isRecording) ? 'none' : 'auto' }}
-              onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop} 
+
+            <div style={styles.robotStatus}>
+                <p style={{margin: 0, color: isRobotConnected ? '#76ff03' : '#ffc107'}}>{robotStatusMessage}</p>
+            </div>
+            {lastCommandResponse && <p style={{fontSize: '0.9em', color: '#aaa', marginTop: '10px', textAlign: 'center'}}>Last Command: {lastCommandResponse}</p>}
+          </section>
+
+          {/* Column 2: Robotist Interaction */}
+          <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>Robotist Interaction</h2>
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: '15px' }}>
+              <button 
+                  onClick={handleMicButtonClick} 
+                  disabled={!isConnectedToBackend || isDrawingActive}
+                  style={{...styles.button, ...styles.micButton, ...( (!isConnectedToBackend || isDrawingActive) && styles.buttonDisabled) }}
+                  title={isRecording ? "Stop Recording" : "Start Voice Command"}
+              >
+                  {isRecording ? <StopIcon /> : <MicIcon />}
+              </button>
+              <p style={{ margin: '0 0 0 15px', flexGrow: 1, color: '#bbbbbb' }}>{interactionStatus}</p>
+            </div>
+
+            {rawTranscribedText && <p style={{fontSize: '0.9em', color: '#aaa', fontStyle: 'italic', marginBottom: '10px'}}>You said: "{rawTranscribedText}"</p>}
+            
+            <textarea 
+                value={editableCommandText}
+                onChange={(e) => setEditableCommandText(e.target.value)}
+                placeholder="Type command or edit transcribed text here..."
+                style={styles.textarea}
+                disabled={!isConnectedToBackend || isDrawingActive || isRecording}
+            />
+            <button 
+                onClick={handleSendEditableCommand} 
+                disabled={!editableCommandText.trim() || !isConnectedToBackend || isDrawingActive || isRecording}
+                style={{...styles.button, ...( (!editableCommandText.trim() || !isConnectedToBackend || isDrawingActive || isRecording) && styles.buttonDisabled) }}
             >
-              <h3>Upload from Desktop</h3>
-              <input type="file" accept="image/*" onChange={handleFileSelect} ref={fileInputRef} style={{ display: 'none' }} disabled={isDrawingActive || isRecording} />
-              <button onClick={triggerFileInput} disabled={isDrawingActive || isRecording} style={{...styles.button, ...((isDrawingActive || isRecording) && styles.buttonDisabled)}}> Choose Image File </button>
-              <p style={{fontSize: '0.9em', marginTop: '10px', color: '#aaa'}}>Or drag & drop image here</p>
-              {imagePreviewUrl && selectedFile && ( <div style={{marginTop: '15px'}}> <p style={{color: '#bbb'}}>Preview:</p> <img src={imagePreviewUrl} alt="Selected preview" style={styles.imagePreview}/> <p style={{fontSize: '0.8em', color: '#aaa'}}>{selectedFile.name}</p> <button onClick={sendSelectedFileToBackend} disabled={!selectedFile || isDrawingActive || !isConnectedToBackend || isRecording} style={{...styles.button, marginTop: '10px', ...((!selectedFile || isDrawingActive || !isConnectedToBackend || isRecording) && styles.buttonDisabled)}} > Upload This Image </button> </div> )}
-            </div>
-          </div>
-          {lastUploadedImageInfo && <p style={{color: lastUploadedImageInfo.startsWith("Received:") ? "#76ff03" : (lastUploadedImageInfo.startsWith("Error") ? "#ff5252" : "#ffc107"), fontWeight: 'bold', textAlign: 'center', marginTop: '15px'}}>{lastUploadedImageInfo}</p>}
-          {uploadedFilePathFromBackend && ( <button onClick={handleProcessAndDrawUploadedImage} disabled={isDrawingActive || !isRobotConnected || !isConnectedToBackend || isRecording} style={{...styles.button, backgroundColor: '#28a745', display: 'block', margin: '20px auto', padding: '12px 25px', fontSize: '1.1em', ...((isDrawingActive || !isRobotConnected || !isConnectedToBackend || isRecording) && styles.buttonDisabled)}} > Process & Draw Uploaded Image </button> )}
+                Send Command to Robotist
+            </button>
+
+            {llmResponse && (
+              <div style={styles.llmResponseBox}>
+                <p style={{ margin: 0 }}><b>Robotist:</b> {llmResponse}</p>
+              </div>
+            )}
+          </section>
           
-          {isDrawingActive && (
-            <div style={{marginTop: '20px'}}>
-              <p style={{color: "#61dafb", fontWeight: "bold", textAlign: 'center'}}>{drawingProgressMessage}</p>
-              <div style={styles.progressBarContainer}>
-                <div style={styles.progressBar}>{drawingProgressPercent.toFixed(0)}%</div>
+          {/* Column 3: Image Input */}
+          <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>Image Input</h2>
+            <div style={styles.imageUploadContainer}> 
+              <div style={styles.uploadBox}>
+                <h3>Upload via QR Code</h3>
+                <button onClick={requestQrCode} disabled={!isConnectedToBackend || isDrawingActive || isRecording} style={{...styles.button, ...((!isConnectedToBackend || isDrawingActive || isRecording) && styles.buttonDisabled)}}>
+                  Get QR Code
+                </button>
+                {qrUploadUrl && !qrCodeImage && <p style={{fontSize: '0.8em', wordBreak: 'break-all', color: '#aaa'}}><small>{qrUploadUrl}</small></p>}
+                {qrCodeImage && ( <div> <p style={{fontSize: '0.8em', color: '#aaa'}}><small>Scan to upload. URL: {qrUploadUrl}</small></p> <img src={qrCodeImage} alt="QR Code for Upload" style={styles.imagePreview} /> </div> )}
+              </div>
+              <div 
+                style={{...styles.uploadBox, ...(isDragging && styles.uploadBoxDragging), opacity: (isDrawingActive || isRecording) ? 0.6 : 1, pointerEvents: (isDrawingActive || isRecording) ? 'none' : 'auto' }}
+                onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop} 
+              >
+                <h3>Upload from Desktop</h3>
+                <input type="file" accept="image/*" onChange={handleFileSelect} ref={fileInputRef} style={{ display: 'none' }} disabled={isDrawingActive || isRecording} />
+                <button onClick={triggerFileInput} disabled={isDrawingActive || isRecording} style={{...styles.button, ...((isDrawingActive || isRecording) && styles.buttonDisabled)}}> Choose Image File </button>
+                <p style={{fontSize: '0.9em', marginTop: '10px', color: '#aaa'}}>Or drag & drop image here</p>
+                {imagePreviewUrl && selectedFile && ( <div style={{marginTop: '15px'}}> <p style={{color: '#bbb'}}>Preview:</p> <img src={imagePreviewUrl} alt="Selected preview" style={styles.imagePreview}/> <p style={{fontSize: '0.8em', color: '#aaa'}}>{selectedFile.name}</p> <button onClick={sendSelectedFileToBackend} disabled={!selectedFile || isDrawingActive || !isConnectedToBackend || isRecording} style={{...styles.button, marginTop: '10px', ...((!selectedFile || isDrawingActive || !isConnectedToBackend || isRecording) && styles.buttonDisabled)}} > Upload This Image </button> </div> )}
               </div>
             </div>
-          )}
-          {!isDrawingActive && drawingProgressMessage && !lastUploadedImageInfo.startsWith("Received:") && !resumableDrawingInfo && <p style={{textAlign: 'center', marginTop: '15px', color: '#aaa'}}>{drawingProgressMessage}</p>}
-        </section>
+            {lastUploadedImageInfo && <p style={{color: lastUploadedImageInfo.startsWith("Received:") ? "#76ff03" : (lastUploadedImageInfo.startsWith("Error") ? "#ff5252" : "#ffc107"), fontWeight: 'bold', textAlign: 'center', marginTop: '15px'}}>{lastUploadedImageInfo}</p>}
+            {uploadedFilePathFromBackend && ( <button onClick={handleProcessAndDrawUploadedImage} disabled={isDrawingActive || !isRobotConnected || !isConnectedToBackend || isRecording} style={{...styles.button, backgroundColor: '#28a745', display: 'block', margin: '20px auto', padding: '12px 25px', fontSize: '1.1em', ...((isDrawingActive || !isRobotConnected || !isConnectedToBackend || isRecording) && styles.buttonDisabled)}} > Process & Draw Uploaded Image </button> )}
+            
+            {isDrawingActive && activeDrawingId && (
+              <div style={{marginTop: '20px'}}>
+                <p style={{color: "#61dafb", fontWeight: "bold", textAlign: 'center'}}>{drawingProgressMessage}</p>
+                <div style={styles.progressBarContainer}>
+                  <div style={styles.progressBar}>{drawingProgressPercent.toFixed(0)}%</div>
+                </div>
+              </div>
+            )}
+            {!isDrawingActive && drawingProgressMessage && !lastUploadedImageInfo.startsWith("Received:") && <p style={{textAlign: 'center', marginTop: '15px', color: '#aaa'}}>{drawingProgressMessage}</p>}
+          </section>
+        </div>
+
+        {/* Drawing History Section */}
+        {drawingHistory.length > 0 && (
+            <section style={{...styles.section, ...styles.historySection, marginTop: '25px'}}>
+                <h2 style={styles.sectionTitle}>Drawing History (Last {drawingHistory.length})</h2>
+                <ul style={styles.historyList}>
+                    {drawingHistory.map(item => (
+                        <li 
+                            key={item.drawing_id} 
+                            style={{
+                                ...styles.historyItem, 
+                                ...(item.status === 'completed' ? styles.historyItemCompleted : {}),
+                                ...(item.status === 'interrupted' || item.status === 'interrupted_error' ? styles.historyItemInterrupted : {}),
+                                ...(item.status && item.status.startsWith('in_progress') ? styles.historyItemInProgress : {}),
+                            }}
+                        >
+                            <p style={{margin: '0 0 5px 0', fontWeight: 'bold', color: '#f0f0f0'}}>{item.original_filename}</p>
+                            <p style={styles.historyDetails}>Status: {item.status.replace(/_/g, ' ')}</p>
+                            {(item.status.includes('in_progress') || item.status.includes('interrupted')) && (
+                                <p style={styles.historyDetails}>Progress: {item.progress.toFixed(0)}%</p>
+                            )}
+                            <p style={styles.historyDetails}>Last Update: {new Date(item.last_updated).toLocaleString()}</p>
+                            <div style={styles.historyActions}>
+                                {(item.status.includes('interrupted') || item.status.includes('in_progress')) && item.status !== 'completed' && (
+                                    <button 
+                                        onClick={() => handleResumeDrawingFromHistory(item.drawing_id)}
+                                        style={{...styles.button, backgroundColor: '#ffc107', color: '#1e1e1e'}}
+                                        disabled={isDrawingActive || !isConnectedToBackend || !isRobotConnected}
+                                    >
+                                        Resume
+                                    </button>
+                                )}
+                                <button 
+                                    onClick={() => handleRestartDrawingFromHistory(item.drawing_id)}
+                                    style={{...styles.button, backgroundColor: '#17a2b8'}}
+                                    disabled={isDrawingActive || !isConnectedToBackend || !isRobotConnected}
+                                >
+                                    Restart
+                                </button>
+                            </div>
+                        </li>
+                    ))}
+                </ul>
+            </section>
+        )}
+
       </div>
 
       {/* Threshold Selection Modal */}
