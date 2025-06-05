@@ -28,7 +28,7 @@ EXCLUDE_PATTERNS=(
     "$TEMP_ALL_CONTENTS"     # Temporary file for all content
     "$SED_SCRIPT_FILE"       # Temporary sed script
     "$SCRIPT_FILENAME"       # The script itself
-    # "$EXCLUDE_CONFIG_FILE"   # The exclusion config file itself
+    "$EXCLUDE_CONFIG_FILE"   # The exclusion config file itself
 )
 
 # Read additional patterns from the user's config file, if it exists
@@ -37,14 +37,15 @@ if [ -f "$EXCLUDE_CONFIG_FILE" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
         # Remove comments (anything after #, including preceding whitespace)
         line_no_comment=$(echo "$line" | sed 's/\s*#.*$//')
+        # Explicitly remove carriage returns
+        line_no_cr=$(echo "$line_no_comment" | tr -d '\r')
         # Trim leading/trailing whitespace effectively
-        trimmed_line=$(echo "$line_no_comment" | awk '{$1=$1};1')
+        trimmed_line=$(echo "$line_no_cr" | awk '{$1=$1};1')
         # Add if not empty and not a line that was ONLY a comment (now empty or just whitespace)
         if [ -n "$trimmed_line" ]; then
             EXCLUDE_PATTERNS+=("$trimmed_line")
         fi
     done < "$EXCLUDE_CONFIG_FILE"
-    echo "Finished reading $EXCLUDE_CONFIG_FILE."
 else
     echo "User exclusions config file ($EXCLUDE_CONFIG_FILE) not found. Using default exclusions only."
     echo "You can create $EXCLUDE_CONFIG_FILE and add one pattern per line to exclude more files/dirs."
