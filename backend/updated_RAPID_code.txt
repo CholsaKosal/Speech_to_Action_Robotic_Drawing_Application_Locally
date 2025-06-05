@@ -218,7 +218,7 @@ MODULE InputDrawing
             
             IF parse_ok THEN
                 points_in_batch := points_in_batch + 1;
-                MoveL Offs(WorkSpaceCenter1, temp_x_val, temp_z_depth_val, temp_y_side_val), v1000, z100, tool2\WObj:=Wobj_1;
+                MoveL Offs(WorkSpaceCenter1, temp_x_val,temp_y_side_val, temp_z_depth_val), v1000, z100, tool2\WObj:=Wobj_1;
             ELSE
                 current_pos := StrLen(batch_data_str) + 1; 
             ENDIF

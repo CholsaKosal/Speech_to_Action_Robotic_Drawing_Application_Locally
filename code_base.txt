@@ -4740,7 +4740,7 @@ This direct local network approach is for the current development phase. Future 
 ### 3.3. Generating `code_base.txt` (for sharing/review)
 
 This script helps generate a snapshot of the current codebase, excluding large or unnecessary directories.
-1.  **Environment:** Use **WSL (Windows Subsystem for Linux)** or **Git Bash** on Windows, or a standard terminal on Linux/macOS.
+1.  **Environment:** Use **WSL (Windows Subsystem for Linux)** or **Git Bash** on Windows (to open git bash, open the entire code folder using with git bash), or a standard terminal on Linux/macOS.
 2.  **Ensure `tree` command is available:**
       * In WSL, if `tree` is not found but available via Snap:
         ```bash

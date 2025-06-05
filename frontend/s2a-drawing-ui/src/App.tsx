@@ -55,7 +55,7 @@ function App() {
   const [robotStatusMessage, setRobotStatusMessage] = useState('Robot: Not connected');
   const [lastCommandResponse, setLastCommandResponse] = useState('');
 
-  const [useRealRobot, setUseRealRobot] = useState(false); // New state for robot type selection
+  const [useRealRobot, setUseRealRobot] = useState(false); 
 
   const [qrCodeImage, setQrCodeImage] = useState<string | null>(null);
   const [qrUploadUrl, setQrUploadUrl] = useState<string>('');
@@ -84,8 +84,8 @@ function App() {
   const audioStreamRef = useRef<MediaStream | null>(null);
 
   const [xCoord, setXCoord] = useState('');
-  const [yCoord, setYCoord] = useState('');
-  const [zCoord, setZCoord] = useState('');
+  const [yCoord, setYCoord] = useState(''); // This will map to Z_depth in backend _format_command
+  const [zCoord, setZCoord] = useState(''); // This will map to Y_side in backend _format_command
 
   const [showThresholdModal, setShowThresholdModal] = useState(false);
   const [selectedThresholdKey, setSelectedThresholdKey] = useState<string>(THRESHOLD_OPTIONS[2].key); 
@@ -162,14 +162,17 @@ function App() {
         original_filename?: string 
       }) => {
       
+      // **** ADDED CONSOLE LOG FOR DEBUGGING ****
+      console.log("FRONTEND: drawing_status_update received:", JSON.stringify(data)); 
+      
       setDrawingProgressMessage(data.message);
-      if (data.progress !== undefined) {
+      if (typeof data.progress === 'number') { // Check if progress is a number
         setDrawingProgressPercent(data.progress);
       }
 
       if (data.active) {
         setIsDrawingActive(true); 
-        if (data.drawing_id) {
+        if (data.drawing_id) { // Ensure drawing_id is present
           setActiveDrawingId(data.drawing_id); 
         }
       } else { 
@@ -239,7 +242,7 @@ function App() {
         }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clearActiveDrawingState]); 
+  }, [clearActiveDrawingState]); // llmResponse removed from deps to avoid re-triggering on its own update if not needed
 
   const requestThresholdPreview = useCallback((key: string) => {
     const selectedOpt = THRESHOLD_OPTIONS.find(opt => opt.key === key);
@@ -264,7 +267,6 @@ function App() {
 
   const handleConnectRobot = () => { 
     if (!isDrawingActive && socket) {
-      // Send the useRealRobot state to the backend
       socket.emit('robot_connect_request', { use_real_robot: useRealRobot }); 
     }
   }
@@ -483,19 +485,22 @@ function App() {
         alert("Cannot send coordinates while drawing is active.");
         return;
     }
-    const x = parseFloat(xCoord);
-    const y = parseFloat(yCoord); 
-    const z = parseFloat(zCoord); 
+    const x_val = parseFloat(xCoord);
+    const y_val = parseFloat(yCoord); // For UI, this is Depth (which is Z in _format_command)
+    const z_val = parseFloat(zCoord); // For UI, this is Side (which is Y in _format_command)
 
-    if (isNaN(x) || isNaN(y) || isNaN(z)) {
-        alert("Invalid coordinates. Please enter numbers for X, Y (depth), and Z (side-to-side).");
+    if (isNaN(x_val) || isNaN(y_val) || isNaN(z_val)) {
+        alert("Invalid coordinates. Please enter numbers for X, Depth, and Side.");
         return;
     }
     if (socket) {
-        socket.emit('send_custom_coordinates', { x_py: x, z_py: y, y_py: z });
-        setLastCommandResponse(`Sent custom coords: X=${x}, Depth=${y}, Side=${z}`);
+        // Backend handle_send_custom_coordinates_event expects { x_py: x_paper, z_py: z_pen_depth, y_py: y_paper_side_val }
+        // So, frontend's xCoord -> x_py, yCoord (Depth) -> z_py, zCoord (Side) -> y_py
+        socket.emit('send_custom_coordinates', { x_py: x_val, z_py: y_val, y_py: z_val });
+        setLastCommandResponse(`Sent custom coords: X=${x_val}, Depth=${y_val}, Side=${z_val}`);
     }
   };
+
 
   const styles: { [key: string]: React.CSSProperties } = {
     appContainer: { maxWidth: '1400px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif', color: '#e0e0e0', backgroundColor: '#1e1e1e' }, 
@@ -515,15 +520,15 @@ function App() {
     uploadBoxDragging: { borderColor: '#007bff', backgroundColor: '#3a3a3a' },
     imagePreview: { maxWidth: '100%', maxHeight: '150px', border: '1px solid #444', borderRadius: '4px', marginTop: '10px' },
     progressBarContainer: { width: '100%', backgroundColor: '#444', borderRadius: '4px', overflow: 'hidden', marginTop: '10px' },
-    progressBar: { width: `${drawingProgressPercent}%`, backgroundColor: '#61dafb', height: '20px', textAlign: 'center' as const, lineHeight: '20px', color: '#1e1e1e', transition: 'width 0.3s ease' },
+    progressBar: { /* width: `${drawingProgressPercent}%`, */ backgroundColor: '#61dafb', height: '20px', textAlign: 'center' as const, lineHeight: '20px', color: '#1e1e1e', transition: 'width 0.3s ease' },
     robotStatus: { padding: '10px', backgroundColor: '#333', borderRadius: '4px', fontSize: '0.9em', marginTop: '10px' },
     llmResponseBox: { marginTop: '15px', padding: '15px', border: '1px solid #444', borderRadius: '4px', backgroundColor: '#333', whiteSpace: 'pre-wrap' as const, maxHeight: '200px', overflowY: 'auto' as const, flexGrow: 1},
     coordInputContainer: { display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '15px', marginBottom: '15px' },
     coordInputGroup: { display: 'flex', alignItems: 'center', gap: '10px' },
-    coordLabel: { minWidth: '70px', textAlign: 'right' as const, color: '#bbb' },
+    coordLabel: { minWidth: '100px', textAlign: 'right' as const, color: '#bbb' }, 
     coordInput: { flexGrow: 1, padding: '8px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff' },
-    checkboxContainer: { display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '10px 0', color: '#ccc' }, // Style for checkbox
-    checkboxInput: { marginRight: '8px', accentColor: '#61dafb' }, // Style for checkbox input
+    checkboxContainer: { display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '10px 0', color: '#ccc' }, 
+    checkboxInput: { marginRight: '8px', accentColor: '#61dafb' }, 
     modalOverlay: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 },
     modalContent: { backgroundColor: '#2a2a2a', padding: '30px', borderRadius: '8px', boxShadow: '0 5px 15px rgba(0,0,0,0.3)', width: 'auto', minWidth: '750px', maxWidth: '900px', color: '#e0e0e0' },
     modalTitle: { fontSize: '1.8em', color: '#61dafb', marginBottom: '20px', textAlign: 'center' as const },
@@ -557,7 +562,7 @@ function App() {
           {/* Column 1: Robot Control */}
           <section style={styles.section}>
             <h2 style={styles.sectionTitle}>Robot Control</h2>
-            <div style={styles.checkboxContainer}> {/* Checkbox for robot type */}
+            <div style={styles.checkboxContainer}> 
               <input 
                 type="checkbox" 
                 id="robotType" 
@@ -581,15 +586,15 @@ function App() {
             <div style={styles.coordInputContainer}>
               <h3 style={{fontSize: '1.2em', color: '#ccc', marginBottom: '10px', textAlign: 'center'}}>Move to Specific Position:</h3>
               <div style={styles.coordInputGroup}>
-                <label htmlFor="x-coord" style={styles.coordLabel}>X (mm):</label>
+                <label htmlFor="x-coord" style={styles.coordLabel}>X (paper, mm):</label>
                 <input type="number" id="x-coord" value={xCoord} onChange={(e) => setXCoord(e.target.value)} placeholder="e.g., 100" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
               </div>
               <div style={styles.coordInputGroup}>
-                <label htmlFor="y-coord" style={styles.coordLabel}>Y/Depth (mm):</label>
-                <input type="number" id="y-coord" value={yCoord} onChange={(e) => setYCoord(e.target.value)} placeholder="e.g., -150" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
+                <label htmlFor="y-coord" style={styles.coordLabel}>Depth (pen, mm):</label> 
+                <input type="number" id="y-coord" value={yCoord} onChange={(e) => setYCoord(e.target.value)} placeholder="e.g., -15 (up) or -7 (down)" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
               </div>
               <div style={styles.coordInputGroup}>
-                <label htmlFor="z-coord" style={styles.coordLabel}>Z/Side (mm):</label>
+                <label htmlFor="z-coord" style={styles.coordLabel}>Side (paper, mm):</label> 
                 <input type="number" id="z-coord" value={zCoord} onChange={(e) => setZCoord(e.target.value)} placeholder="e.g., 50" style={styles.coordInput} disabled={!isRobotConnected || isDrawingActive} />
               </div>
               <button onClick={handleSendCustomCoordinates} disabled={!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord} style={{...styles.button, marginTop: '10px', backgroundColor: '#17a2b8', ...((!isRobotConnected || isDrawingActive || !xCoord || !yCoord || !zCoord) && styles.buttonDisabled)}}>
@@ -672,7 +677,7 @@ function App() {
               <div style={{marginTop: '20px'}}>
                 <p style={{color: "#61dafb", fontWeight: "bold", textAlign: 'center'}}>{drawingProgressMessage}</p>
                 <div style={styles.progressBarContainer}>
-                  <div style={styles.progressBar}>{drawingProgressPercent.toFixed(0)}%</div>
+                  <div style={{...styles.progressBar, width: `${drawingProgressPercent}%`}}>{drawingProgressPercent.toFixed(0)}%</div>
                 </div>
               </div>
             )}
@@ -697,7 +702,7 @@ function App() {
                         >
                             <p style={{margin: '0 0 5px 0', fontWeight: 'bold', color: '#f0f0f0'}}>{item.original_filename}</p>
                             <p style={styles.historyDetails}>Status: {item.status.replace(/_/g, ' ')}</p>
-                            {(item.status.includes('in_progress') || item.status.includes('interrupted')) && (
+                            {(item.status.includes('in_progress') || item.status.includes('interrupted')) && item.total_commands && item.total_commands > 0 && ( // Ensure total_commands is valid
                                 <p style={styles.historyDetails}>Progress: {item.progress.toFixed(0)}%</p>
                             )}
                             <p style={styles.historyDetails}>Last Update: {new Date(item.last_updated).toLocaleString()}</p>
