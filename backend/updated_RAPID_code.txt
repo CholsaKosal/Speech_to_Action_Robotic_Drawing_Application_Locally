@@ -1,0 +1,217 @@
+MODULE InputDrawing
+    ! Module for handling drawing commands received over socket.
+    ! Protocol v3 (Corrected):
+    ! 1. Python sends Command Case ("0": Move, "1": Draw)
+    ! 2. RAPID sends "R" (Received), then "C" (Controller Ready)
+    ! 3. Data exchange specific to Command Case:
+    !    Case 0 (Move):
+    !        Python sends point "x,y,z" (paper_x, paper_y_side, pen_z_depth)
+    !        RAPID receives, sends "R", moves, sends "D"
+    !    Case 1 (Draw):
+    !        Python sends batch of points "x1,y1,z1,x2,y2,z2,..."
+    !        RAPID receives, sends "R", processes batch, sends "Re"
+    !        Repeats for all batches.
+    !        If RAPID times out waiting for next batch after an "Re", it sends "D".
+
+    VAR num rapid_x; ! For X-offset on paper (corresponds to Python's x_paper)
+    VAR num rapid_y; ! For Y-offset for pen depth (corresponds to Python's z_pen_depth)
+    VAR num rapid_z; ! For Z-offset on paper, side-to-side (corresponds to Python's y_paper_side)
+    VAR num command_case_num; ! Stores the current command case number
+    VAR bool conversion_success_flag; ! Flag to indicate success of string to number conversions
+
+    VAR string received_data_str;
+    VAR socketdev client_socket;
+    VAR socketdev server_socket_listener;
+
+    ! RAPID movement parameters
+    CONST robtarget home1 := [[409.328464947,30.699294352,-350.922061873],[0.999898286,-0.005230998,0.00469865,0.012408784],[0,-1,1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    CONST robtarget WorkSpaceCenter1 := [[75.78,312.76,9.799641871],[0.988089954,-0.00592235,0.00373461,-0.153717993],[0,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+    TASK PERS wobjdata Wobj_1 := [FALSE,TRUE,"",[[87.974520519,-126.434467699,0],[0,0.707106781,0.707106781,0]],[[0,0,0],[1,0,0,0]]];
+!    VAR speeddata v1000 := v1000;
+!    VAR zonedata drawing_zone := z100;
+                VAR string client_addr_var_main; 
+
+    ! Socket communication constants
+    CONST string RESP_R := "R";
+    CONST string RESP_C := "C";
+    CONST string RESP_D := "D";
+    CONST string RESP_RE := "Re";
+    CONST string RESP_E := "E";
+
+    CONST num DRAW_BATCH_RECEIVE_TIMEOUT := 10; ! seconds
+    CONST num ERRNO_SOCK_TIMEOUT := -2; ! Standard ERRNO for socket timeout
+
+    PROC Main()
+        MoveJ home1, v1000, z100, tool2\WObj:=Wobj_1;
+        SocketServerSetup;
+
+        WHILE TRUE DO
+            IF SocketGetStatus(client_socket) = SOCKET_CONNECTED THEN
+                SocketReceive client_socket\Str:=received_data_str \Time:=WAIT_MAX;
+                
+                ConvertSocketStrToCmd(received_data_str);
+                IF conversion_success_flag THEN
+                    SocketSend client_socket\Str:=RESP_R;
+                    SocketSend client_socket\Str:=RESP_C;
+
+                    IF command_case_num = 0 THEN
+                        HandleCase0_MoveSinglePoint;
+                    ELSEIF command_case_num = 1 THEN
+                        HandleCase1_DrawBatchPoints;
+                    ! ELSEIF command_case_num = 2 THEN
+                        ! HandleCase2_FutureImplementation(); ! Example for future
+                    ELSE
+                        SocketSend client_socket\Str:=RESP_E; 
+                    ENDIF
+                ELSE
+                    SocketSend client_socket\Str:=RESP_E; 
+                ENDIF
+            ELSE
+                SocketClose client_socket; 
+                SocketAccept server_socket_listener, client_socket \Time:=WAIT_MAX ; 
+                IF SocketGetStatus(client_socket) <> SOCKET_CONNECTED THEN
+                    WaitTime 1; 
+                ENDIF
+            ENDIF
+        ENDWHILE
+    ERROR
+        IF ERRNO = ERRNO_SOCK_TIMEOUT THEN
+
+        ELSE
+            IF SocketGetStatus(client_socket) = SOCKET_CONNECTED THEN
+                SocketSend client_socket\Str:=RESP_E;
+            ENDIF
+        ENDIF
+    ENDPROC
+
+    PROC SocketServerSetup()
+        VAR string client_addr_var_setup; 
+        SocketClose client_socket; 
+        SocketClose server_socket_listener; 
+        SocketCreate server_socket_listener;
+        SocketBind server_socket_listener, "127.0.0.1", 55000; 
+        ! SocketBind server_socket_listener, "192.168.125.1", 1025; 
+        SocketListen server_socket_listener;
+        SocketAccept server_socket_listener, client_socket \Time:=WAIT_MAX;
+        IF SocketGetStatus(client_socket) <> SOCKET_CONNECTED THEN
+            ! Error accepting: Main loop will handle re-accept attempt
+        ENDIF
+    ENDPROC
+
+    PROC ConvertSocketStrToCmd(string data_str)
+        conversion_success_flag := FALSE;
+        IF StrToVal(data_str, command_case_num) THEN
+            conversion_success_flag := TRUE;
+        ENDIF
+    ENDPROC
+
+    PROC HandleCase0_MoveSinglePoint()
+        SocketReceive client_socket\Str:=received_data_str \Time:=WAIT_MAX;
+        
+        ConvertSocketStrToSinglePoint(received_data_str);
+        IF conversion_success_flag THEN
+            SocketSend client_socket\Str:=RESP_R; 
+            MoveL Offs(WorkSpaceCenter1, rapid_x, rapid_y, rapid_z), v1000, z100, tool2\WObj:=Wobj_1;                
+            SocketSend client_socket\Str:=RESP_D; 
+        ELSE
+            SocketSend client_socket\Str:=RESP_E;
+        ENDIF
+    ERROR
+        IF ERRNO = ERRNO_SOCK_TIMEOUT THEN
+            SocketSend client_socket\Str:=RESP_E;
+        ELSE
+            SocketSend client_socket\Str:=RESP_E;
+        ENDIF
+    ENDPROC
+
+    PROC ConvertSocketStrToSinglePoint(string data_str)
+        VAR num idx1;
+        VAR num idx2;
+        VAR string temp_x_str;
+        VAR string temp_y_side_str;
+        VAR string temp_z_depth_str;
+
+        conversion_success_flag := FALSE; 
+        idx1:=StrFind(data_str,1,",");
+        idx2:=StrFind(data_str,idx1+1,",");
+
+        IF idx1 > 0 AND idx2 > 0 THEN
+            temp_x_str       := StrPart(data_str, 1, idx1-1);
+            temp_y_side_str  := StrPart(data_str, idx1+1, idx2-idx1-1); 
+            temp_z_depth_str := StrPart(data_str, idx2+1, StrLen(data_str)-idx2); 
+            
+            IF StrToVal(temp_x_str, rapid_x) AND 
+               StrToVal(temp_y_side_str, rapid_y) AND
+               StrToVal(temp_z_depth_str, rapid_z) THEN  
+                conversion_success_flag := TRUE;
+            ENDIF
+        ENDIF
+    ENDPROC
+
+    PROC HandleCase1_DrawBatchPoints()
+        VAR string current_batch_str;
+        VAR bool more_batches_expected := TRUE;
+        
+        WHILE more_batches_expected DO
+            SocketReceive client_socket\Str:=current_batch_str \Time:=DRAW_BATCH_RECEIVE_TIMEOUT;
+            
+            ConV2DrawingBatchAndMove(current_batch_str);
+            SocketSend client_socket\Str:=RESP_R; 
+            SocketSend client_socket\Str:=RESP_RE;
+        ENDWHILE
+        
+    ERROR 
+        IF ERRNO = ERRNO_SOCK_TIMEOUT THEN
+            SocketSend client_socket\Str:=RESP_D; 
+            more_batches_expected := FALSE; 
+        ELSE
+            SocketSend client_socket\Str:=RESP_E;
+            more_batches_expected := FALSE; 
+        ENDIF
+    ENDPROC
+
+    PROC ConV2DrawingBatchAndMove(string batch_data_str)
+        VAR num current_pos;
+        VAR num next_comma_idx;
+        VAR string x_str;
+        VAR string y_side_str;
+        VAR string z_depth_str;
+        VAR num temp_x_val;
+        VAR num temp_y_side_val;
+        VAR num temp_z_depth_val;
+        VAR num points_in_batch;
+
+        current_pos := 1;
+        points_in_batch := 0;
+
+        WHILE current_pos <= StrLen(batch_data_str) DO
+            next_comma_idx := StrFind(batch_data_str, current_pos, ",");
+
+            x_str := StrPart(batch_data_str, current_pos, next_comma_idx - current_pos);
+            current_pos := next_comma_idx + 1;
+
+            next_comma_idx := StrFind(batch_data_str, current_pos, ",");
+            y_side_str := StrPart(batch_data_str, current_pos, next_comma_idx - current_pos);
+            current_pos := next_comma_idx + 1;
+
+            IF current_pos <= StrLen(batch_data_str) THEN
+                next_comma_idx := StrFind(batch_data_str, current_pos, ",");
+                IF next_comma_idx > 0 THEN
+                    z_depth_str := StrPart(batch_data_str, current_pos, next_comma_idx - current_pos);
+                    current_pos := next_comma_idx + 1;
+                ELSE 
+                    z_depth_str := StrPart(batch_data_str, current_pos, StrLen(batch_data_str) - current_pos + 1);
+                    current_pos := StrLen(batch_data_str) + 1; 
+                ENDIF
+
+            ENDIF
+            
+            IF StrToVal(x_str, temp_x_val) AND StrToVal(y_side_str, temp_y_side_val) AND StrToVal(z_depth_str, temp_z_depth_val) THEN
+                points_in_batch := points_in_batch + 1;
+                MoveL Offs(WorkSpaceCenter1, temp_x_val, temp_z_depth_val, temp_y_side_val), v1000, z100, tool2\WObj:=Wobj_1;
+ 
+            ENDIF
+        ENDWHILE
+    ENDPROC
+
+ENDMODULE
