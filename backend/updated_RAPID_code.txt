@@ -1,6 +1,6 @@
 MODULE InputDrawing
     ! Module for handling drawing commands received over socket.
-    ! Protocol v3 (Corrected):
+    ! Protocol v3 (Corrected v4):
     ! 1. Python sends Command Case ("0": Move, "1": Draw)
     ! 2. RAPID sends "R" (Received), then "C" (Controller Ready)
     ! 3. Data exchange specific to Command Case:
@@ -27,9 +27,8 @@ MODULE InputDrawing
     CONST robtarget home1 := [[409.328464947,30.699294352,-350.922061873],[0.999898286,-0.005230998,0.00469865,0.012408784],[0,-1,1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
     CONST robtarget WorkSpaceCenter1 := [[75.78,312.76,9.799641871],[0.988089954,-0.00592235,0.00373461,-0.153717993],[0,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
     TASK PERS wobjdata Wobj_1 := [FALSE,TRUE,"",[[87.974520519,-126.434467699,0],[0,0.707106781,0.707106781,0]],[[0,0,0],[1,0,0,0]]];
-!    VAR speeddata v1000 := v1000;
-!    VAR zonedata drawing_zone := z100;
-                VAR string client_addr_var_main; 
+    VAR speeddata drawing_speed := v1000;
+    VAR zonedata drawing_zone := z10;
 
     ! Socket communication constants
     CONST string RESP_R := "R";
@@ -42,6 +41,7 @@ MODULE InputDrawing
     CONST num ERRNO_SOCK_TIMEOUT := -2; ! Standard ERRNO for socket timeout
 
     PROC Main()
+        VAR string client_addr_var_main; ! Moved declaration to top of PROC
         MoveJ home1, v1000, z100, tool2\WObj:=Wobj_1;
         SocketServerSetup;
 
@@ -58,8 +58,6 @@ MODULE InputDrawing
                         HandleCase0_MoveSinglePoint;
                     ELSEIF command_case_num = 1 THEN
                         HandleCase1_DrawBatchPoints;
-                    ! ELSEIF command_case_num = 2 THEN
-                        ! HandleCase2_FutureImplementation(); ! Example for future
                     ELSE
                         SocketSend client_socket\Str:=RESP_E; 
                     ENDIF
@@ -68,7 +66,8 @@ MODULE InputDrawing
                 ENDIF
             ELSE
                 SocketClose client_socket; 
-                SocketAccept server_socket_listener, client_socket \Time:=WAIT_MAX ; 
+                ! client_addr_var_main is already declared at the top of PROC Main
+                SocketAccept server_socket_listener, client_socket \Time:=WAIT_MAX; 
                 IF SocketGetStatus(client_socket) <> SOCKET_CONNECTED THEN
                     WaitTime 1; 
                 ENDIF
@@ -76,8 +75,10 @@ MODULE InputDrawing
         ENDWHILE
     ERROR
         IF ERRNO = ERRNO_SOCK_TIMEOUT THEN
-
+            ! Socket timeout in main receive, likely client disconnected.
+            ! Loop will continue and attempt SocketAccept.
         ELSE
+            ! For other errors, send E if possible.
             IF SocketGetStatus(client_socket) = SOCKET_CONNECTED THEN
                 SocketSend client_socket\Str:=RESP_E;
             ENDIF
@@ -85,7 +86,7 @@ MODULE InputDrawing
     ENDPROC
 
     PROC SocketServerSetup()
-        VAR string client_addr_var_setup; 
+        VAR string client_addr_var_setup; ! Moved declaration to top of PROC
         SocketClose client_socket; 
         SocketClose server_socket_listener; 
         SocketCreate server_socket_listener;
@@ -94,7 +95,7 @@ MODULE InputDrawing
         SocketListen server_socket_listener;
         SocketAccept server_socket_listener, client_socket \Time:=WAIT_MAX;
         IF SocketGetStatus(client_socket) <> SOCKET_CONNECTED THEN
-            ! Error accepting: Main loop will handle re-accept attempt
+            ! Error accepting: Main loop will handle re-accept attempt if initial setup fails.
         ENDIF
     ENDPROC
 
@@ -155,7 +156,7 @@ MODULE InputDrawing
         WHILE more_batches_expected DO
             SocketReceive client_socket\Str:=current_batch_str \Time:=DRAW_BATCH_RECEIVE_TIMEOUT;
             
-            ConV2DrawingBatchAndMove(current_batch_str);
+            ParseAndMoveBatch(current_batch_str); 
             SocketSend client_socket\Str:=RESP_R; 
             SocketSend client_socket\Str:=RESP_RE;
         ENDWHILE
@@ -170,7 +171,7 @@ MODULE InputDrawing
         ENDIF
     ENDPROC
 
-    PROC ConV2DrawingBatchAndMove(string batch_data_str)
+    PROC ParseAndMoveBatch(string batch_data_str) 
         VAR num current_pos;
         VAR num next_comma_idx;
         VAR string x_str;
@@ -180,36 +181,46 @@ MODULE InputDrawing
         VAR num temp_y_side_val;
         VAR num temp_z_depth_val;
         VAR num points_in_batch;
+        VAR bool parse_ok; 
 
         current_pos := 1;
         points_in_batch := 0;
 
         WHILE current_pos <= StrLen(batch_data_str) DO
+            parse_ok := FALSE; 
+            
             next_comma_idx := StrFind(batch_data_str, current_pos, ",");
+            IF next_comma_idx > 0 THEN
+                x_str := StrPart(batch_data_str, current_pos, next_comma_idx - current_pos);
+                current_pos := next_comma_idx + 1;
 
-            x_str := StrPart(batch_data_str, current_pos, next_comma_idx - current_pos);
-            current_pos := next_comma_idx + 1;
-
-            next_comma_idx := StrFind(batch_data_str, current_pos, ",");
-            y_side_str := StrPart(batch_data_str, current_pos, next_comma_idx - current_pos);
-            current_pos := next_comma_idx + 1;
-
-            IF current_pos <= StrLen(batch_data_str) THEN
                 next_comma_idx := StrFind(batch_data_str, current_pos, ",");
                 IF next_comma_idx > 0 THEN
-                    z_depth_str := StrPart(batch_data_str, current_pos, next_comma_idx - current_pos);
+                    y_side_str := StrPart(batch_data_str, current_pos, next_comma_idx - current_pos);
                     current_pos := next_comma_idx + 1;
-                ELSE 
-                    z_depth_str := StrPart(batch_data_str, current_pos, StrLen(batch_data_str) - current_pos + 1);
-                    current_pos := StrLen(batch_data_str) + 1; 
-                ENDIF
 
-            ENDIF
+                    IF current_pos <= StrLen(batch_data_str) THEN
+                        next_comma_idx := StrFind(batch_data_str, current_pos, ",");
+                        IF next_comma_idx > 0 THEN
+                            z_depth_str := StrPart(batch_data_str, current_pos, next_comma_idx - current_pos);
+                            current_pos := next_comma_idx + 1;
+                        ELSE 
+                            z_depth_str := StrPart(batch_data_str, current_pos, StrLen(batch_data_str) - current_pos + 1);
+                            current_pos := StrLen(batch_data_str) + 1; 
+                        ENDIF
+                        
+                        IF StrToVal(x_str, temp_x_val) AND StrToVal(y_side_str, temp_y_side_val) AND StrToVal(z_depth_str, temp_z_depth_val) THEN
+                            parse_ok := TRUE;
+                        ENDIF
+                    ENDIF 
+                ENDIF 
+            ENDIF 
             
-            IF StrToVal(x_str, temp_x_val) AND StrToVal(y_side_str, temp_y_side_val) AND StrToVal(z_depth_str, temp_z_depth_val) THEN
+            IF parse_ok THEN
                 points_in_batch := points_in_batch + 1;
                 MoveL Offs(WorkSpaceCenter1, temp_x_val, temp_z_depth_val, temp_y_side_val), v1000, z100, tool2\WObj:=Wobj_1;
- 
+            ELSE
+                current_pos := StrLen(batch_data_str) + 1; 
             ENDIF
         ENDWHILE
     ENDPROC
