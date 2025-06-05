@@ -10,9 +10,7 @@
 │   ├── rapid_code_for_controlling_the_robot_movement.txt
 │   ├── requirements.txt
 │   ├── robot_interface.py
-│   ├── signature_data.py
 │   └── voice_assistant.py
-├── exclude_patterns.conf
 └── frontend
     ├── README.md
     └── s2a-drawing-ui
@@ -37,7 +35,7 @@
         ├── tsconfig.node.json
         └── vite.config.ts
 
-7 directories, 31 files
+7 directories, 29 files
 
 
 =======================================
@@ -160,8 +158,9 @@ Desktop.ini
 # backend/api_server.py
 from flask import Flask, request, render_template_string, jsonify, send_file
 from flask_socketio import SocketIO, emit
-from robot_interface import RobotInterface
-import config # Now imports SIGNATURE_POINTS_RAW from config
+# The RobotInterface class definition will be included/updated here
+# as it's not a separate immersive in this context.
+import config 
 from image_processing_engine import process_image_to_robot_commands_pipeline, get_canny_edges_array 
 from voice_assistant import transcribe_audio, load_whisper_model, load_llm_model, process_command_with_llm_stream 
 
@@ -187,23 +186,169 @@ logging.getLogger('engineio.server').setLevel(logging.WARNING)
 logging.getLogger('socketio.server').setLevel(logging.WARNING) 
 logging.getLogger('werkzeug').setLevel(logging.WARNING) 
 
+# --- RobotInterface Class Definition (Effectively an update to robot_interface.py) ---
+class RobotInterface:
+    def __init__(self):
+        self.robot_socket = None
+        self.is_connected = False
+        # target_host and target_port will be set dynamically in connect_robot
+        self.current_target_host = None
+        self.current_target_port = None
+
+    def _format_command(self, x, z, y):
+        return f"{x:.2f},{z:.2f},{y:.2f}"
+
+    def connect_robot(self, use_real=False): # Added use_real parameter
+        if self.is_connected:
+            logging.info("Robot already connected.")
+            return True, f"Already connected to {self.current_target_host}:{self.current_target_port}"
+
+        if use_real:
+            host = config.REAL_ROBOT_HOST
+            port = config.REAL_ROBOT_PORT
+            logging.info(f"Attempting to connect to REAL ROBOT at {host}:{port}...")
+        else:
+            host = config.SIMULATION_HOST
+            port = config.SIMULATION_PORT
+            logging.info(f"Attempting to connect to SIMULATION at {host}:{port}...")
+        
+        self.current_target_host = host # Store current target
+        self.current_target_port = port
+
+        try:
+            self.robot_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.robot_socket.settimeout(5) # Connection timeout
+            self.robot_socket.connect((host, port))
+            self.robot_socket.settimeout(None) # Reset to blocking for operations
+            self.is_connected = True
+            logging.info(f"Successfully connected to {host}:{port}.")
+            return True, f"Successfully connected to {('Real Robot' if use_real else 'Simulation')} at {host}:{port}"
+        except socket.error as e:
+            self.robot_socket = None
+            self.is_connected = False
+            self.current_target_host = None
+            self.current_target_port = None
+            logging.error(f"Error connecting to {host}:{port} - {e}")
+            return False, f"Error connecting to {('Real Robot' if use_real else 'Simulation')}: {e}"
+
+    def disconnect_robot(self, graceful=True):
+        if not self.is_connected:
+            logging.info("Robot is not connected.")
+            return True, "Was not connected."
+
+        if graceful:
+            logging.info("Attempting graceful disconnect (going home first)...")
+            if self.is_connected: 
+                home_success, home_msg = self.go_home() 
+                if not home_success:
+                    logging.warning(f"Warning: Failed to go home before disconnecting: {home_msg}")
+                else:
+                    logging.info("Successfully moved to home position.")
+                    logging.info("Waiting for 2 seconds before closing socket...") # Reduced wait time
+                    time.sleep(2)
+            else: 
+                logging.warning("Cannot go home for graceful disconnect, robot is not connected.")
+
+        if self.robot_socket:
+            try:
+                self.robot_socket.close()
+            except socket.error as e:
+                logging.error(f"Error closing socket: {e}")
+            finally:
+                self.robot_socket = None
+                self.is_connected = False
+                logging.info(f"Socket closed. Disconnected from {self.current_target_host}:{self.current_target_port}.")
+                self.current_target_host = None
+                self.current_target_port = None
+        else: 
+            self.is_connected = False 
+            logging.info("No active socket to close. Marked as disconnected.")
+            self.current_target_host = None
+            self.current_target_port = None
+            
+        return True, "Disconnected from robot."
+
+    def send_command_raw(self, command_str):
+        if not self.is_connected or not self.robot_socket:
+            return False, "Not connected"
+        try:
+            logging.info(f"Sending command to {self.current_target_host}: {command_str}")
+            self.robot_socket.sendall(command_str.encode('utf-8'))
+            
+            # Set a timeout for receiving responses
+            self.robot_socket.settimeout(10) # 10-second timeout for R
+            response_r = self.robot_socket.recv(1024).decode('utf-8').strip()
+            logging.info(f"Received R-phase: '{response_r}'")
+            
+            self.robot_socket.settimeout(20) # 20-second timeout for D/E
+            response_d_or_e = self.robot_socket.recv(1024).decode('utf-8').strip()
+            logging.info(f"Received D/E-phase: '{response_d_or_e}'")
+            
+            self.robot_socket.settimeout(None) # Reset to blocking
+
+            if response_r.upper() != "R":
+                return False, f"Robot did not acknowledge (R). Got: {response_r}"
+            if response_d_or_e.upper() == "D":
+                return True, f"Command '{command_str}' successful."
+            elif response_d_or_e.upper() == "E":
+                return False, f"Command '{command_str}' failed: Robot reported error (E)."
+            else:
+                return False, f"Robot did not signal done (D) or error (E). Got: {response_d_or_e}"
+                
+        except socket.timeout:
+            logging.error(f"Socket timeout during send/recv for command: {command_str}")
+            self.disconnect_robot(graceful=False) # Force disconnect on timeout
+            return False, "Socket timeout"
+        except socket.error as e:
+            logging.error(f"Socket error during send/recv: {e}")
+            self.disconnect_robot(graceful=False) # Force disconnect
+            return False, f"Socket error: {e}"
+        except Exception as e:
+            logging.error(f"An unexpected error occurred: {e}")
+            self.disconnect_robot(graceful=False) # Force disconnect
+            return False, f"Unexpected error: {e}"
+
+    def go_home(self):
+        if not self.is_connected:
+            # Attempt to connect using default (simulation) if not connected,
+            # or let the calling function handle pre-connection.
+            # For now, assume connect_robot was called with user's choice.
+            logging.warning("go_home called but robot not connected. Frontend should ensure connection first.")
+            return False, "Cannot go home. Robot not connected."
+        
+        logging.info("Sending robot to home position...")
+        x, z, y = config.ROBOT_HOME_POSITION_PY
+        cmd_str = self._format_command(x, z, y)
+        return self.send_command_raw(cmd_str)
+
+    def move_to_position_py(self, x_py, z_py, y_py):
+        if not self.is_connected:
+            logging.warning("move_to_position_py called but robot not connected.")
+            return False, "Cannot move. Robot not connected."
+
+        cmd_str = self._format_command(x_py, z_py, y_py)
+        return self.send_command_raw(cmd_str)
+# --- End RobotInterface Class ---
+
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_very_secret_key_here!' 
-app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), config.QR_UPLOAD_FOLDER)
-app.config['AUDIO_TEMP_FOLDER_PATH'] = os.path.join(os.path.dirname(__file__), config.AUDIO_TEMP_FOLDER)
+BASE_DIR = os.path.dirname(__file__)
+app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, config.QR_UPLOAD_FOLDER)
+app.config['AUDIO_TEMP_FOLDER_PATH'] = os.path.join(BASE_DIR, config.AUDIO_TEMP_FOLDER)
+ASSETS_DIR = os.path.join(BASE_DIR, config.ASSETS_FOLDER_NAME) 
 
-DRAWING_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "drawing_history.json")
+DRAWING_HISTORY_FILE = os.path.join(BASE_DIR, "drawing_history.json")
 MAX_DRAWING_HISTORY = 5
 
 
-# Create directories if they don't exist
-for folder_path in [app.config['UPLOAD_FOLDER'], app.config['AUDIO_TEMP_FOLDER_PATH']]:
+for folder_path in [app.config['UPLOAD_FOLDER'], app.config['AUDIO_TEMP_FOLDER_PATH'], ASSETS_DIR]:
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
         logging.info(f"Created folder at: {folder_path}")
 
-# Load AI models
+SIGNATURE_IMAGE_FULL_PATH = os.path.join(ASSETS_DIR, config.SIGNATURE_IMAGE_FILENAME)
+
 logging.info("--- Initializing AI Models ---")
 if load_whisper_model(): logging.info("Whisper model loaded successfully.")
 else: logging.error("Whisper model FAILED to load.")
@@ -212,13 +357,14 @@ else: logging.error("LLM model FAILED to load.")
 logging.info("--- AI Model Initialization Complete ---")
 
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', max_http_buffer_size=10 * 1024 * 1024) 
-robot = RobotInterface() 
+robot = RobotInterface() # Instantiate the robot interface
 
 current_upload_session_id = None
 is_drawing_active_flag = False 
 drawing_history = [] 
 active_drawing_session_id = None 
 
+# ... (get_ui_history_summary, save_drawing_history, load_drawing_history, etc. remain the same)
 def get_ui_history_summary(history_list):
     """Converts raw history items to the summary structure expected by UI."""
     ui_summary = []
@@ -330,38 +476,6 @@ def update_drawing_status_in_history(drawing_id, status, current_command_index=N
         return True
     return False
 
-def create_signature_commands():
-    """
-    Generates robot commands for drawing the signature defined in config.SIGNATURE_POINTS_RAW.
-    Returns a list of (X_py, Z_depth_py, Y_py) tuples.
-    """
-    signature_cmds = []
-    if not config.SIGNATURE_POINTS_RAW:
-        return signature_cmds
-
-    # Assuming SIGNATURE_POINTS_RAW is a flat list of (X_robot, Z_robot_side) tuples
-    # representing a single continuous stroke after initial pen down.
-    # Or, if it's structured as multiple strokes, this logic would need adjustment.
-
-    # For the first point: move pen up to it, then pen down
-    first_point_x, first_point_y_side = config.SIGNATURE_POINTS_RAW[0]
-    signature_cmds.append((first_point_x, config.PEN_UP_Z_PY, first_point_y_side))
-    signature_cmds.append((first_point_x, config.PEN_DOWN_Z_PY, first_point_y_side))
-
-    # For subsequent points, keep pen down
-    for i in range(1, len(config.SIGNATURE_POINTS_RAW)):
-        point_x, point_y_side = config.SIGNATURE_POINTS_RAW[i]
-        signature_cmds.append((point_x, config.PEN_DOWN_Z_PY, point_y_side))
-    
-    # After the last point, lift the pen
-    if config.SIGNATURE_POINTS_RAW:
-        last_point_x, last_point_y_side = config.SIGNATURE_POINTS_RAW[-1]
-        signature_cmds.append((last_point_x, config.PEN_UP_Z_PY, last_point_y_side))
-        
-    logging.info(f"Generated {len(signature_cmds)} commands for signature.")
-    return signature_cmds
-
-
 load_drawing_history()
 
 UPLOAD_PAGE_TEMPLATE = """
@@ -407,7 +521,11 @@ def handle_connect():
     global drawing_history, is_drawing_active_flag, active_drawing_session_id
     logging.info(f"Client connected: {request.sid}")
     emit('response', {'data': 'Connected to Python backend!'})
-    emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Connected to robot' if robot.is_connected else 'Not connected to robot'})
+    # Send current robot connection status (might be connected from a previous session if server didn't restart)
+    emit('robot_connection_status', {
+        'success': robot.is_connected, 
+        'message': f"Connected to {robot.current_target_host}" if robot.is_connected else 'Not connected to robot'
+    })
     emit('drawing_history_updated', get_ui_history_summary(drawing_history))
 
     current_active_drawing = get_drawing_from_history(active_drawing_session_id) if active_drawing_session_id else None
@@ -436,19 +554,32 @@ def handle_connect():
 
 @socketio.on('disconnect')
 def handle_disconnect(): logging.info(f"Client disconnected: {request.sid}")
+
 @socketio.on('robot_connect_request')
-def handle_robot_connect_request(json_data):
+def handle_robot_connect_request(data): # Data from client
     global is_drawing_active_flag
-    if is_drawing_active_flag: emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'}); return
-    success, message = robot.connect_robot()
+    if is_drawing_active_flag: 
+        emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'})
+        return
+    
+    # Get the client's preference for real robot vs simulation
+    use_real = data.get('use_real_robot', config.USE_REAL_ROBOT_DEFAULT) # Default from config if not provided
+    logging.info(f"Robot connect request received. use_real_robot: {use_real}")
+    
+    success, message = robot.connect_robot(use_real=use_real)
     emit('robot_connection_status', {'success': success, 'message': message})
+
 @socketio.on('robot_disconnect_request')
 def handle_robot_disconnect_request(json_data):
     global is_drawing_active_flag
-    if is_drawing_active_flag: emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'}); return
+    if is_drawing_active_flag: 
+        emit('robot_connection_status', {'success': robot.is_connected, 'message': 'Cannot connect/disconnect robot while drawing is active.'})
+        return
     success, message = robot.disconnect_robot(graceful=True)
     emit('robot_connection_status', {'success': robot.is_connected, 'message': message if success else "Failed to disconnect"})
 
+# ... (check_and_abort_active_drawing, handle_send_robot_command, etc. remain mostly the same)
+# Minor adjustment in handle_send_robot_command for initial connection if needed.
 def check_and_abort_active_drawing(command_description="Manual command"):
     global active_drawing_session_id, is_drawing_active_flag, drawing_history
     if active_drawing_session_id:
@@ -472,14 +603,24 @@ def handle_send_robot_command(json_data, triggered_by_llm=False):
             return False, "Drawing is active."
     elif not triggered_by_llm : 
         check_and_abort_active_drawing(f"Manual command '{json_data.get('type', 'N/A')}'")
+    
     command_type = json_data.get('type', 'raw')
     command_str = json_data.get('command_str') 
+    
+    # If robot is not connected and command is not 'go_home', attempt connection
+    # using the default from config, as specific choice is made via 'robot_connect_request'
     if not robot.is_connected and command_type not in ['go_home']: 
-        conn_success, conn_message = robot.connect_robot()
+        logging.info("Robot not connected. Attempting to connect with default settings before sending command.")
+        # For direct commands like this, it might be better to enforce connection first via UI
+        # Or, if we want to auto-connect, decide which target (real/sim) to use.
+        # For now, let's assume the user should connect first via the dedicated button.
+        # If RobotInterface.connect_robot() is called without 'use_real', it uses its internal default.
+        conn_success, conn_message = robot.connect_robot(use_real=config.USE_REAL_ROBOT_DEFAULT) # Use server default
         if not conn_success:
             if not triggered_by_llm: emit('command_response', {'success': False, 'message': f'Robot not connected & connection failed: {conn_message}', 'command_sent': command_type})
             return False, f'Robot not connected & connection failed: {conn_message}' 
-        emit('robot_connection_status', {'success': True, 'message': conn_message})
+        emit('robot_connection_status', {'success': True, 'message': conn_message}) # Update client
+        
     success, message = False, "Invalid command type"
     actual_command_sent = command_type
     if command_type == 'go_home':
@@ -493,10 +634,12 @@ def handle_send_robot_command(json_data, triggered_by_llm=False):
     elif command_type == 'raw' and command_str:
         success, message = robot.send_command_raw(command_str)
         actual_command_sent = command_str
+        
     if not triggered_by_llm: emit('command_response', {'success': success, 'message': message, 'command_sent': actual_command_sent})
-    if not robot.is_connected: emit('robot_connection_status', {'success': False, 'message': 'Disconnected'})
+    if not robot.is_connected: emit('robot_connection_status', {'success': False, 'message': 'Disconnected'}) # Update if disconnect happened
     return success, message 
 
+# ... (handle_direct_image_upload, handle_audio_chunk, handle_submit_text_to_llm, etc. remain the same)
 @socketio.on('direct_image_upload')
 def handle_direct_image_upload(data):
     global active_drawing_session_id
@@ -584,28 +727,39 @@ def handle_submit_text_to_llm(data):
 def handle_send_custom_coordinates_event(data):
     logging.info(f"--- API: Event 'send_custom_coordinates' RECEIVED with data: {data} ---")
     check_and_abort_active_drawing("Manual coordinate input")
-    if not robot.is_connected: emit('command_response', {'success': False, 'message': 'Robot not connected.'}); return
+    if not robot.is_connected: 
+        emit('command_response', {'success': False, 'message': 'Robot not connected.'})
+        return
     try:
         x_py, z_py, y_py = float(data.get('x_py')), float(data.get('z_py')), float(data.get('y_py'))
         success, message = robot.move_to_position_py(x_py, z_py, y_py)
         emit('command_response', {'success': success, 'message': message, 'command_sent': f'Custom Coords: X={x_py}, Depth={z_py}, Side={y_py}'})
         if not robot.is_connected: emit('robot_connection_status', {'success': False, 'message': 'Disconnected'})
-    except Exception as e: logging.error(f"API Error in handle_send_custom_coordinates_event: {e}", exc_info=True); emit('command_response', {'success': False, 'message': f'Server error: {e}'})
+    except Exception as e: 
+        logging.error(f"API Error in handle_send_custom_coordinates_event: {e}", exc_info=True)
+        emit('command_response', {'success': False, 'message': f'Server error: {e}'})
 
 @socketio.on('request_threshold_preview')
 def handle_request_threshold_preview(data):
     logging.info(f"--- API: Event 'request_threshold_preview' RECEIVED with data: {data} ---")
     filepath, t1, t2 = data.get('filepath'), data.get('t1'), data.get('t2')
-    if not filepath or not os.path.exists(filepath) or t1 is None or t2 is None: emit('threshold_preview_image_response', {'error': 'Invalid data for preview.'}); return
+    if not filepath or not os.path.exists(filepath) or t1 is None or t2 is None: 
+        emit('threshold_preview_image_response', {'error': 'Invalid data for preview.'})
+        return
     try:
         edges_array = get_canny_edges_array(filepath, int(t1), int(t2)) 
         if edges_array is not None:
-            _, buffer = cv2.imencode('.png', edges_array); img_base64 = base64.b64encode(buffer).decode('utf-8')
+            _, buffer = cv2.imencode('.png', edges_array)
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
             emit('threshold_preview_image_response', {'image_base64': img_base64})
-        else: emit('threshold_preview_image_response', {'error': 'Failed to generate preview.'})
-    except Exception as e: logging.error(f"API Error generating threshold preview: {e}", exc_info=True); emit('threshold_preview_image_response', {'error': f'Server error: {e}'})
+        else: 
+            emit('threshold_preview_image_response', {'error': 'Failed to generate preview.'})
+    except Exception as e: 
+        logging.error(f"API Error generating threshold preview: {e}", exc_info=True)
+        emit('threshold_preview_image_response', {'error': f'Server error: {e}'})
 
-
+# _execute_drawing_commands and subsequent functions remain the same as the previous version
+# (process_image_for_drawing, resume_drawing_request, restart_drawing_request)
 def _execute_drawing_commands(drawing_session_id_to_execute):
     global is_drawing_active_flag, active_drawing_session_id, drawing_history
 
@@ -621,24 +775,34 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
     active_drawing_session_id = drawing_session_id_to_execute 
     
     original_filename = session_data['original_filename']
-    # Important: Make a copy of the commands list if it might be modified (e.g. by appending signature)
-    # For now, assuming robot_commands_tuples in history is the complete list for that specific drawing instance.
-    commands_to_execute = list(session_data['robot_commands_tuples']) # Use a copy
+    commands_to_execute = list(session_data['robot_commands_tuples']) 
 
-    # Check if signature needs to be appended (only for new or restarted image drawings, not for signature-only drawings)
-    # This logic might need refinement based on how you differentiate a "signature-only" drawing if that's a feature.
-    # For now, assume signature is appended to image drawings.
-    if session_data.get('is_image_drawing', True): # Add a flag to session_data if needed
-        signature_robot_commands = create_signature_commands()
-        if signature_robot_commands:
-            logging.info(f"Appending {len(signature_robot_commands)} signature commands to drawing '{original_filename}'.")
-            commands_to_execute.extend(signature_robot_commands)
-            # Update total_commands in the session_data if signature is added
-            session_data['total_commands'] = len(commands_to_execute) 
-            # No need to save history here, it will be saved before the first command of the main drawing
+    if session_data.get('is_image_drawing', True): 
+        if not os.path.exists(SIGNATURE_IMAGE_FULL_PATH):
+            logging.error(f"Signature image not found at {SIGNATURE_IMAGE_FULL_PATH}. Skipping signature.")
+            emit('command_response', {'success': False, 'message': f"Signature image missing. Drawing '{original_filename}' without signature."})
+        else:
+            logging.info(f"Processing signature image from: {SIGNATURE_IMAGE_FULL_PATH}")
+            try:
+                signature_robot_commands = process_image_to_robot_commands_pipeline(
+                    SIGNATURE_IMAGE_FULL_PATH, 
+                    config.SIGNATURE_CANNY_THRESHOLD1, 
+                    config.SIGNATURE_CANNY_THRESHOLD2,
+                    optimize=True 
+                )
+                if signature_robot_commands:
+                    logging.info(f"Appending {len(signature_robot_commands)} signature commands (from image) to drawing '{original_filename}'.")
+                    commands_to_execute.extend(signature_robot_commands)
+                    session_data['total_commands'] = len(commands_to_execute) 
+                else:
+                    logging.warning(f"No commands generated from signature image '{config.SIGNATURE_IMAGE_FILENAME}'. Drawing without signature.")
+                    emit('command_response', {'success': False, 'message': f"Could not process signature image. Drawing '{original_filename}' without signature."})
+            except Exception as sig_e:
+                logging.error(f"Error processing signature image '{config.SIGNATURE_IMAGE_FILENAME}': {sig_e}", exc_info=True)
+                emit('command_response', {'success': False, 'message': f"Error processing signature image. Drawing '{original_filename}' without signature."})
 
     start_index = session_data['current_command_index']
-    total_commands = session_data['total_commands'] # Use the potentially updated total_commands
+    total_commands = session_data['total_commands'] 
     
     logging.info(f"Executing/Resuming drawing '{original_filename}' (ID: {active_drawing_session_id}) from command {start_index + 1}/{total_commands}")
     update_drawing_status_in_history(active_drawing_session_id, "in_progress" if start_index == 0 else "in_progress_resumed", start_index)
@@ -647,7 +811,15 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
 
     try:
         if not robot.is_connected:
-            conn_success, conn_msg = robot.connect_robot()
+            # Attempt to connect using the choice made by the user during the initial "Connect" action
+            # This assumes robot.current_target_host/port are set if a previous connection attempt was made.
+            # If they are None, it means no connection attempt was made, so use default.
+            use_real_for_reconnect = config.USE_REAL_ROBOT_DEFAULT
+            if robot.current_target_host == config.REAL_ROBOT_HOST:
+                 use_real_for_reconnect = True
+            
+            logging.info(f"Robot not connected. Attempting to reconnect for drawing (use_real={use_real_for_reconnect})...")
+            conn_success, conn_msg = robot.connect_robot(use_real=use_real_for_reconnect)
             if not conn_success:
                 emit('command_response', {'success': False, 'message': f"Robot connection failed: {conn_msg}"})
                 is_drawing_active_flag = False; active_drawing_session_id = None
@@ -678,7 +850,7 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
             
             success, msg = robot.send_command_raw(formatted_cmd_str)
             if not success:
-                is_drawing_active_flag = False; active_drawing_session_id = None
+                is_drawing_active_flag = False; # Keep active_drawing_session_id for resume
                 update_drawing_status_in_history(drawing_session_id_to_execute, "interrupted", i)
                 emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' interrupted. Ready to resume.", 'resumable': True, 'drawing_id': drawing_session_id_to_execute, 'original_filename': original_filename, 'progress': (i / total_commands) * 100 if total_commands > 0 else 0})
                 emit('drawing_history_updated', get_ui_history_summary(drawing_history))
@@ -687,22 +859,28 @@ def _execute_drawing_commands(drawing_session_id_to_execute):
             
         update_drawing_status_in_history(drawing_session_id_to_execute, "completed", total_commands)
         emit('command_response', {'success': True, 'message': f"Sent all {total_commands} commands for '{original_filename}'."})
-        emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete.", 'resumable': False, 'drawing_id': drawing_session_id_to_execute})
+        emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' complete.", 'resumable': False, 'drawing_id': drawing_session_id_to_execute}) # Ensure active:False is sent
         emit('drawing_history_updated', get_ui_history_summary(drawing_history))
         robot.go_home() 
-        is_drawing_active_flag = False; active_drawing_session_id = None
+        is_drawing_active_flag = False
+        active_drawing_session_id = None # Clear active session ID on completion
 
     except Exception as e:
         logging.error(f"Error during drawing execution for '{original_filename}': {e}", exc_info=True)
-        is_drawing_active_flag = False; active_drawing_session_id = None
+        is_drawing_active_flag = False # Keep active_drawing_session_id for resume
         current_idx = session_data.get('current_command_index', start_index) 
         update_drawing_status_in_history(drawing_session_id_to_execute, "interrupted_error", current_idx)
         emit('command_response', {'success': False, 'message': f"Error during drawing: {e}"})
         emit('drawing_status_update', {'active': False, 'message': f"Drawing of '{original_filename}' failed with server error. Ready to resume.", 'resumable': True, 'drawing_id': drawing_session_id_to_execute, 'original_filename': original_filename, 'progress': (current_idx / total_commands) * 100 if total_commands > 0 else 0})
         emit('drawing_history_updated', get_ui_history_summary(drawing_history))
     finally:
-        if not is_drawing_active_flag and active_drawing_session_id == drawing_session_id_to_execute:
-            active_drawing_session_id = None 
+        # This check is important: only clear active_drawing_session_id if the drawing truly finished or was unrecoverably aborted.
+        # If it was interrupted for resume, active_drawing_session_id should persist.
+        # The 'completed' status or an explicit abort signal should lead to clearing it.
+        current_status = get_drawing_from_history(drawing_session_id_to_execute)
+        if current_status and current_status['status'] == 'completed':
+             active_drawing_session_id = None
+        # If is_drawing_active_flag is false but it wasn't a clean completion, active_drawing_session_id might still be set for resume.
         logging.info(f"Drawing execution for '{original_filename}' (ID: {drawing_session_id_to_execute}) ended. Active flag: {is_drawing_active_flag}, Active ID: {active_drawing_session_id}")
 
 
@@ -734,23 +912,20 @@ def handle_process_image_for_drawing(data):
             emit('drawing_status_update', {'active': False, 'message': f"Failed to process '{original_filename}'.", 'resumable': False})
             return
         
-        # Signature commands are now added in _execute_drawing_commands
-        # num_cmds = len(robot_commands_tuples) # This will be updated if signature is added
-
         drawing_id = f"draw_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         
         new_drawing_data = {
             'drawing_id': drawing_id,
             'filepath_on_server': filepath_on_server,
             'original_filename': original_filename,
-            'robot_commands_tuples': robot_commands_tuples, # Image commands only at this stage
+            'robot_commands_tuples': robot_commands_tuples, 
             'current_command_index': 0,
-            'total_commands': len(robot_commands_tuples), # Initial total before signature
+            'total_commands': len(robot_commands_tuples), 
             'canny_t1': canny_t1,
             'canny_t2': canny_t2,
             'status': 'pending_execution', 
             'timestamp': datetime.now().isoformat(),
-            'is_image_drawing': True # Flag to indicate this includes an image
+            'is_image_drawing': True 
         }
         add_or_update_drawing_in_history(new_drawing_data) 
         
@@ -815,6 +990,7 @@ def handle_restart_drawing_request(data):
         logging.info(f"Restarting drawing of '{session_to_restart['original_filename']}' from the beginning.")
         session_to_restart['current_command_index'] = 0
         session_to_restart['status'] = 'pending_restart' 
+        
         add_or_update_drawing_in_history(session_to_restart.copy()) 
 
         emit('drawing_status_update', {
@@ -838,10 +1014,11 @@ if __name__ == '__main__':
     logging.info(f"Starting Python backend server (SocketIO with Flask) on port {server_port}...")
     socketio.run(app, host='0.0.0.0', port=server_port, debug=True, use_reloader=False)
 
-
 --- END OF FILE: backend/api_server.py ---
 --- START OF FILE: backend/config.py ---
 # backend/config.py
+
+import os 
 
 # --- Robot Connection Settings ---
 SIMULATION_HOST = '127.0.0.1'
@@ -849,8 +1026,11 @@ SIMULATION_PORT = 55000
 REAL_ROBOT_HOST = '192.168.125.1' # Your actual robot IP
 REAL_ROBOT_PORT = 1025          # Your actual robot port
 
-# Set True to use real robot, False for simulation
-USE_REAL_ROBOT = False
+# The USE_REAL_ROBOT constant is now primarily a server-side default
+# if the client doesn't specify. The client's choice will take precedence.
+# It can also be used by other backend modules if they need a default
+# robot type assumption without client input.
+USE_REAL_ROBOT_DEFAULT = False # Default to simulation if not specified by client
 
 # --- QR Code Upload Settings ---
 QR_UPLOAD_FOLDER = 'qr_uploads' # Relative to the backend directory
@@ -883,17 +1063,20 @@ MIN_CONTOUR_LENGTH_PX = 50 # Minimum contour length in pixels to consider from i
 DEFAULT_CANNY_THRESHOLD1 = 50
 DEFAULT_CANNY_THRESHOLD2 = 150
 
-# --- Signature Points ---
-# Import from the separate signature_data.py file
-try:
-    from .signature_data import SIGNATURE_POINTS_RAW
-    # If you used SIGNATURE_STROKES_RAW, import that instead:
-    # from .signature_data import SIGNATURE_STROKES_RAW
-except ImportError:
-    # Fallback or error handling if the file/variable isn't found
-    SIGNATURE_POINTS_RAW = () # Default to empty tuple if import fails
-    # SIGNATURE_STROKES_RAW = [] 
-    print("WARNING: Could not import signature data. Signature will be empty.")
+# --- Signature Settings ---
+# Path to the signature image, relative to the backend directory
+ASSETS_FOLDER_NAME = 'assets'
+SIGNATURE_IMAGE_FILENAME = "signature.jpg" # Ensure this file is in backend/assets/
+
+# Canny thresholds for processing the signature image.
+# These can be tuned for optimal results with your specific signature.jpg
+SIGNATURE_CANNY_THRESHOLD1 = 50
+SIGNATURE_CANNY_THRESHOLD2 = 150
+# You might want to make these thresholds different from the default image processing
+# if your signature image requires different settings for optimal edge detection.
+# For example, if the signature is very clean, lower thresholds might be better.
+# SIGNATURE_CANNY_THRESHOLD1 = 30
+# SIGNATURE_CANNY_THRESHOLD2 = 100
 
 
 # --- Temporary Audio File Settings ---
@@ -901,7 +1084,8 @@ AUDIO_TEMP_FOLDER = 'audio_tmp' # Relative to the backend directory
 
 # --- LLM Settings ---
 # IMPORTANT: Replace with the actual filename of your downloaded GGUF model
-LLM_MODEL_FILENAME = "deepseek-llm-7b-chat.Q4_K_M.gguf"
+# LLM_MODEL_FILENAME = "deepseek-llm-7b-chat.Q4_K_M.gguf"
+LLM_MODEL_FILENAME = ""
 LLM_MAX_TOKENS = 512 # Max tokens for LLM response
 LLM_TEMPERATURE = 0.3 # Temperature for LLM response
 LLM_N_CTX = 2048 # Context window size for the LLM
@@ -2617,26 +2801,6 @@ class RobotInterface:
 # Main guard for direct testing (if __name__ == '__main__') remains the same
 # ... (previous if __name__ == '__main__' block)
 --- END OF FILE: backend/robot_interface.py ---
---- START OF FILE: backend/signature_data.py ---
-# backend/signature_data.py
-
-# Define the raw X, Z_side coordinates for the signature.
-# The actual pen height (depth) will be handled by PEN_UP_Z_PY and PEN_DOWN_Z_PY from config.py
-# when generating the full robot commands.
-
-# If your signature is one continuous set of points after an initial pen down:
-SIGNATURE_POINTS_RAW = ((46.94,  -119.18), (46.94,-119.18), (47.06,-119.06), (47.41,-119.06), (47.53,-119.18), (47.29,-119.41), (47.29,-119.53), (47.18,-119.65), (47.18,-119.76), (47.06,-119.88), (47.06,-120.0), (46.94,-120.12), (46.94,-120.24), (46.82,-120.35), (46.59,-120.12), (46.71,-120.0), (46.71,-119.76), (46.82,-119.65), (46.82,-119.53), (46.94,-119.41), (46.94,  -119.41), (47.53,  -119.06), (47.53,-119.06), (47.53,-119.29), (47.29,-119.53), (47.29,-119.65), (47.18,-119.76), (47.18,-119.88), (47.06,-120.0), (47.06,-120.12), (46.94,-120.24), (46.94,-120.35), (46.71,-120.35), (46.71,-120.24), (46.59,-120.12), (46.71,-120.0), (46.71,-119.76), (46.82,-119.65), (46.82,-119.53), (46.94,-119.41), (46.94,-119.06), (47.53,-119.06), (47.65,-118.94), (47.65,  -118.94), (46.35,  -118.94), (46.35,-118.94), (46.47,-119.06), (46.59,-119.06), (46.59,-119.29), (46.47,-119.41), (46.47,-119.65), (46.24,-119.65), (46.24,-119.53), (46.12,-119.41), (46.12,-119.29), (46.0,-119.18), (46.0,-118.94), (46.0,  -118.94), (46.0,  -119.06), (46.0,-119.06), (46.12,-118.94), (46.35,-118.94), (46.59,-119.18), (46.59,-119.29), (46.47,-119.41), (46.47,-119.53), (46.35,-119.65), (46.24,-119.53), (46.24,-119.41), (46.0,-119.18), (46.0,  -119.18), (50.71,  -113.65), (50.71,-113.65), (50.59,-113.76), (50.47,-113.76), (50.35,-113.88), (50.24,-113.88), (50.12,-114.0), (50.0,-114.0), (49.65,-114.35), (49.53,-114.35), (48.71,-115.18), (48.71,-115.29), (48.35,-115.65), (48.35,-115.76), (48.24,-115.88), (48.24,-116.0), (48.12,-116.12), (48.12,-116.24), (48.0,-116.35), (48.0,-116.47), (47.88,-116.59), (47.88,-116.71), (47.76,-116.82), (47.76,-117.18), (47.53,-117.41), (47.53,-117.76), (47.41,-117.88), (47.41,-118.12), (47.29,-118.24), (47.29,-118.47), (47.18,-118.59), (47.18,-118.71), (47.88,-118.71), (47.88,-118.59), (48.12,-118.35), (48.12,-118.24), (48.24,-118.12), (48.24,-118.0), (48.47,-117.76), (48.47,-117.65), (48.59,-117.53), (48.59,-117.41), (48.82,-117.18), (48.82,-117.06), (48.94,-116.94), (48.94,-116.82), (49.18,-116.59), (49.18,-116.47), (49.41,-116.24), (49.41,-116.12), (49.53,-116.0), (49.53,-115.88), (49.76,-115.65), (49.76,-115.53), (49.88,-115.41), (49.88,-115.29), (50.12,-115.06), (50.12,-114.94), (50.35,-114.71), (50.35,-114.59), (50.47,-114.47), (50.47,-114.35), (50.71,-114.12), (50.71,-114.0), (50.82,-113.88), (50.47,-114.24), (50.47,-114.35), (50.35,-114.47), (50.35,-114.59), (50.12,-114.82), (50.12,-114.94), (49.88,-115.18), (49.88,-115.29), (49.76,-115.41), (49.76,-115.53), (49.53,-115.76), (49.53,-115.88), (49.41,-116.0), (49.41,-116.12), (49.18,-116.35), (49.18,-116.47), (48.94,-116.71), (48.94,-116.82), (48.82,-116.94), (48.82,-117.06), (48.59,-117.29), (48.59,-117.41), (48.47,-117.53), (48.47,-117.65), (48.24,-117.88), (48.24,-118.0), (48.12,-118.12), (48.12,-118.24), (47.88,-118.47), (47.88,-118.59), (47.76,-118.71), (47.29,-118.71), (47.18,-118.59), (47.29,-118.47), (47.29,-118.24), (47.41,-118.12), (47.41,-117.88), (47.53,-117.76), (47.53,-117.53), (47.65,-117.41), (47.65,-117.29), (47.76,-117.18), (47.76,-116.94), (47.88,-116.82), (47.88,-116.71), (48.0,-116.59), (48.0,-116.47), (48.12,-116.35), (48.12,-116.24), (48.24,-116.12), (48.24,-116.0), (48.35,-115.88), (48.35,-115.76), (48.71,-115.41), (48.71,-115.29), (49.65,-114.35), (49.76,-114.35), (50.12,-114.0), (50.24,-114.0), (50.47,-113.76), (50.59,-113.76), (50.71,-113.65), (50.94,-113.65), (50.94,  -113.65), (51.88,  -112.24), (51.88,-112.24), (51.65,-112.47), (51.65,-112.59), (51.53,-112.71), (51.53,-112.82), (51.29,-113.06), (51.29,-113.18), (51.06,-113.18), (50.94,-113.29), (50.71,-113.29), (50.59,-113.41), (50.47,-113.41), (50.35,-113.53), (50.24,-113.53), (50.0,-113.76), (49.88,-113.76), (49.65,-114.0), (49.53,-114.0), (48.24,-115.29), (48.24,-115.41), (48.12,-115.53), (48.12,-115.65), (47.88,-115.88), (47.88,-116.0), (47.76,-116.12), (47.76,-116.35), (47.65,-116.47), (47.65,-116.59), (47.41,-116.82), (47.41,-117.06), (47.29,-117.18), (47.29,-117.41), (47.18,-117.53), (47.18,-117.65), (47.06,-117.76), (47.06,-118.0), (46.94,-118.12), (46.94,-118.35), (46.82,-118.47), (46.82,-118.71), (46.47,-118.71), (46.35,-118.59), (46.0,-118.59), (45.88,-118.47), (45.76,-118.47), (45.76,-118.35), (45.65,-118.24), (45.65,-118.12), (45.53,-118.0), (45.41,-118.0), (45.29,-118.12), (45.29,-118.35), (45.41,-118.47), (45.41,-118.59), (45.53,-118.71), (45.53,-118.82), (45.65,-118.94), (45.65,-119.18), (45.76,-119.29), (45.76,-119.41), (45.88,-119.53), (45.88,-119.65), (46.12,-119.88), (46.12,-120.0), (46.24,-120.12), (46.24,-120.47), (46.12,-120.59), (46.12,-120.71), (46.0,-120.82), (46.0,-121.06), (45.88,-121.18), (45.88,-121.53), (45.76,-121.65), (45.76,-122.0), (45.65,-122.12), (45.65,-122.24), (45.53,-122.35), (45.53,-122.59), (45.41,-122.71), (45.41,-122.94), (45.29,-123.06), (45.29,-123.29), (45.18,-123.41), (45.18,-123.53), (45.06,-123.65), (45.06,-123.76), (44.94,-123.88), (44.94,-124.0), (44.82,-124.12), (44.82,-124.24), (44.71,-124.35), (44.71,-124.47), (44.59,-124.59), (44.59,-124.71), (44.71,-124.82), (44.82,-124.82), (44.94,-124.71), (44.94,-124.59), (45.06,-124.47), (45.06,-124.35), (45.18,-124.24), (45.18,-124.12), (45.29,-124.0), (45.29,-123.88), (45.41,-123.76), (45.41,-123.65), (45.53,-123.53), (45.53,-123.41), (45.65,-123.29), (45.65,-123.18), (45.76,-123.06), (45.76,-122.94), (45.88,-122.82), (45.88,-122.71), (46.0,-122.59), (46.0,-122.35), (46.12,-122.24), (46.12,-122.12), (46.35,-121.88), (46.35,-121.76), (46.59,-121.53), (46.59,-121.41), (46.71,-121.29), (46.71,-121.18), (47.06,-121.18), (47.06,-121.29), (47.41,-121.65), (47.53,-121.65), (47.88,-122.0), (48.0,-122.0), (48.12,-122.12), (48.24,-122.12), (48.35,-122.24), (48.47,-122.24), (48.59,-122.35), (48.71,-122.35), (48.94,-122.59), (49.41,-122.59), (49.53,-122.71), (50.82,-122.71), (50.94,-122.59), (51.29,-122.59), (51.41,-122.47), (51.65,-122.47), (51.76,-122.35), (51.88,-122.35), (52.0,-122.24), (52.12,-122.24), (52.24,-122.12), (52.35,-122.12), (52.47,-122.0), (52.59,-122.0), (52.71,-121.88), (52.82,-121.88), (53.06,-121.65), (53.18,-121.65), (53.41,-121.41), (53.53,-121.41), (53.88,-121.06), (54.0,-121.06), (55.18,-119.88), (55.41,-119.88), (55.76,-120.24), (55.88,-120.24), (56.0,-120.12), (56.12,-120.12), (56.71,-119.53), (56.71,-119.41), (56.94,-119.18), (56.94,-119.06), (57.06,-118.94), (57.29,-118.94), (57.41,-119.06), (57.88,-119.06), (58.0,-119.18), (59.18,-119.18), (59.18,-119.41), (59.06,-119.53), (59.06,-119.65), (58.82,-119.88), (58.82,-120.0), (58.71,-120.12), (58.71,-120.24), (58.82,-120.35), (58.94,-120.35), (59.06,-120.24), (59.06,-120.12), (59.18,-120.24), (59.29,-120.12), (59.41,-120.12), (59.53,-120.24), (59.76,-120.24), (59.88,-120.12), (60.24,-120.12), (60.35,-120.0), (60.82,-120.0), (60.94,-119.88), (61.18,-119.88), (61.29,-119.76), (61.41,-119.76), (61.53,-119.65), (61.76,-119.65), (61.88,-119.53), (62.0,-119.53), (62.12,-119.41), (62.35,-119.41), (62.59,-119.18), (62.94,-119.18), (62.94,-119.41), (62.82,-119.53), (62.82,-119.88), (63.18,-120.24), (63.41,-120.24), (64.24,-119.41), (64.24,-119.29), (64.35,-119.18), (64.35,-119.06), (64.47,-118.94), (64.71,-118.94), (64.82,-119.06), (65.29,-119.06), (65.41,-119.18), (66.59,-119.18), (66.59,-119.41), (66.35,-119.65), (66.35,-119.76), (66.24,-119.88), (66.24,-120.0), (66.0,-120.24), (66.0,-120.47), (65.88,-120.59), (65.88,-120.94), (66.24,-121.29), (66.71,-121.29), (66.82,-121.18), (67.06,-121.18), (67.18,-121.06), (67.41,-121.06), (67.65,-120.82), (67.76,-120.82), (67.88,-120.71), (68.0,-120.71), (68.12,-120.59), (68.24,-120.59), (68.35,-120.47), (68.47,-120.47), (68.71,-120.24), (68.82,-120.24), (68.94,-120.12), (69.06,-120.12), (69.18,-120.0), (69.29,-120.0), (69.53,-119.76), (69.65,-119.76), (70.0,-119.41), (70.12,-119.41), (70.35,-119.18), (70.47,-119.18), (70.59,-119.06), (70.71,-119.18), (70.71,-119.53), (70.82,-119.65), (70.82,-119.76), (70.94,-119.88), (71.06,-119.88), (71.18,-120.0), (71.76,-120.0), (71.88,-119.88), (72.24,-119.88), (72.35,-119.76), (72.59,-119.76), (72.71,-119.65), (72.82,-119.65), (72.94,-119.53), (73.06,-119.53), (73.18,-119.41), (73.29,-119.41), (73.41,-119.29), (73.65,-119.29), (73.76,-119.18), (73.76,-119.76), (73.65,-119.88), (73.65,-120.35), (73.53,-120.35), (73.29,-120.59), (73.18,-120.59), (73.06,-120.71), (73.06,-120.82), (73.29,-121.06), (73.41,-121.06), (73.88,-120.59), (73.88,-120.47), (74.0,-120.47), (74.12,-120.35), (74.24,-120.35), (74.35,-120.24), (74.47,-120.24), (74.59,-120.12), (74.71,-120.12), (74.82,-120.0), (75.06,-120.0), (75.18,-119.88), (75.29,-119.88), (75.41,-119.76), (75.53,-119.76), (75.65,-119.65), (75.76,-119.65), (75.88,-119.53), (76.12,-119.53), (76.24,-119.41), (76.35,-119.41), (76.47,-119.29), (76.59,-119.29), (76.71,-119.18), (76.94,-119.18), (76.94,-119.41), (76.71,-119.65), (76.71,-119.76), (76.59,-119.88), (76.59,-120.0), (76.35,-120.24), (76.35,-120.47), (76.24,-120.59), (76.24,-120.94), (76.59,-121.29), (77.06,-121.29), (77.18,-121.18), (77.41,-121.18), (77.53,-121.06), (77.76,-121.06), (78.0,-120.82), (78.12,-120.82), (78.24,-120.71), (78.35,-120.71), (78.47,-120.59), (78.59,-120.59), (78.71,-120.47), (78.82,-120.47), (79.06,-120.24), (79.18,-120.24), (79.29,-120.12), (79.41,-120.12), (79.53,-120.0), (79.65,-120.0), (79.88,-119.76), (80.0,-119.76), (80.35,-119.41), (80.47,-119.41), (80.71,-119.18), (80.82,-119.18), (81.06,-118.94), (81.18,-118.94), (81.41,-118.71), (81.41,-118.59), (81.29,-118.47), (81.18,-118.59), (81.06,-118.59), (80.82,-118.82), (80.71,-118.82), (80.47,-119.06), (80.35,-119.06), (80.12,-119.29), (80.0,-119.29), (79.76,-119.53), (79.65,-119.53), (79.41,-119.76), (79.29,-119.76), (79.18,-119.88), (79.06,-119.88), (78.82,-120.12), (78.71,-120.12), (78.59,-120.24), (78.47,-120.24), (78.24,-120.47), (78.12,-120.47), (78.0,-120.59), (77.88,-120.59), (77.76,-120.71), (77.41,-120.71), (77.29,-120.82), (77.06,-120.82), (76.94,-120.94), (76.59,-120.94), (76.59,-120.71), (76.71,-120.59), (76.71,-120.24), (76.82,-120.12), (76.82,-120.0), (77.06,-119.76), (77.06,-119.65), (77.18,-119.53), (77.18,-119.41), (77.29,-119.29), (77.29,-119.18), (77.53,-118.94), (77.53,-118.82), (77.65,-118.71), (77.41,-118.47), (77.29,-118.59), (77.18,-118.59), (77.06,-118.71), (76.94,-118.71), (76.82,-118.82), (76.71,-118.82), (76.59,-118.94), (76.47,-118.94), (76.35,-119.06), (76.24,-119.06), (76.12,-119.18), (76.0,-119.18), (75.88,-119.29), (75.65,-119.29), (75.53,-119.41), (75.41,-119.41), (75.29,-119.53), (75.18,-119.53), (75.06,-119.65), (74.94,-119.65), (74.82,-119.76), (74.71,-119.76), (74.59,-119.88), (74.35,-119.88), (74.24,-120.0), (74.12,-120.0), (74.12,-119.29), (74.24,-119.18), (74.24,-118.82), (74.35,-118.71), (74.35,-118.59), (74.47,-118.47), (74.47,-118.35), (74.71,-118.12), (74.94,-118.12), (74.94,-118.24), (75.18,-118.47), (75.41,-118.24), (75.41,-118.12), (75.06,-117.76), (74.71,-117.76), (74.47,-118.0), (74.35,-118.0), (74.24,-118.12), (74.24,-118.24), (74.12,-118.35), (74.12,-118.47), (74.0,-118.59), (74.0,-118.71), (73.88,-118.71), (73.65,-118.94), (73.53,-118.94), (73.41,-119.06), (73.29,-119.06), (73.18,-119.18), (72.94,-119.18), (72.82,-119.29), (72.71,-119.29), (72.59,-119.41), (72.24,-119.41), (72.12,-119.53), (71.88,-119.53), (71.76,-119.65), (71.18,-119.65), (71.06,-119.53), (71.06,-118.94), (71.18,-118.82), (71.18,-118.71), (71.29,-118.59), (71.29,-118.47), (71.41,-118.35), (71.41,-118.24), (71.29,-118.12), (70.71,-118.71), (70.59,-118.71), (70.47,-118.82), (70.35,-118.82), (70.12,-119.06), (70.0,-119.06), (69.76,-119.29), (69.65,-119.29), (69.41,-119.53), (69.29,-119.53), (69.06,-119.76), (68.94,-119.76), (68.82,-119.88), (68.71,-119.88), (68.47,-120.12), (68.35,-120.12), (68.24,-120.24), (68.12,-120.24), (67.88,-120.47), (67.76,-120.47), (67.65,-120.59), (67.53,-120.59), (67.41,-120.71), (67.06,-120.71), (66.94,-120.82), (66.71,-120.82), (66.59,-120.94), (66.24,-120.94), (66.24,-120.71), (66.35,-120.59), (66.35,-120.24), (66.47,-120.12), (66.47,-120.0), (66.71,-119.76), (66.71,-119.65), (66.82,-119.53), (66.82,-119.41), (66.94,-119.29), (66.94,-119.18), (67.18,-118.94), (67.18,-118.82), (67.41,-118.59), (67.41,-118.47), (67.76,-118.12), (67.76,-118.0), (67.88,-117.88), (67.88,-117.76), (68.24,-117.41), (68.24,-117.29), (68.47,-117.06), (68.47,-116.94), (68.59,-116.82), (70.24,-116.82), (70.35,-116.71), (70.35,-116.59), (70.24,-116.47), (69.06,-116.47), (69.06,-116.24), (69.29,-116.0), (69.29,-115.88), (69.53,-115.65), (69.41,-115.53), (69.29,-115.53), (68.94,-115.88), (68.94,-116.0), (68.71,-116.24), (68.71,-116.35), (68.59,-116.47), (67.29,-116.47), (67.18,-116.59), (67.18,-116.71), (67.29,-116.82), (68.12,-116.82), (68.12,-117.06), (67.88,-117.29), (67.88,-117.41), (67.65,-117.65), (67.65,-117.76), (67.41,-118.0), (67.41,-118.12), (67.06,-118.47), (67.06,-118.59), (66.94,-118.71), (66.71,-118.71), (66.59,-118.82), (65.41,-118.82), (65.29,-118.71), (64.71,-118.71), (64.59,-118.59), (64.59,-118.47), (64.35,-118.24), (63.88,-118.24), (63.76,-118.35), (63.53,-118.35), (63.29,-118.59), (63.18,-118.59), (63.06,-118.71), (62.94,-118.71), (62.82,-118.82), (62.71,-118.82), (62.59,-118.94), (62.47,-118.94), (62.35,-119.06), (62.24,-119.06), (62.12,-119.18), (62.0,-119.18), (61.88,-119.29), (61.53,-119.29), (61.41,-119.41), (61.29,-119.41), (61.18,-119.53), (60.94,-119.53), (60.82,-119.65), (60.35,-119.65), (60.24,-119.53), (60.12,-119.65), (60.0,-119.65), (59.88,-119.76), (59.76,-119.76), (59.65,-119.88), (59.41,-119.88), (59.29,-119.76), (59.18,-119.88), (59.29,-119.76), (59.29,-119.65), (59.88,-119.06), (60.0,-119.06), (60.47,-118.59), (60.59,-118.59), (60.71,-118.47), (60.82,-118.59), (60.82,-118.71), (60.71,-118.82), (60.71,-118.94), (60.59,-119.06), (60.59,-119.18), (60.24,-119.53), (60.35,-119.65), (60.47,-119.65), (60.82,-119.29), (60.82,-119.18), (61.06,-118.94), (61.06,-118.82), (61.18,-118.71), (61.18,-118.35), (60.94,-118.12), (60.71,-118.12), (60.47,-118.35), (60.35,-118.35), (60.12,-118.59), (60.0,-118.59), (60.0,-118.35), (60.12,-118.24), (60.12,-118.12), (60.24,-118.0), (60.24,-117.88), (60.35,-117.76), (60.35,-117.65), (60.59,-117.41), (60.59,-117.29), (60.71,-117.18), (60.71,-117.06), (60.82,-116.94), (60.82,-116.82), (60.94,-116.71), (60.94,-116.59), (61.18,-116.35), (61.18,-116.24), (61.29,-116.12), (61.29,-116.0), (61.53,-115.76), (61.53,-115.65), (61.76,-115.41), (61.76,-115.29), (62.0,-115.06), (61.76,-114.82), (61.65,-114.94), (61.65,-115.06), (61.41,-115.29), (61.41,-115.41), (61.18,-115.65), (61.18,-115.76), (60.94,-116.0), (60.94,-116.12), (60.82,-116.24), (60.82,-116.35), (60.71,-116.47), (60.71,-116.59), (60.59,-116.71), (60.59,-116.82), (60.35,-117.06), (60.35,-117.18), (60.24,-117.29), (60.24,-117.41), (60.12,-117.53), (60.12,-117.65), (59.88,-117.88), (59.88,-118.0), (59.76,-118.12), (59.76,-118.24), (59.65,-118.35), (59.65,-118.47), (59.53,-118.59), (59.53,-118.71), (59.29,-118.71), (59.18,-118.82), (58.0,-118.82), (57.88,-118.71), (57.29,-118.71), (57.18,-118.59), (57.18,-118.47), (56.94,-118.24), (56.47,-118.24), (56.35,-118.35), (56.24,-118.35), (55.65,-118.94), (55.65,-119.06), (54.47,-120.24), (54.35,-120.24), (53.65,-120.94), (53.53,-120.94), (53.18,-121.29), (53.06,-121.29), (52.82,-121.53), (52.71,-121.53), (52.47,-121.76), (52.35,-121.76), (52.24,-121.88), (52.12,-121.88), (52.0,-122.0), (51.76,-122.0), (51.65,-122.12), (51.41,-122.12), (51.29,-122.24), (50.82,-122.24), (50.71,-122.35), (49.53,-122.35), (49.41,-122.24), (48.94,-122.24), (48.82,-122.12), (48.71,-122.12), (48.59,-122.0), (48.47,-122.0), (48.35,-121.88), (48.24,-121.88), (48.0,-121.65), (47.88,-121.65), (47.18,-120.94), (47.18,-120.47), (47.29,-120.35), (47.29,-120.24), (47.41,-120.12), (47.41,-120.0), (47.65,-119.76), (47.65,-119.65), (47.76,-119.53), (47.76,-119.41), (47.88,-119.29), (47.88,-119.18), (48.0,-119.06), (48.12,-119.06), (48.24,-118.94), (48.24,-118.82), (48.35,-118.71), (48.35,-118.35), (48.59,-118.12), (48.59,-118.0), (48.82,-117.76), (48.82,-117.65), (48.94,-117.53), (48.94,-117.41), (49.18,-117.18), (49.18,-117.06), (49.29,-116.94), (49.29,-116.82), (49.53,-116.59), (49.53,-116.47), (49.76,-116.24), (49.76,-116.12), (49.88,-116.0), (49.88,-115.88), (50.0,-115.76), (50.0,-115.65), (50.24,-115.41), (50.24,-115.29), (50.47,-115.06), (50.47,-114.94), (50.59,-114.82), (50.59,-114.71), (50.82,-114.47), (50.82,-114.35), (50.94,-114.24), (50.94,-114.12), (51.18,-113.88), (51.18,-113.76), (51.29,-113.65), (51.29,-113.53), (51.41,-113.41), (51.53,-113.41), (51.65,-113.29), (52.82,-113.29), (52.94,-113.41), (53.06,-113.41), (53.18,-113.53), (53.29,-113.53), (53.29,-113.65), (53.53,-113.88), (53.53,-114.94), (53.41,-115.06), (53.41,-115.53), (53.29,-115.65), (53.29,-115.76), (53.18,-115.88), (53.18,-116.0), (52.94,-116.24), (52.94,-116.35), (52.12,-117.18), (52.0,-117.18), (51.65,-117.53), (51.53,-117.53), (51.41,-117.65), (51.29,-117.65), (51.06,-117.88), (50.94,-117.88), (50.82,-118.0), (50.59,-118.0), (50.47,-118.12), (50.24,-118.12), (50.12,-118.24), (50.0,-118.24), (49.88,-118.35), (49.65,-118.35), (49.53,-118.47), (49.18,-118.47), (49.06,-118.59), (48.71,-118.59), (48.59,-118.71), (48.71,-118.59), (49.06,-118.59), (49.18,-118.47), (49.53,-118.47), (49.65,-118.35), (49.76,-118.35), (49.88,-118.24), (50.12,-118.24), (50.24,-118.12), (50.47,-118.12), (50.59,-118.0), (50.71,-118.0), (50.82,-117.88), (50.94,-117.88), (51.18,-117.65), (51.29,-117.65), (51.41,-117.53), (51.53,-117.53), (51.88,-117.18), (52.0,-117.18), (52.94,-116.24), (52.94,-116.12), (53.18,-115.88), (53.18,-115.76), (53.29,-115.65), (53.29,-115.53), (53.41,-115.41), (53.41,-115.06), (53.53,-114.94), (53.53,-114.0), (53.29,-113.76), (53.29,-113.65), (53.18,-113.53), (53.06,-113.53), (52.82,-113.29), (51.76,-113.29), (51.65,-113.41), (51.53,-113.41), (51.29,-113.65), (51.29,-113.76), (51.18,-113.88), (51.18,-114.0), (50.94,-114.24), (50.94,-114.35), (50.82,-114.47), (50.82,-114.59), (50.59,-114.82), (50.59,-114.94), (50.47,-115.06), (50.47,-115.18), (50.24,-115.41), (50.24,-115.53), (50.0,-115.76), (50.0,-115.88), (49.88,-116.0), (49.88,-116.12), (49.76,-116.24), (49.76,-116.35), (49.53,-116.59), (49.53,-116.71), (49.29,-116.94), (49.29,-117.06), (49.18,-117.18), (49.18,-117.29), (48.94,-117.53), (48.94,-117.65), (48.82,-117.76), (48.82,-117.88), (48.59,-118.12), (48.59,-118.24), (48.35,-118.47), (48.35,-118.71), (48.24,-118.82), (48.35,-118.94), (49.06,-118.94), (49.18,-118.82), (49.41,-118.82), (49.53,-118.71), (49.88,-118.71), (50.0,-118.59), (50.24,-118.59), (50.47,-118.35), (50.71,-118.35), (50.82,-118.24), (51.06,-118.24), (51.29,-118.0), (51.41,-118.0), (51.65,-117.76), (51.76,-117.76), (51.88,-117.65), (52.0,-117.65), (52.35,-117.29), (52.47,-117.29), (53.06,-116.71), (53.06,-116.59), (53.29,-116.35), (53.29,-116.24), (53.41,-116.12), (53.41,-116.0), (53.53,-115.88), (53.53,-115.76), (53.76,-115.53), (53.76,-115.18), (53.88,-115.06), (53.88,-114.0), (53.76,-113.88), (53.76,-113.76), (53.65,-113.65), (53.65,-113.53), (53.29,-113.18), (53.18,-113.18), (53.06,-113.06), (52.94,-113.06), (52.82,-112.94), (51.76,-112.94), (51.88,-112.82), (51.88,-112.59), (52.12,-112.35), (52.12,-112.12), (52.0,-112.0), (51.88,-112.12), (51.88,  -112.12), (51.88,  -112.0), (51.88,-112.0), (51.88,-112.12), (51.65,-112.35), (51.65,-112.47), (51.53,-112.59), (51.53,-112.71), (51.29,-112.94), (51.29,-113.06), (51.18,-113.18), (51.06,-113.18), (50.94,-113.29), (50.71,-113.29), (50.59,-113.41), (50.35,-113.41), (50.24,-113.53), (50.12,-113.53), (49.88,-113.76), (49.76,-113.76), (49.53,-114.0), (49.41,-114.0), (48.24,-115.18), (48.24,-115.29), (48.12,-115.41), (48.12,-115.53), (47.88,-115.76), (47.88,-116.0), (47.76,-116.12), (47.76,-116.24), (47.65,-116.35), (47.65,-116.47), (47.53,-116.59), (47.53,-116.71), (47.41,-116.82), (47.41,-117.06), (47.29,-117.18), (47.29,-117.29), (47.18,-117.41), (47.18,-117.65), (47.06,-117.76), (47.06,-118.0), (46.94,-118.12), (46.94,-118.35), (46.82,-118.47), (46.82,-118.59), (46.71,-118.71), (46.47,-118.71), (46.35,-118.59), (46.12,-118.59), (46.0,-118.47), (45.88,-118.47), (45.76,-118.35), (45.76,-118.24), (45.65,-118.12), (45.65,-118.0), (45.29,-118.0), (45.29,-118.35), (45.41,-118.47), (45.41,-118.59), (45.53,-118.71), (45.53,-118.94), (45.65,-119.06), (45.65,-119.18), (45.76,-119.29), (45.76,-119.53), (45.88,-119.65), (45.88,-119.76), (46.12,-120.0), (46.12,-120.12), (46.24,-120.24), (46.24,-120.47), (46.12,-120.59), (46.12,-120.71), (46.0,-120.82), (46.0,-121.06), (45.88,-121.18), (45.88,-121.53), (45.76,-121.65), (45.76,-122.0), (45.65,-122.12), (45.65,-122.24), (45.53,-122.35), (45.53,-122.59), (45.41,-122.71), (45.41,-122.94), (45.29,-123.06), (45.29,-123.18), (45.18,-123.29), (45.18,-123.41), (45.06,-123.53), (45.06,-123.65), (44.94,-123.76), (44.94,-123.88), (44.82,-124.0), (44.82,-124.12), (44.71,-124.24), (44.71,-124.47), (44.59,-124.59), (44.59,-124.82), (44.94,-124.82), (44.94,-124.71), (45.06,-124.59), (45.06,-124.47), (45.18,-124.35), (45.18,-124.24), (45.29,-124.12), (45.29,-124.0), (45.41,-123.88), (45.41,-123.76), (45.53,-123.65), (45.53,-123.53), (45.65,-123.41), (45.65,-123.29), (45.76,-123.18), (45.76,-123.06), (45.88,-122.94), (45.88,-122.82), (46.0,-122.71), (46.0,-122.47), (46.12,-122.35), (46.12,-122.24), (46.35,-122.0), (46.35,-121.88), (46.59,-121.65), (46.59,-121.53), (46.71,-121.41), (46.71,-121.29), (46.82,-121.18), (46.94,-121.18), (47.06,-121.29), (47.06,-121.41), (47.29,-121.65), (47.41,-121.65), (47.76,-122.0), (47.88,-122.0), (48.0,-122.12), (48.12,-122.12), (48.24,-122.24), (48.35,-122.24), (48.47,-122.35), (48.59,-122.35), (48.71,-122.47), (48.82,-122.47), (48.94,-122.59), (49.41,-122.59), (49.53,-122.71), (50.82,-122.71), (50.94,-122.59), (51.29,-122.59), (51.41,-122.47), (51.65,-122.47), (51.76,-122.35), (52.0,-122.35), (52.12,-122.24), (52.24,-122.24), (52.35,-122.12), (52.47,-122.12), (52.59,-122.0), (52.71,-122.0), (52.82,-121.88), (52.94,-121.88), (53.18,-121.65), (53.29,-121.65), (53.53,-121.41), (53.65,-121.41), (54.0,-121.06), (54.12,-121.06), (55.29,-119.88), (55.53,-120.12), (55.65,-120.12), (55.76,-120.24), (55.88,-120.24), (56.0,-120.12), (56.24,-120.12), (56.71,-119.65), (56.71,-119.53), (56.94,-119.29), (56.94,-119.18), (57.18,-118.94), (57.29,-118.94), (57.41,-119.06), (57.88,-119.06), (58.0,-119.18), (59.06,-119.18), (59.18,-119.29), (59.18,-119.41), (58.82,-119.76), (58.82,-120.0), (58.71,-120.12), (58.71,-120.35), (59.06,-120.35), (59.29,-120.12), (59.41,-120.24), (59.76,-120.24), (59.88,-120.12), (60.24,-120.12), (60.35,-120.0), (60.82,-120.0), (60.94,-119.88), (61.18,-119.88), (61.29,-119.76), (61.53,-119.76), (61.65,-119.65), (61.76,-119.65), (61.88,-119.53), (62.12,-119.53), (62.24,-119.41), (62.35,-119.41), (62.47,-119.29), (62.59,-119.29), (62.71,-119.18), (62.82,-119.18), (62.94,-119.29), (62.94,-119.41), (62.82,-119.53), (62.82,-119.88), (62.94,-120.0), (62.94,-120.12), (63.06,-120.12), (63.18,-120.24), (63.41,-120.24), (63.53,-120.12), (63.65,-120.12), (64.24,-119.53), (64.24,-119.41), (64.35,-119.29), (64.35,-119.18), (64.59,-118.94), (64.71,-118.94), (64.82,-119.06), (65.29,-119.06), (65.41,-119.18), (66.47,-119.18), (66.59,-119.29), (66.35,-119.53), (66.35,-119.65), (66.24,-119.76), (66.24,-119.88), (66.12,-120.0), (66.12,-120.12), (66.0,-120.24), (66.0,-120.47), (65.88,-120.59), (65.88,-120.94), (66.0,-121.06), (66.0,-121.18), (66.12,-121.18), (66.24,-121.29), (66.71,-121.29), (66.82,-121.18), (67.06,-121.18), (67.18,-121.06), (67.41,-121.06), (67.53,-120.94), (67.65,-120.94), (67.76,-120.82), (67.88,-120.82), (68.0,-120.71), (68.12,-120.71), (68.24,-120.59), (68.35,-120.59), (68.47,-120.47), (68.59,-120.47), (68.82,-120.24), (68.94,-120.24), (69.06,-120.12), (69.18,-120.12), (69.29,-120.0), (69.41,-120.0), (69.65,-119.76), (69.76,-119.76), (70.12,-119.41), (70.24,-119.41), (70.59,-119.06), (70.71,-119.18), (70.71,-119.53), (70.82,-119.65), (70.82,-119.88), (71.06,-119.88), (71.18,-120.0), (71.76,-120.0), (71.88,-119.88), (72.24,-119.88), (72.35,-119.76), (72.59,-119.76), (72.71,-119.65), (72.82,-119.65), (72.94,-119.53), (73.18,-119.53), (73.29,-119.41), (73.41,-119.41), (73.53,-119.29), (73.65,-119.29), (73.76,-119.41), (73.76,-119.76), (73.65,-119.88), (73.65,-120.24), (73.53,-120.35), (73.41,-120.35), (73.18,-120.59), (73.06,-120.59), (73.06,-120.94), (73.18,-121.06), (73.53,-121.06), (73.88,-120.71), (73.88,-120.59), (74.0,-120.47), (74.12,-120.47), (74.24,-120.35), (74.35,-120.35), (74.47,-120.24), (74.59,-120.24), (74.71,-120.12), (74.82,-120.12), (74.94,-120.0), (75.06,-120.0), (75.18,-119.88), (75.41,-119.88), (75.53,-119.76), (75.65,-119.76), (75.76,-119.65), (75.88,-119.65), (76.0,-119.53), (76.12,-119.53), (76.24,-119.41), (76.35,-119.41), (76.47,-119.29), (76.59,-119.29), (76.71,-119.18), (76.82,-119.18), (76.94,-119.29), (76.71,-119.53), (76.71,-119.65), (76.59,-119.76), (76.59,-119.88), (76.47,-120.0), (76.47,-120.12), (76.35,-120.24), (76.35,-120.47), (76.24,-120.59), (76.24,-120.94), (76.35,-121.06), (76.35,-121.18), (76.47,-121.18), (76.59,-121.29), (77.06,-121.29), (77.18,-121.18), (77.41,-121.18), (77.53,-121.06), (77.76,-121.06), (77.88,-120.94), (78.0,-120.94), (78.12,-120.82), (78.24,-120.82), (78.35,-120.71), (78.47,-120.71), (78.59,-120.59), (78.71,-120.59), (78.82,-120.47), (78.94,-120.47), (79.18,-120.24), (79.29,-120.24), (79.41,-120.12), (79.53,-120.12), (79.65,-120.0), (79.76,-120.0), (80.0,-119.76), (80.12,-119.76), (80.47,-119.41), (80.59,-119.41), (80.82,-119.18), (80.94,-119.18), (81.18,-118.94), (81.29,-118.94), (81.41,-118.82), (81.53,-118.94), (81.53,-120.35), (81.65,-120.47), (81.65,-120.82), (81.76,-120.94), (81.76,-121.06), (81.88,-121.18), (81.88,-121.29), (82.0,-121.41), (82.0,-121.53), (82.24,-121.76), (82.24,-121.88), (82.35,-121.88), (82.47,-122.0), (82.82,-122.0), (82.82,-121.76), (82.35,-121.29), (82.35,-121.18), (82.12,-120.94), (82.12,-120.82), (82.0,-120.71), (82.0,-120.35), (81.88,-120.24), (81.88,-118.94), (82.0,-118.82), (82.0,-118.35), (82.12,-118.24), (82.12,-117.88), (82.24,-117.76), (82.24,-117.65), (82.35,-117.53), (82.35,-117.41), (82.47,-117.29), (82.47,-117.18), (82.59,-117.06), (82.59,-116.94), (82.71,-116.82), (82.71,-116.71), (82.94,-116.47), (82.94,-116.35), (84.0,-115.29), (84.12,-115.29), (84.24,-115.18), (84.24,-114.82), (84.12,-114.94), (83.76,-114.94), (83.41,-115.29), (83.29,-115.29), (82.94,-115.65), (82.94,-115.76), (82.59,-116.12), (82.59,-116.24), (82.35,-116.47), (82.35,-116.59), (82.24,-116.71), (82.24,-116.82), (82.12,-116.94), (82.12,-117.18), (82.0,-117.29), (82.0,-117.41), (81.88,-117.53), (81.88,-117.76), (81.76,-117.88), (81.76,-118.12), (81.65,-118.24), (81.65,-118.82), (81.53,-118.94), (81.41,-118.82), (81.41,-118.59), (81.29,-118.47), (81.18,-118.47), (80.94,-118.71), (80.82,-118.71), (80.71,-118.82), (80.59,-118.82), (80.35,-119.06), (80.24,-119.06), (80.0,-119.29), (79.88,-119.29), (79.65,-119.53), (79.53,-119.53), (79.29,-119.76), (79.18,-119.76), (79.06,-119.88), (78.94,-119.88), (78.71,-120.12), (78.59,-120.12), (78.47,-120.24), (78.35,-120.24), (78.12,-120.47), (78.0,-120.47), (77.88,-120.59), (77.76,-120.59), (77.65,-120.71), (77.41,-120.71), (77.29,-120.82), (77.06,-120.82), (76.94,-120.94), (76.71,-120.94), (76.59,-120.82), (76.59,-120.71), (76.71,-120.59), (76.71,-120.35), (76.82,-120.24), (76.82,-120.12), (77.06,-119.88), (77.06,-119.76), (77.18,-119.65), (77.18,-119.53), (77.29,-119.41), (77.29,-119.29), (77.53,-119.06), (77.53,-118.94), (77.76,-118.71), (77.76,-118.59), (78.12,-118.24), (78.12,-118.12), (78.24,-118.0), (78.24,-117.88), (78.59,-117.53), (78.59,-117.41), (78.82,-117.18), (78.82,-117.06), (79.06,-116.82), (80.71,-116.82), (80.71,-116.47), (79.53,-116.47), (79.41,-116.35), (79.65,-116.12), (79.65,-116.0), (79.88,-115.76), (79.88,-115.53), (79.53,-115.53), (79.29,-115.76), (79.29,-115.88), (79.06,-116.12), (79.06,-116.24), (78.82,-116.47), (77.53,-116.47), (77.53,-116.82), (78.35,-116.82), (78.47,-116.94), (78.24,-117.18), (78.24,-117.29), (78.0,-117.53), (78.0,-117.65), (77.76,-117.88), (77.76,-118.0), (77.18,-118.59), (77.06,-118.59), (76.94,-118.71), (76.82,-118.71), (76.71,-118.82), (76.59,-118.82), (76.47,-118.94), (76.35,-118.94), (76.24,-119.06), (76.12,-119.06), (76.0,-119.18), (75.88,-119.18), (75.76,-119.29), (75.65,-119.29), (75.53,-119.41), (75.29,-119.41), (75.18,-119.53), (75.06,-119.53), (74.94,-119.65), (74.82,-119.65), (74.71,-119.76), (74.59,-119.76), (74.47,-119.88), (74.35,-119.88), (74.24,-120.0), (74.12,-119.88), (74.12,-119.29), (74.24,-119.18), (74.24,-118.94), (74.35,-118.82), (74.35,-118.59), (74.82,-118.12), (75.06,-118.35), (75.06,-118.47), (75.29,-118.47), (75.29,-118.35), (75.41,-118.24), (75.41,-118.0), (75.29,-117.88), (75.18,-117.88), (75.06,-117.76), (74.71,-117.76), (74.59,-117.88), (74.47,-117.88), (74.35,-118.0), (74.24,-118.0), (74.24,-118.12), (74.12,-118.24), (74.12,-118.35), (74.0,-118.47), (74.0,-118.59), (73.88,-118.71), (73.76,-118.71), (73.53,-118.94), (73.41,-118.94), (73.29,-119.06), (73.18,-119.06), (73.06,-119.18), (72.94,-119.18), (72.82,-119.29), (72.59,-119.29), (72.47,-119.41), (72.24,-119.41), (72.12,-119.53), (71.88,-119.53), (71.76,-119.65), (71.29,-119.65), (71.06,-119.41), (71.06,-119.06), (71.18,-118.94), (71.18,-118.82), (71.29,-118.71), (71.29,-118.59), (71.41,-118.47), (71.41,-118.24), (71.53,-118.12), (71.18,-118.12), (70.59,-118.71), (70.47,-118.71), (70.35,-118.82), (70.24,-118.82), (70.0,-119.06), (69.88,-119.06), (69.65,-119.29), (69.53,-119.29), (69.29,-119.53), (69.18,-119.53), (68.94,-119.76), (68.82,-119.76), (68.71,-119.88), (68.59,-119.88), (68.35,-120.12), (68.24,-120.12), (68.12,-120.24), (68.0,-120.24), (67.76,-120.47), (67.65,-120.47), (67.53,-120.59), (67.41,-120.59), (67.29,-120.71), (67.06,-120.71), (66.94,-120.82), (66.71,-120.82), (66.59,-120.94), (66.35,-120.94), (66.24,-120.82), (66.24,-120.71), (66.35,-120.59), (66.35,-120.35), (66.47,-120.24), (66.47,-120.12), (66.71,-119.88), (66.71,-119.76), (66.82,-119.65), (66.82,-119.53), (66.94,-119.41), (66.94,-119.29), (67.18,-119.06), (67.18,-118.94), (67.41,-118.71), (67.41,-118.59), (67.65,-118.35), (67.65,-118.24), (67.88,-118.0), (67.88,-117.88), (68.24,-117.53), (68.24,-117.41), (68.47,-117.18), (68.47,-117.06), (68.71,-116.82), (70.35,-116.82), (70.35,-116.47), (69.18,-116.47), (69.06,-116.35), (69.29,-116.12), (69.29,-116.0), (69.53,-115.76), (69.53,-115.53), (69.18,-115.53), (68.94,-115.76), (68.94,-115.88), (68.71,-116.12), (68.71,-116.24), (68.47,-116.47), (67.18,-116.47), (67.18,-116.82), (68.0,-116.82), (68.12,-116.94), (67.88,-117.18), (67.88,-117.29), (67.65,-117.53), (67.65,-117.65), (67.41,-117.88), (67.41,-118.0), (67.18,-118.24), (67.18,-118.35), (66.82,-118.71), (66.71,-118.71), (66.59,-118.82), (65.41,-118.82), (65.29,-118.71), (64.82,-118.71), (64.47,-118.35), (64.47,-118.24), (63.88,-118.24), (63.76,-118.35), (63.53,-118.35), (63.41,-118.47), (63.29,-118.47), (63.18,-118.59), (63.06,-118.59), (62.94,-118.71), (62.82,-118.71), (62.71,-118.82), (62.59,-118.82), (62.47,-118.94), (62.35,-118.94), (62.24,-119.06), (62.12,-119.06), (62.0,-119.18), (61.88,-119.18), (61.76,-119.29), (61.53,-119.29), (61.41,-119.41), (61.29,-119.41), (61.18,-119.53), (60.94,-119.53), (60.82,-119.65), (60.71,-119.65), (60.59,-119.53), (61.06,-119.06), (61.06,-118.82), (61.18,-118.71), (61.18,-118.35), (61.06,-118.24), (61.06,-118.12), (60.59,-118.12), (60.35,-118.35), (60.12,-118.12), (60.35,-117.88), (60.35,-117.76), (60.59,-117.53), (60.59,-117.41), (60.71,-117.29), (60.71,-117.18), (60.82,-117.06), (60.82,-116.94), (60.94,-116.82), (60.94,-116.71), (61.18,-116.47), (61.18,-116.35), (61.29,-116.24), (61.29,-116.12), (61.53,-115.88), (61.53,-115.76), (61.76,-115.53), (61.76,-115.41), (62.0,-115.18), (62.0,-115.06), (61.76,-114.82), (61.65,-114.82), (61.65,-114.94), (61.41,-115.18), (61.41,-115.29), (61.18,-115.53), (61.18,-115.65), (60.94,-115.88), (60.94,-116.0), (60.82,-116.12), (60.82,-116.24), (60.71,-116.35), (60.71,-116.47), (60.59,-116.59), (60.59,-116.71), (60.35,-116.94), (60.35,-117.06), (60.24,-117.18), (60.24,-117.29), (60.12,-117.41), (60.12,-117.53), (59.88,-117.76), (59.88,-117.88), (59.76,-118.0), (59.76,-118.12), (59.65,-118.24), (59.65,-118.35), (59.53,-118.47), (59.53,-118.59), (59.41,-118.71), (59.29,-118.71), (59.18,-118.82), (58.0,-118.82), (57.88,-118.71), (57.41,-118.71), (57.06,-118.35), (57.06,-118.24), (56.47,-118.24), (56.35,-118.35), (56.12,-118.35), (55.65,-118.82), (55.65,-118.94), (54.35,-120.24), (54.24,-120.24), (53.53,-120.94), (53.41,-120.94), (53.06,-121.29), (52.94,-121.29), (52.71,-121.53), (52.59,-121.53), (52.35,-121.76), (52.24,-121.76), (52.12,-121.88), (52.0,-121.88), (51.88,-122.0), (51.76,-122.0), (51.65,-122.12), (51.41,-122.12), (51.29,-122.24), (50.82,-122.24), (50.71,-122.35), (49.53,-122.35), (49.41,-122.24), (49.06,-122.24), (48.94,-122.12), (48.82,-122.12), (48.71,-122.0), (48.59,-122.0), (48.47,-121.88), (48.35,-121.88), (48.12,-121.65), (48.0,-121.65), (47.18,-120.82), (47.18,-120.59), (47.29,-120.47), (47.29,-120.35), (47.41,-120.24), (47.41,-120.12), (47.65,-119.88), (47.65,-119.76), (47.76,-119.65), (47.76,-119.53), (47.88,-119.41), (47.88,-119.29), (48.12,-119.06), (48.35,-119.06), (48.47,-118.94), (49.06,-118.94), (49.18,-118.82), (49.41,-118.82), (49.53,-118.71), (49.88,-118.71), (50.0,-118.59), (50.24,-118.59), (50.35,-118.47), (50.47,-118.47), (50.59,-118.35), (50.71,-118.35), (50.82,-118.24), (51.06,-118.24), (51.18,-118.12), (51.29,-118.12), (51.41,-118.0), (51.53,-118.0), (51.76,-117.76), (51.88,-117.76), (52.0,-117.65), (52.12,-117.65), (52.47,-117.29), (52.59,-117.29), (53.06,-116.82), (53.06,-116.71), (53.29,-116.47), (53.29,-116.35), (53.41,-116.24), (53.41,-116.12), (53.53,-116.0), (53.53,-115.88), (53.65,-115.76), (53.65,-115.65), (53.76,-115.53), (53.76,-115.18), (53.88,-115.06), (53.88,-114.0), (53.76,-113.88), (53.76,-113.65), (53.65,-113.53), (53.65,-113.41), (53.41,-113.18), (53.18,-113.18), (53.06,-113.06), (52.94,-113.06), (52.82,-112.94), (52.0,-112.94), (51.88,-112.82), (51.88,-112.71), (52.12,-112.47), (52.12,-112.0), (52.12,  -112.0), (56.59,  -118.47), (56.59,-118.47), (56.59,-118.59), (56.47,-118.71), (56.24,-118.71), (56.12,-118.82), (56.12,-118.94), (55.88,-119.18), (55.88,-119.29), (55.76,-119.41), (55.76,-119.53), (55.65,-119.65), (55.76,-119.76), (55.76,-119.88), (56.0,-119.88), (56.35,-119.53), (56.35,-119.41), (56.59,-119.18), (56.59,-118.94), (56.71,-118.82), (56.71,-118.71), (56.59,-118.59), (56.59,  -118.59), (56.35,  -118.71), (56.35,-118.71), (56.59,-118.71), (56.71,-118.82), (56.59,-118.94), (56.59,-119.06), (56.35,-119.29), (56.35,-119.41), (55.88,-119.88), (55.65,-119.65), (55.88,-119.41), (55.88,-119.29), (56.0,-119.18), (56.0,-119.06), (56.0,  -119.06), (60.12,  -119.06), (60.12,-119.06), (60.0,-119.06), (59.29,-119.76), (59.41,-119.88), (59.65,-119.88), (59.88,-119.65), (60.0,-119.65), (60.71,-118.94), (60.71,-118.82), (60.82,-118.71), (60.82,-118.59), (60.71,-118.47), (60.71,  -118.47), (63.41,  -119.06), (63.41,-119.06), (63.41,-119.18), (63.29,-119.29), (63.29,-119.41), (63.18,-119.53), (63.18,-119.76), (63.29,-119.88), (63.76,-119.41), (63.76,-119.29), (64.0,-119.06), (64.0,-118.94), (64.12,-118.82), (63.88,-118.59), (63.88,  -118.59), (64.0,  -118.59), (64.0,-118.59), (64.12,-118.71), (64.12,-118.82), (64.0,-118.94), (64.0,-119.18), (63.76,-119.41), (63.76,-119.53), (63.41,-119.88), (63.18,-119.88), (63.18,-119.41), (63.29,-119.29), (63.29,-119.18), (63.41,-119.06), (63.41,-118.94), (63.65,-118.71), (63.76,-118.71), (64.0,-118.47), (64.0,  -118.47), (79.29,  -115.88), (79.29,-115.88), (79.29,-116.0), (79.06,-116.24), (79.06,-116.35), (78.94,-116.47), (77.65,-116.47), (77.53,-116.59), (77.53,-116.71), (77.65,-116.82), (78.47,-116.82), (78.47,-117.06), (78.24,-117.29), (78.24,-117.41), (78.0,-117.65), (78.0,-117.76), (77.76,-118.0), (77.76,-118.12), (77.41,-118.47), (77.65,-118.71), (77.76,-118.59), (77.76,-118.47), (78.12,-118.12), (78.12,-118.0), (78.24,-117.88), (78.24,-117.76), (78.59,-117.41), (78.59,-117.29), (78.82,-117.06), (78.82,-116.94), (78.94,-116.82), (80.59,-116.82), (80.71,-116.71), (80.71,-116.59), (80.59,-116.47), (79.41,-116.47), (79.41,-116.24), (79.65,-116.0), (79.65,-115.88), (79.88,-115.65), (79.76,-115.53), (79.65,-115.53), (79.65,  -115.53), (83.53,  -115.29), (83.53,-115.29), (83.41,-115.29), (82.94,-115.76), (82.94,-115.88), (82.59,-116.24), (82.59,-116.35), (82.35,-116.59), (82.35,-116.71), (82.24,-116.82), (82.24,-116.94), (82.12,-117.06), (82.12,-117.18), (82.0,-117.29), (82.0,-117.53), (81.88,-117.65), (81.88,-117.76), (81.76,-117.88), (81.76,-118.12), (81.65,-118.24), (81.65,-118.82), (81.53,-118.94), (81.53,-120.35), (81.65,-120.47), (81.65,-120.82), (81.76,-120.94), (81.76,-121.06), (82.0,-121.29), (82.0,-121.41), (82.24,-121.65), (82.24,-121.76), (82.35,-121.88), (82.47,-121.88), (82.59,-122.0), (82.71,-122.0), (82.82,-121.88), (82.35,-121.41), (82.35,-121.29), (82.12,-121.06), (82.12,-120.94), (82.0,-120.82), (82.0,-120.35), (81.88,-120.24), (81.88,-118.94), (82.0,-118.82), (82.0,-118.35), (82.12,-118.24), (82.12,-117.88), (82.24,-117.76), (82.24,-117.53), (82.35,-117.41), (82.35,-117.29), (82.47,-117.18), (82.47,-117.06), (82.59,-116.94), (82.59,-116.82), (82.71,-116.71), (82.71,-116.59), (82.94,-116.35), (82.94,-116.24), (83.88,-115.29), (84.0,-115.29), (84.24,-115.06), (84.12,-114.94), (83.88,-114.94), (83.88,  -114.94), (85.18,  -116.0), (85.18,-116.0), (85.06,-116.0), (84.94,-116.12), (84.94,-116.24), (85.18,-116.47), (85.18,-116.59), (85.29,-116.71), (85.29,-116.82), (85.41,-116.94), (85.41,-117.18), (85.53,-117.29), (85.53,-117.53), (85.76,-117.76), (86.0,-117.76), (86.35,-117.41), (86.35,-117.29), (86.24,-117.18), (86.24,-116.94), (86.12,-116.82), (86.12,-116.71), (85.88,-116.47), (85.88,-116.35), (85.76,-116.24), (85.76,-116.12), (85.41,-115.76), (85.41,  -115.76), (85.41,  -115.76), (85.41,-115.76), (85.29,-115.88), (85.18,-115.88), (85.06,-116.0), (84.94,-116.0), (84.94,-116.35), (85.18,-116.59), (85.18,-116.71), (85.29,-116.82), (85.29,-116.94), (85.41,-117.06), (85.41,-117.18), (85.53,-117.29), (85.53,-117.53), (85.65,-117.65), (85.65,-117.76), (86.12,-117.76), (86.35,-117.53), (86.35,-117.29), (86.24,-117.18), (86.24,-116.82), (86.12,-116.71), (86.12,-116.59), (85.88,-116.35), (85.88,-116.24), (85.65,-116.0), (85.65,-115.88), (85.53,-115.88), (85.53,  -115.88), (87.06,  -115.53), (87.06,-115.53), (86.82,-115.76), (87.06,-116.0), (87.06,-116.12), (87.18,-116.24), (87.18,-116.35), (87.41,-116.59), (87.41,-116.82), (87.76,-117.18), (87.88,-117.18), (88.24,-116.82), (88.24,-116.59), (88.12,-116.47), (88.12,-116.35), (88.0,-116.24), (88.0,-116.12), (87.88,-116.0), (87.88,-115.88), (87.41,-115.41), (87.29,-115.41), (87.18,-115.53), (87.18,  -115.53), (87.18,  -115.41), (87.18,-115.41), (87.06,-115.53), (86.94,-115.53), (86.94,-115.65), (86.82,-115.76), (86.82,-115.88), (87.06,-116.12), (87.06,-116.24), (87.18,-116.35), (87.18,-116.47), (87.41,-116.71), (87.41,-116.94), (87.65,-117.18), (88.0,-117.18), (88.24,-116.94), (88.24,-116.47), (88.0,-116.24), (88.0,-116.0), (87.88,-115.88), (87.88,-115.76), (87.53,-115.41), (87.53,  -115.41), (90.0,  -115.76), (90.0,-115.76), (90.0,-116.12), (89.88,-116.24), (89.88,-116.71), (89.76,-116.82), (89.76,-117.06), (89.65,-117.18), (89.65,-117.41), (89.53,-117.53), (89.53,-117.76), (89.41,-117.88), (89.41,-118.12), (89.29,-118.24), (89.29,-118.35), (89.18,-118.47), (89.18,-118.59), (89.06,-118.71), (89.06,-118.82), (88.35,-119.53), (88.24,-119.53), (88.12,-119.65), (88.0,-119.65), (87.88,-119.76), (87.76,-119.76), (87.65,-119.88), (87.53,-119.88), (87.41,-120.0), (87.29,-120.0), (87.18,-120.12), (87.06,-120.12), (86.94,-120.24), (86.82,-120.24), (86.71,-120.35), (86.47,-120.35), (86.24,-120.59), (86.35,-120.71), (86.35,-120.82), (86.59,-121.06), (86.94,-121.06), (87.06,-120.94), (87.18,-120.94), (87.29,-120.82), (87.53,-120.82), (87.76,-120.59), (88.0,-120.59), (88.24,-120.35), (88.35,-120.35), (88.71,-120.0), (88.82,-120.0), (89.65,-119.18), (89.65,-119.06), (89.88,-118.82), (89.88,-118.71), (90.0,-118.59), (90.0,-118.35), (90.24,-118.12), (90.24,-117.88), (90.35,-117.76), (90.35,-117.53), (90.47,-117.41), (90.47,-117.18), (90.59,-117.06), (90.59,-116.82), (90.71,-116.71), (90.71,-116.24), (90.82,-116.12), (90.82,-115.76), (90.71,-115.65), (90.59,-115.65), (90.47,-115.53), (90.24,-115.53), (90.24,  -115.53), (90.12,  -115.53), (90.12,-115.53), (90.12,-115.65), (90.0,-115.76), (90.0,-116.12), (89.88,-116.24), (89.88,-116.71), (89.76,-116.82), (89.76,-117.06), (89.65,-117.18), (89.65,-117.41), (89.53,-117.53), (89.53,-117.76), (89.41,-117.88), (89.41,-118.0), (89.29,-118.12), (89.29,-118.24), (89.18,-118.35), (89.18,-118.47), (89.06,-118.59), (89.06,-118.71), (88.24,-119.53), (88.12,-119.53), (88.0,-119.65), (87.88,-119.65), (87.65,-119.88), (87.41,-119.88), (87.29,-120.0), (87.18,-120.0), (87.06,-120.12), (86.94,-120.12), (86.71,-120.35), (86.35,-120.35), (86.24,-120.47), (86.24,-120.71), (86.35,-120.82), (86.35,-120.94), (86.47,-121.06), (87.06,-121.06), (87.29,-120.82), (87.65,-120.82), (87.88,-120.59), (88.0,-120.59), (88.12,-120.47), (88.24,-120.47), (88.35,-120.35), (88.47,-120.35), (88.82,-120.0), (88.94,-120.0), (89.65,-119.29), (89.65,-119.18), (89.88,-118.94), (89.88,-118.82), (90.0,-118.71), (90.0,-118.47), (90.24,-118.24), (90.24,-117.88), (90.35,-117.76), (90.35,-117.53), (90.47,-117.41), (90.47,-117.18), (90.59,-117.06), (90.59,-116.82), (90.71,-116.71), (90.71,-116.24), (90.82,-116.12), (90.82,-115.65), (90.59,-115.65), (90.47,-115.53), (90.47,  -115.53), (93.53,  -115.06), (93.53,-115.06), (93.65,-115.18), (93.76,-115.18), (94.12,-115.53), (94.12,-115.65), (94.35,-115.88), (94.35,-116.12), (94.47,-116.24), (94.47,-116.59), (94.59,-116.71), (94.59,-118.12), (94.47,-118.24), (94.47,-118.71), (94.35,-118.82), (94.35,-119.18), (94.24,-119.29), (94.24,-119.53), (94.12,-119.65), (94.12,-119.76), (94.0,-119.88), (94.0,-120.0), (93.88,-120.12), (93.88,-120.24), (93.76,-120.35), (93.76,-120.47), (92.71,-121.53), (92.59,-121.53), (92.47,-121.65), (92.35,-121.65), (92.12,-121.88), (92.24,-122.0), (92.47,-122.0), (92.59,-121.88), (92.71,-121.88), (92.94,-121.65), (93.06,-121.65), (93.76,-120.94), (93.76,-120.82), (94.0,-120.59), (94.0,-120.47), (94.12,-120.35), (94.12,-120.24), (94.35,-120.0), (94.35,-119.88), (94.47,-119.76), (94.47,-119.53), (94.59,-119.41), (94.59,-119.29), (94.71,-119.18), (94.71,-118.82), (94.82,-118.71), (94.82,-118.24), (94.94,-118.12), (94.94,-116.71), (94.82,-116.59), (94.82,-116.24), (94.71,-116.12), (94.71,-116.0), (94.59,-115.88), (94.59,-115.76), (94.47,-115.65), (94.47,-115.53), (93.76,-114.82), (93.76,  -114.82), (93.76,  -114.82), (93.76,-114.82), (93.53,-115.06), (93.53,-115.18), (93.65,-115.18), (94.12,-115.65), (94.12,-115.76), (94.35,-116.0), (94.35,-116.12), (94.47,-116.24), (94.47,-116.59), (94.59,-116.71), (94.59,-118.12), (94.47,-118.24), (94.47,-118.71), (94.35,-118.82), (94.35,-119.18), (94.24,-119.29), (94.24,-119.41), (94.12,-119.53), (94.12,-119.65), (94.0,-119.76), (94.0,-119.88), (93.88,-120.0), (93.88,-120.12), (93.76,-120.24), (93.76,-120.35), (92.59,-121.53), (92.47,-121.53), (92.35,-121.65), (92.24,-121.65), (92.12,-121.76), (92.12,-122.0), (92.59,-122.0), (92.71,-121.88), (92.82,-121.88), (93.06,-121.65), (93.18,-121.65), (93.76,-121.06), (93.76,-120.94), (94.0,-120.71), (94.0,-120.59), (94.12,-120.47), (94.12,-120.35), (94.35,-120.12), (94.35,-119.88), (94.47,-119.76), (94.47,-119.65), (94.59,-119.53), (94.59,-119.29), (94.71,-119.18), (94.71,-118.82), (94.82,-118.71), (94.82,-118.24), (94.94,-118.12), (94.94,-116.71), (94.82,-116.59), (94.82,-116.24), (94.71,-116.12), (94.71,-115.88), (94.59,-115.76), (94.59,-115.65), (94.47,-115.53), (94.47,-115.41), (93.88,-114.82), (93.88,  -114.82))
-
-# Alternatively, if your signature has multiple distinct strokes (pen lifts in between):
-# SIGNATURE_STROKES_RAW = [
-#   [ (X1_stroke1, Z_side1_stroke1), (X2_stroke1, Z_side2_stroke1), ... ], # Stroke 1
-#   [ (X1_stroke2, Z_side1_stroke2), (X2_stroke2, Z_side2_stroke2), ... ], # Stroke 2
-#   # ... more strokes
-# ]
-# If using SIGNATURE_STROKES_RAW, you'd adjust the signature command generation logic.
-# For now, we'll assume SIGNATURE_POINTS_RAW is a single, continuous path after initial pen down.
-
---- END OF FILE: backend/signature_data.py ---
 --- START OF FILE: backend/voice_assistant.py ---
 # backend/voice_assistant.py
 import whisper
@@ -3416,8 +3580,7 @@ interface DrawingHistoryItem {
     status: string; // e.g., "completed", "interrupted", "in_progress", "aborted_manual_override"
     progress: number; // Percentage
     last_updated: string; // ISO date string
-    // The backend might send more, but these are key for UI
-    robot_commands_tuples?: any[]; // For potential client-side restart logic if needed, or just for info
+    robot_commands_tuples?: any[]; 
     current_command_index?: number;
     total_commands?: number;
 }
@@ -3428,6 +3591,8 @@ function App() {
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [robotStatusMessage, setRobotStatusMessage] = useState('Robot: Not connected');
   const [lastCommandResponse, setLastCommandResponse] = useState('');
+
+  const [useRealRobot, setUseRealRobot] = useState(false); // New state for robot type selection
 
   const [qrCodeImage, setQrCodeImage] = useState<string | null>(null);
   const [qrUploadUrl, setQrUploadUrl] = useState<string>('');
@@ -3440,8 +3605,8 @@ function App() {
   const [lastUploadedImageInfo, setLastUploadedImageInfo] = useState<string>('');
   const [uploadedFilePathFromBackend, setUploadedFilePathFromBackend] = useState<string | null>(null);
 
-  const [isDrawingActive, setIsDrawingActive] = useState(false); // Tracks if _execute_drawing_commands is running
-  const [activeDrawingId, setActiveDrawingId] = useState<string | null>(null); // Tracks the ID of the drawing being executed
+  const [isDrawingActive, setIsDrawingActive] = useState(false); 
+  const [activeDrawingId, setActiveDrawingId] = useState<string | null>(null); 
   const [drawingProgressMessage, setDrawingProgressMessage] = useState('');
   const [drawingProgressPercent, setDrawingProgressPercent] = useState(0);
   
@@ -3464,12 +3629,12 @@ function App() {
   const [thresholdPreviewImage, setThresholdPreviewImage] = useState<string | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
 
-  const clearActiveDrawingState = () => {
+  const clearActiveDrawingState = useCallback(() => { 
     setIsDrawingActive(false);
     setActiveDrawingId(null);
     setDrawingProgressMessage('Idle');
     setDrawingProgressPercent(0);
-  };
+  }, []); 
 
   useEffect(() => {
     socket = io(PYTHON_BACKEND_URL, { transports: ['websocket'] });
@@ -3485,7 +3650,6 @@ function App() {
       setIsConnectedToBackend(false);
       setIsRobotConnected(false);
       setRobotStatusMessage('Robot: Disconnected (backend offline)');
-      // Do not clear drawing active flags on simple disconnect, backend might still be processing or resumable
       setInteractionStatus('Backend offline. Please refresh or check server.');
       setShowThresholdModal(false); 
     });
@@ -3530,7 +3694,7 @@ function App() {
         active: boolean, 
         message: string, 
         progress?: number, 
-        resumable?: boolean, // This indicates if the specific drawing ID is resumable
+        resumable?: boolean, 
         drawing_id?: string,
         original_filename?: string 
       }) => {
@@ -3541,13 +3705,12 @@ function App() {
       }
 
       if (data.active) {
-        setIsDrawingActive(true);
-        if(data.drawing_id) setActiveDrawingId(data.drawing_id);
-      } else {
-        // If drawing is no longer active for this specific ID, or in general
-        if (activeDrawingId === data.drawing_id || !data.drawing_id) {
-            clearActiveDrawingState();
+        setIsDrawingActive(true); 
+        if (data.drawing_id) {
+          setActiveDrawingId(data.drawing_id); 
         }
+      } else { 
+        clearActiveDrawingState(); 
       }
     });
 
@@ -3613,7 +3776,7 @@ function App() {
         }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); 
+  }, [clearActiveDrawingState]); 
 
   const requestThresholdPreview = useCallback((key: string) => {
     const selectedOpt = THRESHOLD_OPTIONS.find(opt => opt.key === key);
@@ -3636,16 +3799,25 @@ function App() {
   }, [selectedThresholdKey, showThresholdModal, uploadedFilePathFromBackend, requestThresholdPreview]); 
 
 
-  const handleConnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_connect_request', {}); }
+  const handleConnectRobot = () => { 
+    if (!isDrawingActive && socket) {
+      // Send the useRealRobot state to the backend
+      socket.emit('robot_connect_request', { use_real_robot: useRealRobot }); 
+    }
+  }
   const handleDisconnectRobot = () => { if (!isDrawingActive && socket) socket.emit('robot_disconnect_request', {}); }
   const sendGoHomeCommand = () => { 
     if (!isDrawingActive && socket) {
       socket.emit('send_robot_command', { type: 'go_home' }); 
+    } else if (isDrawingActive) {
+      alert("Cannot send 'Go Home' command while drawing is active.");
     }
   }
   const sendSafeCenterCommand = () => { 
     if (!isDrawingActive && socket) {
       socket.emit('send_robot_command', { type: 'move_to_safe_center' }); 
+    } else if (isDrawingActive) {
+      alert("Cannot send 'Safe Center' command while drawing is active.");
     }
   }
   
@@ -3863,16 +4035,16 @@ function App() {
   };
 
   const styles: { [key: string]: React.CSSProperties } = {
-    appContainer: { maxWidth: '1400px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif', color: '#e0e0e0', backgroundColor: '#1e1e1e' }, // Wider for history
+    appContainer: { maxWidth: '1400px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif', color: '#e0e0e0', backgroundColor: '#1e1e1e' }, 
     header: { textAlign: 'center' as const, marginBottom: '30px', borderBottom: '1px solid #444', paddingBottom: '20px' },
     mainTitle: { fontSize: '2.5em', color: '#61dafb', margin: '0 0 10px 0' },
     statusText: { fontSize: '0.9em', color: isConnectedToBackend ? '#76ff03' : '#ff5252' },
-    mainLayoutContainer: { display: 'flex', flexDirection: 'column', gap: '25px' }, // Main sections stack vertically
+    mainLayoutContainer: { display: 'flex', flexDirection: 'column', gap: '25px' }, 
     topRowGrid: { display: 'grid', gridTemplateColumns: '1fr 2fr 1.5fr', gap: '25px', alignItems: 'start', marginBottom: '25px' }, 
     section: { backgroundColor: '#2a2a2a', padding: '20px', borderRadius: '8px', boxShadow: '0 4px 8px rgba(0,0,0,0.2)', display: 'flex', flexDirection: 'column', minHeight: '300px' }, 
     sectionTitle: { fontSize: '1.5em', color: '#61dafb', borderBottom: '1px solid #444', paddingBottom: '10px', marginBottom: '15px' },
     button: { backgroundColor: '#007bff', color: 'white', border: 'none', padding: '10px 15px', borderRadius: '5px', cursor: 'pointer', fontSize: '1em', margin: '5px', transition: 'background-color 0.2s ease' },
-    buttonDisabled: { backgroundColor: '#555', cursor: 'not-allowed' },
+    buttonDisabled: { backgroundColor: '#555', cursor: 'not-allowed', opacity: 0.6 }, 
     micButton: { backgroundColor: isRecording ? '#dc3545' : '#007bff', width: '60px', height: '60px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' },
     textarea: { width: 'calc(100% - 22px)', padding: '10px', marginBottom: '10px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff', minHeight: '60px' },
     imageUploadContainer: { display: 'flex', flexDirection: 'column', gap: '20px'}, 
@@ -3887,18 +4059,20 @@ function App() {
     coordInputGroup: { display: 'flex', alignItems: 'center', gap: '10px' },
     coordLabel: { minWidth: '70px', textAlign: 'right' as const, color: '#bbb' },
     coordInput: { flexGrow: 1, padding: '8px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff' },
+    checkboxContainer: { display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '10px 0', color: '#ccc' }, // Style for checkbox
+    checkboxInput: { marginRight: '8px', accentColor: '#61dafb' }, // Style for checkbox input
     modalOverlay: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 },
-    modalContent: { backgroundColor: '#2a2a2a', padding: '30px', borderRadius: '8px', boxShadow: '0 5px 15px rgba(0,0,0,0.3)', width: 'auto', minWidth: '750px', maxWidth: '900px', color: '#e0e0e0' }, // Increased width
+    modalContent: { backgroundColor: '#2a2a2a', padding: '30px', borderRadius: '8px', boxShadow: '0 5px 15px rgba(0,0,0,0.3)', width: 'auto', minWidth: '750px', maxWidth: '900px', color: '#e0e0e0' },
     modalTitle: { fontSize: '1.8em', color: '#61dafb', marginBottom: '20px', textAlign: 'center' as const },
     modalColumns: { display: 'flex', gap: '20px' },
     modalColumn: { flex: 1 },
-    modalRadioGroup: { maxHeight: '550px', overflowY: 'auto', paddingRight: '10px' }, // Increased height
+    modalRadioGroup: { maxHeight: '550px', overflowY: 'auto', paddingRight: '10px' }, 
     modalRadioLabel: { display: 'block', marginBottom: '8px', cursor: 'pointer', padding: '8px', borderRadius: '4px', transition: 'background-color 0.2s' },
     modalRadioLabelSelected: { backgroundColor: '#007bff', color: 'white' },
     modalPreviewArea: { textAlign: 'center' as const, borderLeft: '1px solid #444', paddingLeft: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
-    modalPreviewImage: { maxWidth: '350px', maxHeight: '350px', border: '1px solid #555', borderRadius: '4px', backgroundColor: '#1e1e1e', minHeight: '250px' }, // Increased preview image size
+    modalPreviewImage: { maxWidth: '350px', maxHeight: '350px', border: '1px solid #555', borderRadius: '4px', backgroundColor: '#1e1e1e', minHeight: '250px' }, 
     modalActions: { marginTop: '25px', textAlign: 'right' as const },
-    historySection: { /* Uses styles.section */ },
+    historySection: { },
     historyList: { listStyle: 'none', padding: 0, maxHeight: '400px', overflowY: 'auto'},
     historyItem: { backgroundColor: '#333', padding: '15px', borderRadius: '6px', marginBottom: '10px', borderLeft: '5px solid #007bff' },
     historyItemCompleted: { borderLeftColor: '#28a745' },
@@ -3920,6 +4094,19 @@ function App() {
           {/* Column 1: Robot Control */}
           <section style={styles.section}>
             <h2 style={styles.sectionTitle}>Robot Control</h2>
+            <div style={styles.checkboxContainer}> {/* Checkbox for robot type */}
+              <input 
+                type="checkbox" 
+                id="robotType" 
+                checked={useRealRobot} 
+                onChange={(e) => setUseRealRobot(e.target.checked)}
+                disabled={isRobotConnected || isDrawingActive || isRecording}
+                style={styles.checkboxInput}
+              />
+              <label htmlFor="robotType" style={{cursor: (isRobotConnected || isDrawingActive || isRecording) ? 'not-allowed' : 'pointer'}}>
+                Connect to Real Robot (Unchecked = Simulation)
+              </label>
+            </div>
             <div style={{textAlign: 'center'}}>
               <button onClick={handleConnectRobot} disabled={!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, ...((!isConnectedToBackend || isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Connect to Robot </button>
               <button onClick={handleDisconnectRobot} disabled={!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording} style={{...styles.button, backgroundColor: '#ffc107', color: '#1e1e1e', ...((!isConnectedToBackend || !isRobotConnected || isDrawingActive || isRecording) && styles.buttonDisabled)}}> Disconnect Robot</button>
@@ -4145,7 +4332,6 @@ function App() {
 
 export default App;
 
-
 --- END OF FILE: frontend/s2a-drawing-ui/src/App.tsx ---
 --- START OF FILE: frontend/s2a-drawing-ui/src/index.css ---
 :root {
@@ -4315,10 +4501,7 @@ export default defineConfig({
 
 --- END OF FILE: frontend/s2a-drawing-ui/vite.config.ts ---
 --- START OF FILE: README.md ---
-(This project will change into webapp due to computational resource constrain)
-
-
-# Speech to Action Robotic Drawing Application
+# Speech to Action Robotic Drawing Application (Locally)
 
 ## Introduction to the project
 
@@ -4355,7 +4538,7 @@ Open your preferred terminal (Git Bash, Command Prompt, PowerShell, or a Linux/m
 cd path/to/your/development/folder
 
 # Clone the repository using HTTPS (recommended for simplicity)
-git clone [https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git](https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git)
+git clone https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application_Locally.git
 
 # Or clone using SSH (if you have SSH keys set up with GitHub)
 # git clone git@github.com:CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git
@@ -4386,8 +4569,8 @@ git remote -v
 You should see output similar to:
 
 ```
-origin  [https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git](https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git) (fetch)
-origin  [https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git](https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git) (push)
+origin  https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application_Locally.git (fetch)
+origin  https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application_Locally.git (push)
 ```
 
 ### 1.4. Pushing Changes
