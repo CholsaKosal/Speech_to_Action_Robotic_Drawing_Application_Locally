@@ -35,7 +35,7 @@ Open your preferred terminal (Git Bash, Command Prompt, PowerShell, or a Linux/m
 cd path/to/your/development/folder
 
 # Clone the repository using HTTPS (recommended for simplicity)
-git clone [https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git](https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git)
+git clone https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application_Locally.git
 
 # Or clone using SSH (if you have SSH keys set up with GitHub)
 # git clone git@github.com:CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git
@@ -66,8 +66,8 @@ git remote -v
 You should see output similar to:
 
 ```
-origin  [https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git](https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git) (fetch)
-origin  [https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git](https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application.git) (push)
+origin  https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application_Locally.git (fetch)
+origin  https://github.com/CholsaKosal/Speech_to_Action_Robotic_Drawing_Application_Locally.git (push)
 ```
 
 ### 1.4. Pushing Changes
