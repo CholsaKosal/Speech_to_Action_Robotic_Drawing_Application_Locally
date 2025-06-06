@@ -3,7 +3,8 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
 import './App.css'; 
 
-const PYTHON_BACKEND_URL = 'http://localhost:5555';
+// *** UPDATED: Changed URL to HTTPS ***
+const PYTHON_BACKEND_URL = 'https://localhost:5555';
 
 let socket: Socket;
 let mediaRecorder: MediaRecorder | null = null;
@@ -14,7 +15,12 @@ const MicIcon = () => ( <svg xmlns="http://www.w3.org/2000/svg" width="24" heigh
 const StopIcon = () => ( <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 16 16"> <path d="M5 3.5h6A1.5 1.5 0 0 1 12.5 5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5z"/> </svg> );
 
 interface ThresholdOption { key: string; label: string; t1: number; t2: number; }
-const THRESHOLD_OPTIONS: ThresholdOption[] = Array.from({ length: 10 }, (_, i) => ({ key: `opt${i + 1}`, label: `Style ${i + 1}`, t1: (i + 1) * 10 + 20, t2: (i + 1) * 20 + 40, }));
+const THRESHOLD_OPTIONS: ThresholdOption[] = Array.from({ length: 10 }, (_, i) => ({ 
+    key: `opt${i + 1}`, 
+    label: `Option ${i + 1}`, 
+    t1: (i + 1) * 10, 
+    t2: (i + 1) * 20 
+}));
 
 interface DrawingHistoryItem {
     drawing_id: string;
@@ -69,7 +75,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    socket = io(PYTHON_BACKEND_URL, { transports: ['websocket'] });
+    socket = io(PYTHON_BACKEND_URL, { 
+        transports: ['websocket'],
+        // This tells the client to trust the self-signed certificate.
+        // In a real production app, you would use a proper certificate and not need this.
+        rejectUnauthorized: false 
+    });
 
     socket.on('connect', () => setIsConnectedToBackend(true));
     socket.on('disconnect', () => {
@@ -328,7 +339,7 @@ function App() {
     }
     if (socket && isConnectedToBackend) {
       socket.emit('submit_text_to_llm', { text_command: text });
-      setLlmResponse(''); // Clear previous response
+      setLlmResponse(''); 
       setInteractionStatus('Robotist is thinking...');
     }
   };

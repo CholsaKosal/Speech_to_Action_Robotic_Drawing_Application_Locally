@@ -57,6 +57,12 @@ app.on('window-all-closed', () => {
   }
 })
 
+// *** ADDED: Ignore certificate errors for local HTTPS development ***
+// This allows the Electron app to connect to the backend server
+// which is using a self-signed certificate.
+app.commandLine.appendSwitch('ignore-certificate-errors');
+
+
 app.on('activate', () => {
   // On OS X it's common to re-create a window in the app when the
   // dock icon is clicked and there are no other windows open.
@@ -66,3 +72,4 @@ app.on('activate', () => {
 })
 
 app.whenReady().then(createWindow)
+

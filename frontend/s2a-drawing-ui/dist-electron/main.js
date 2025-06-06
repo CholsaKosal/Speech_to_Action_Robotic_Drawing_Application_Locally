@@ -32,6 +32,7 @@ app.on("window-all-closed", () => {
     win = null;
   }
 });
+app.commandLine.appendSwitch("ignore-certificate-errors");
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
