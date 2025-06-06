@@ -251,15 +251,25 @@ def handle_direct_image_upload(data):
     except Exception as e:
         emit('direct_image_upload_response', {'success': False, 'message': f"Server error: {e}"})
 
-def _get_commands_for_drawing_from_file(filepath, canny_t1, canny_t2):
+# *** MODIFIED: Accept pen_down_z ***
+def _get_commands_for_drawing_from_file(filepath, canny_t1, canny_t2, pen_down_z):
     """Helper to generate full command list (drawing + signature) from a file."""
     try:
-        robot_commands = process_image_to_robot_commands_pipeline(filepath, canny_t1, canny_t2, optimize=True)
+        # Pass pen_down_z to the main pipeline
+        robot_commands = process_image_to_robot_commands_pipeline(
+            filepath, 
+            canny_t1, 
+            canny_t2,
+            pen_down_z, # Use the user-provided value
+            optimize=True
+        )
         if os.path.exists(SIGNATURE_IMAGE_FULL_PATH):
+            # Pass pen_down_z to the signature pipeline as well for consistency
             signature_commands = process_image_to_robot_commands_pipeline(
                 SIGNATURE_IMAGE_FULL_PATH, 
                 config.SIGNATURE_CANNY_THRESHOLD1, 
                 config.SIGNATURE_CANNY_THRESHOLD2, 
+                pen_down_z, # Use the same user-provided value for signature
                 optimize=True
             )
             if signature_commands:
@@ -275,13 +285,18 @@ def _get_commands_for_drawing(drawing_id):
     if not history_item: 
         logging.error(f"Could not find drawing_id {drawing_id} in history.")
         return None
+    
     filepath = history_item.get('filepath_on_server')
     canny_t1 = history_item.get('canny_t1', config.DEFAULT_CANNY_THRESHOLD1)
     canny_t2 = history_item.get('canny_t2', config.DEFAULT_CANNY_THRESHOLD2)
+    # *** MODIFIED: Retrieve pen_down_z from history ***
+    pen_down_z = history_item.get('pen_down_z', config.DEFAULT_PEN_DOWN_Z_PY)
+    
     if not filepath or not os.path.exists(filepath):
         logging.error(f"Filepath '{filepath}' for drawing {drawing_id} not found.")
         return None
-    return _get_commands_for_drawing_from_file(filepath, canny_t1, canny_t2)
+    
+    return _get_commands_for_drawing_from_file(filepath, canny_t1, canny_t2, pen_down_z)
 
 @socketio.on('resume_drawing_request')
 def handle_resume_drawing(data):
@@ -292,7 +307,10 @@ def handle_resume_drawing(data):
     history_item = next((item for item in drawing_history if item.get('drawing_id') == drawing_id), None)
     if not history_item:
         emit('command_response', {'success': False, 'message': f"Drawing ID {drawing_id} not found."}); return
+    
+    # _get_commands_for_drawing now implicitly handles getting the correct pen_down_z from history
     commands = _get_commands_for_drawing(drawing_id)
+    
     if not commands:
         emit('command_response', {'success': False, 'message': f"Could not get commands for {drawing_id}."}); return
     start_index = history_item.get('current_command_index', 0)
@@ -308,7 +326,10 @@ def handle_restart_drawing(data):
     if is_drawing_flag_for_ui:
         emit('command_response', {'success': False, 'message': "Another drawing is active."}); return
     drawing_id = data.get('drawing_id')
+    
+    # _get_commands_for_drawing now implicitly handles getting the correct pen_down_z from history
     commands = _get_commands_for_drawing(drawing_id)
+
     if not commands:
         emit('command_response', {'success': False, 'message': f"Could not get commands for {drawing_id}."}); return
     logging.info(f"Restarting drawing '{drawing_id}'.")
@@ -322,13 +343,19 @@ def handle_process_image_for_drawing(data):
     global is_drawing_flag_for_ui, active_drawing_session_id, drawing_history
     if check_and_abort_active_drawing("new_drawing_request"):
         socketio.sleep(0.5)
+        
     filepath = data.get('filepath')
     original_filename = data.get('original_filename', os.path.basename(filepath or "unknown"))
     canny_t1, canny_t2 = data.get('canny_t1'), data.get('canny_t2')
+    # *** MODIFIED: Get pen_down_z from frontend, with a default ***
+    pen_down_z = data.get('pen_down_z', config.DEFAULT_PEN_DOWN_Z_PY)
+    
     if not filepath or not os.path.exists(filepath):
         emit('command_response', {'success': False, 'message': f"File not found: {filepath}"}); return
     try:
-        robot_commands = _get_commands_for_drawing_from_file(filepath, canny_t1, canny_t2)
+        # Pass the pen_down_z value to the command generation function
+        robot_commands = _get_commands_for_drawing_from_file(filepath, canny_t1, canny_t2, pen_down_z)
+        
         if not robot_commands:
             emit('command_response', {'success': False, 'message': f"No drawing paths found in '{original_filename}'."}); return
         
@@ -337,9 +364,11 @@ def handle_process_image_for_drawing(data):
         active_drawing_session_id = drawing_id
         is_drawing_flag_for_ui = True
         
+        # *** MODIFIED: Save pen_down_z to history item ***
         history_item = {
             'drawing_id': drawing_id, 'filepath_on_server': filepath, 'original_filename': original_filename,
             'status': 'in_progress', 'total_commands': total_commands, 'canny_t1': canny_t1, 'canny_t2': canny_t2,
+            'pen_down_z': pen_down_z, # Store the value used for this drawing
             'current_command_index': 0
         }
         drawing_history.insert(0, history_item)
@@ -366,7 +395,6 @@ def handle_request_qr_code(data):
         s.connect(("8.8.8.8", 80)); host_ip = s.getsockname()[0]; s.close()
     except Exception: pass
 
-    # *** UPDATED: Generate URL with https scheme ***
     protocol = "https" if os.path.exists('cert.pem') else "http"
     upload_url = f"{protocol}://{host_ip}:{app.config.get('SERVER_PORT', 5555)}/qr_upload_page/{session_id}"
 

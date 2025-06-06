@@ -39,6 +39,9 @@ function App() {
   const [lastCommandResponse, setLastCommandResponse] = useState('');
   const [useRealRobot, setUseRealRobot] = useState(false);
 
+  // *** NEW: State for pen down depth ***
+  const [penDownZ, setPenDownZ] = useState<number>(-7.0);
+
   const [qrCodeImage, setQrCodeImage] = useState<string | null>(null);
   const [qrUploadUrl, setQrUploadUrl] = useState<string>('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -77,8 +80,6 @@ function App() {
   useEffect(() => {
     socket = io(PYTHON_BACKEND_URL, { 
         transports: ['websocket'],
-        // This tells the client to trust the self-signed certificate.
-        // In a real production app, you would use a proper certificate and not need this.
         rejectUnauthorized: false 
     });
 
@@ -262,11 +263,13 @@ function App() {
     setDrawingStatusText(`Processing image: ${originalFilename}...`);
     setDrawingProgress(0);
 
+    // *** MODIFIED: Send pen_down_z value to backend ***
     socket.emit('process_image_for_drawing', {
         filepath: lastUploadedImageInfo.filepath,
         original_filename: originalFilename,
         canny_t1: selectedOpt.t1,
-        canny_t2: selectedOpt.t2
+        canny_t2: selectedOpt.t2,
+        pen_down_z: penDownZ
     });
     
     setShowThresholdModal(false);
@@ -386,7 +389,7 @@ function App() {
     progressBar: { backgroundColor: '#61dafb', height: '20px', textAlign: 'center' as const, lineHeight: '20px', color: '#1e1e1e', transition: 'width 0.3s ease' },
     robotStatus: { padding: '10px', backgroundColor: '#333', borderRadius: '4px', fontSize: '0.9em', marginTop: '10px' },
     llmResponseBox: { marginTop: '15px', padding: '15px', border: '1px solid #444', borderRadius: '4px', backgroundColor: '#333', whiteSpace: 'pre-wrap' as const, maxHeight: '200px', overflowY: 'auto' as const, flexGrow: 1},
-    coordInputContainer: { display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '15px', marginBottom: '15px' },
+    coordInputContainer: { display: 'flex', flexDirection: 'column', gap: '10px', marginTop: 'auto' },
     coordInputGroup: { display: 'flex', alignItems: 'center', gap: '10px' },
     coordLabel: { minWidth: '100px', textAlign: 'right' as const, color: '#bbb' },
     coordInput: { flexGrow: 1, padding: '8px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#333', color: '#fff' },
@@ -439,11 +442,18 @@ function App() {
              </div>
 
              <div style={styles.coordInputContainer}>
-                <h3 style={{fontSize: '1.1em', color: '#ccc', textAlign: 'center'}}>Custom Move</h3>
+                <h3 style={{fontSize: '1.1em', color: '#ccc', textAlign: 'center', marginBottom: '10px'}}>Drawing & Move Settings</h3>
+                {/* *** NEW: Pen Down Depth Input *** */}
+                <div style={styles.coordInputGroup}>
+                    <label style={styles.coordLabel}>Pen Down Depth:</label>
+                    <input type="number" value={penDownZ} onChange={e => setPenDownZ(parseFloat(e.target.value) || 0)} style={styles.coordInput} disabled={isDrawing} />
+                </div>
+
+                <h4 style={{fontSize: '1em', color: '#bbb', textAlign: 'center', marginTop: '15px', marginBottom: '5px'}}>Custom Move</h4>
                 <div style={styles.coordInputGroup}><label style={styles.coordLabel}>X (paper):</label><input type="number" value={xCoord} onChange={e => setXCoord(e.target.value)} style={styles.coordInput} disabled={!isRobotConnected || isDrawing} /></div>
                 <div style={styles.coordInputGroup}><label style={styles.coordLabel}>Depth (pen):</label><input type="number" value={yCoord} onChange={e => setYCoord(e.target.value)} style={styles.coordInput} disabled={!isRobotConnected || isDrawing} /></div>
                 <div style={styles.coordInputGroup}><label style={styles.coordLabel}>Side (paper):</label><input type="number" value={zCoord} onChange={e => setZCoord(e.target.value)} style={styles.coordInput} disabled={!isRobotConnected || isDrawing} /></div>
-                <button onClick={handleSendCustomCoordinates} disabled={!isRobotConnected || isDrawing} style={{...styles.button, ...((!isRobotConnected || isDrawing) && styles.buttonDisabled)}}>Send Coords</button>
+                <button onClick={handleSendCustomCoordinates} disabled={!isRobotConnected || isDrawing} style={{...styles.button, marginTop:'10px', ...((!isRobotConnected || isDrawing) && styles.buttonDisabled)}}>Send Coords</button>
              </div>
              {lastCommandResponse && <p style={{fontSize: '0.8em', color: '#aaa', marginTop: '10px', textAlign: 'center'}}>Last Resp: {lastCommandResponse}</p>}
           </section>
