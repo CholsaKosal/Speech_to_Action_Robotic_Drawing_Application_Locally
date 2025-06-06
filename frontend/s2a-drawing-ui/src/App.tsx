@@ -22,6 +22,7 @@ interface DrawingHistoryItem {
     status: string;
     last_updated: string;
     total_commands?: number;
+    progress?: number;
 }
 
 // --- Main App Component ---
@@ -41,7 +42,6 @@ function App() {
   const [lastUploadedImageInfo, setLastUploadedImageInfo] = useState<{message: string, filepath: string | null}>({message: '', filepath: null});
 
   const [isDrawing, setIsDrawing] = useState(false);
-  const [activeDrawingId, setActiveDrawingId] = useState<string | null>(null);
   const [drawingProgress, setDrawingProgress] = useState(0);
   const [drawingStatusText, setDrawingStatusText] = useState('Idle');
   const [drawingHistory, setDrawingHistory] = useState<DrawingHistoryItem[]>([]);
@@ -64,7 +64,6 @@ function App() {
 
   const clearActiveDrawingState = useCallback(() => {
     setIsDrawing(false);
-    setActiveDrawingId(null);
     setDrawingProgress(0);
     setDrawingStatusText('Idle');
   }, []);
@@ -109,20 +108,14 @@ function App() {
     });
 
     socket.on('drawing_status_update', (data: { active: boolean, message: string, progress?: number, drawing_id?: string }) => {
-      console.log("FRONTEND: drawing_status_update received:", data);
       setIsDrawing(data.active);
       setDrawingStatusText(data.message);
-      if (data.drawing_id) {
-          setActiveDrawingId(data.drawing_id);
-      }
       if (typeof data.progress === 'number') {
           setDrawingProgress(data.progress);
       }
     });
 
     socket.on('drawing_completed', (data: { drawing_id: string, message: string }) => {
-        console.log(`Frontend: Received 'drawing_completed' for ID ${data.drawing_id}`);
-        // *** REMOVED activeDrawingId CHECK ***
         setIsDrawing(false);
         setDrawingProgress(100);
         setDrawingStatusText(data.message || 'Drawing complete!');
@@ -130,8 +123,6 @@ function App() {
     });
     
     socket.on('drawing_aborted', (data: { drawing_id: string, message: string }) => {
-        console.log(`Frontend: Received 'drawing_aborted' for ID ${data.drawing_id}`);
-        // *** REMOVED activeDrawingId CHECK ***
         clearActiveDrawingState();
         setDrawingStatusText(data.message || 'Drawing aborted.');
     });
@@ -257,7 +248,6 @@ function App() {
     const originalFilename = lastUploadedImageInfo.message.includes("Received: ") ? lastUploadedImageInfo.message.split("Received: ")[1].split(".")[0] : "uploaded_image";
 
     setIsDrawing(true);
-    setActiveDrawingId(null); // Will be set by backend
     setDrawingStatusText(`Processing image: ${originalFilename}...`);
     setDrawingProgress(0);
 
@@ -272,11 +262,19 @@ function App() {
   };
   
   const handleResumeDrawingFromHistory = (drawingId: string) => {
-    alert(`Resume requested for ${drawingId}. (Functionality pending)`);
+    if (isDrawing) { alert("Another drawing is already active."); return; }
+    if (socket) {
+        console.log(`Frontend: Emitting resume_drawing_request for ${drawingId}`);
+        socket.emit('resume_drawing_request', { drawing_id: drawingId });
+    }
   };
   
   const handleRestartDrawingFromHistory = (drawingId: string) => {
-    alert(`Restart requested for ${drawingId}. (Functionality pending)`);
+    if (isDrawing) { alert("Another drawing is already active."); return; }
+    if (socket) {
+        console.log(`Frontend: Emitting restart_drawing_request for ${drawingId}`);
+        socket.emit('restart_drawing_request', { drawing_id: drawingId });
+    }
   };
   
   const startRecording = async () => { 
@@ -322,6 +320,7 @@ function App() {
     }
   };
   const handleMicButtonClick = () => { isRecording ? stopRecording() : startRecording(); };
+  
   const submitTextToLLM = (text: string) => { 
     if (!text.trim()) {
       alert("Command cannot be empty.");
@@ -513,6 +512,7 @@ function App() {
                                 <div>
                                     <p style={styles.historyDetails}>Status: {item.status.replace(/_/g, ' ')}</p>
                                     <p style={styles.historyDetails}>Last Update: {new Date(item.last_updated).toLocaleString()}</p>
+                                    {item.progress !== undefined && item.status.includes('interrupted') && <div style={{width: '100px', backgroundColor: '#555'}}><div style={{width: `${item.progress}%`, backgroundColor: '#ffc107', height: '5px'}}></div></div>}
                                 </div>
                                 <div style={styles.historyActions}>
                                     {(item.status.includes('interrupted')) && (

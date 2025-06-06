@@ -168,6 +168,18 @@ echo Look under "Display Devices" in that file for VRAM information (e.g., "Disp
 
 8.  The `backend` directory should contain subdirectories like `models` (for AI models), `qr_uploads` (for images uploaded via QR code), and `audio_tmp` (for temporary audio files). These are typically ignored by Git but needed for runtime.
 
+9.  **Generate Local SSL Certificate (Required for Mobile Upload):**
+    For the QR code upload from a mobile phone to work securely, the backend server needs to run over HTTPS. You can generate a self-signed certificate for local development.
+    
+    * **Install OpenSSL:** If you have Git for Windows, OpenSSL is likely already included. You can check by typing `openssl version` in Git Bash. If not, you can download it for your OS.
+    * **Generate Certificate:** In your terminal, navigate to the `backend` directory and run the following command:
+        ```bash
+        openssl req -x509 -newkey rsa:4096 -nodes -out cert.pem -keyout key.pem -days 365
+        ```
+    * You will be prompted for information (Country Name, etc.). You can press Enter for each prompt to accept the defaults or fill them in. The most important field is "Common Name (e.g. server FQDN or YOUR name)". For local development, entering `localhost` is a good practice.
+    * This will create two files in your `backend` directory: `cert.pem` and `key.pem`. These files are included in the `.gitignore` and should not be committed to the repository. The server is now configured to use them.
+
+
 ### 2.3. JavaScript/TypeScript Frontend Setup (Electron with Vite)
 
 The frontend is located in `frontend/s2a-drawing-ui/`.
@@ -259,11 +271,17 @@ This script helps generate a snapshot of the current codebase, excluding large o
 
 ### 3.4. Testing Robot Communication
 
-1.  Ensure your GOFA CRB 15000 robot controller is powered on and connected to the same network as your development PC.
+1.  Ensure your GOFA CRB 15000 robot controller simulation/real controller is powered on.
 2.  Verify the robot controller's IP address and port match the settings in your backend's `config.py`.
 3.  Use the application's UI or voice commands to initiate actions that involve robot communication.
 4.  Monitor backend logs for connection status and command exchange.
 5.  If using RobotStudio for simulation, ensure it's running and configured to listen for socket connections from your application.
+
+
+### 3.5. Mobile Upload via QR Code
+When you scan the QR code now, the URL will be `https://...`. Your phone's browser will show a security warning because the certificate is self-signed (not from a trusted authority). This is expected and safe for local development. **You must accept the risk and proceed to the page** for the upload to work.
+
+
 
 ## 4. Other Necessary Information for Development
 
