@@ -177,6 +177,17 @@ echo Look under "Display Devices" in that file for VRAM information (e.g., "Disp
         openssl req -x509 -newkey rsa:4096 -nodes -out cert.pem -keyout key.pem -days 365
         ```
     * You will be prompted for information (Country Name, etc.). You can press Enter for each prompt to accept the defaults or fill them in. The most important field is "Common Name (e.g. server FQDN or YOUR name)". For local development, entering `localhost` is a good practice.
+    * You can use these values, or just press Enter to accept the defaults/leave them blank for most of them.
+    ```bash
+    Country Name (2 letter code) [AU]: KH
+    State or Province Name (full name) []: Phnom Penh
+    Locality Name (eg, city) []: Phnom Penh
+    Organization Name (eg, company) []: MyDevPC (You can put anything here)
+    Organizational Unit Name (eg, section) []: Development (You can put anything here)
+    Common Name (e.g. server FQDN or YOUR name) []: localhost (This one is important)
+    Email Address []: (You can leave this blank by pressing Enter)
+    After you complete these steps, the cert.pem and key.pem files will be created in your backend directory, and the server will be able to run over HTTPS.
+    ```
     * This will create two files in your `backend` directory: `cert.pem` and `key.pem`. These files are included in the `.gitignore` and should not be committed to the repository. The server is now configured to use them.
 
 
