@@ -55,7 +55,7 @@ def get_ui_history_summary(history_list):
     """Creates a simplified summary of drawing history for the frontend."""
     summary = []
     for item in history_list:
-        total_commands = item.get('total_commands', 1) # Avoid division by zero
+        total_commands = item.get('total_commands', 1) 
         if total_commands == 0: total_commands = 1
         current_index = item.get('current_command_index', 0)
         progress = (current_index / total_commands) * 100 if item.get('status') != 'completed' else 100
@@ -251,12 +251,10 @@ def handle_direct_image_upload(data):
     except Exception as e:
         emit('direct_image_upload_response', {'success': False, 'message': f"Server error: {e}"})
 
-# *** NEW: Defined helper function that was previously missing ***
 def _get_commands_for_drawing_from_file(filepath, canny_t1, canny_t2):
     """Helper to generate full command list (drawing + signature) from a file."""
     try:
         robot_commands = process_image_to_robot_commands_pipeline(filepath, canny_t1, canny_t2, optimize=True)
-        # Add signature commands if available
         if os.path.exists(SIGNATURE_IMAGE_FULL_PATH):
             signature_commands = process_image_to_robot_commands_pipeline(
                 SIGNATURE_IMAGE_FULL_PATH, 
@@ -283,7 +281,6 @@ def _get_commands_for_drawing(drawing_id):
     if not filepath or not os.path.exists(filepath):
         logging.error(f"Filepath '{filepath}' for drawing {drawing_id} not found.")
         return None
-    # Use the new helper function
     return _get_commands_for_drawing_from_file(filepath, canny_t1, canny_t2)
 
 @socketio.on('resume_drawing_request')
@@ -322,7 +319,7 @@ def handle_restart_drawing(data):
 
 @socketio.on('process_image_for_drawing')
 def handle_process_image_for_drawing(data):
-    global is_drawing_flag_for_ui, active_drawing_session_id
+    global is_drawing_flag_for_ui, active_drawing_session_id, drawing_history
     if check_and_abort_active_drawing("new_drawing_request"):
         socketio.sleep(0.5)
     filepath = data.get('filepath')
@@ -331,7 +328,6 @@ def handle_process_image_for_drawing(data):
     if not filepath or not os.path.exists(filepath):
         emit('command_response', {'success': False, 'message': f"File not found: {filepath}"}); return
     try:
-        # *** FIXED: Call the correct, newly defined helper function ***
         robot_commands = _get_commands_for_drawing_from_file(filepath, canny_t1, canny_t2)
         if not robot_commands:
             emit('command_response', {'success': False, 'message': f"No drawing paths found in '{original_filename}'."}); return
@@ -346,7 +342,6 @@ def handle_process_image_for_drawing(data):
             'status': 'in_progress', 'total_commands': total_commands, 'canny_t1': canny_t1, 'canny_t2': canny_t2,
             'current_command_index': 0
         }
-        global drawing_history
         drawing_history.insert(0, history_item)
         drawing_history = drawing_history[:MAX_DRAWING_HISTORY]
         update_drawing_history(drawing_id, status='in_progress')
@@ -361,8 +356,7 @@ def handle_process_image_for_drawing(data):
 def handle_request_qr_code(data):
     global current_upload_session_id
     if is_drawing_flag_for_ui:
-        emit('qr_code_data', {'error': 'A drawing is currently in progress.'})
-        return
+        emit('qr_code_data', {'error': 'A drawing is currently in progress.'}); return
     check_and_abort_active_drawing("new_qr_request")
     session_id = uuid.uuid4().hex
     current_upload_session_id = session_id
@@ -371,7 +365,11 @@ def handle_request_qr_code(data):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80)); host_ip = s.getsockname()[0]; s.close()
     except Exception: pass
-    upload_url = f"http://{host_ip}:{app.config.get('SERVER_PORT', 5555)}/qr_upload_page/{session_id}"
+
+    # *** UPDATED: Generate URL with https scheme ***
+    protocol = "https" if os.path.exists('cert.pem') else "http"
+    upload_url = f"{protocol}://{host_ip}:{app.config.get('SERVER_PORT', 5555)}/qr_upload_page/{session_id}"
+
     qr_img = qrcode.make(upload_url)
     buffered = BytesIO()
     qr_img.save(buffered, format="PNG")
@@ -389,7 +387,6 @@ def handle_request_threshold_preview(data):
             emit('threshold_preview_image_response', {'image_base64': img_base64})
         else: emit('threshold_preview_image_response', {'error': 'Failed to generate preview.'})
     except Exception as e:
-        logging.error(f"API Error threshold preview: {e}", exc_info=True)
         emit('threshold_preview_image_response', {'error': f'Server error: {e}'})
 
 @socketio.on('audio_chunk')
