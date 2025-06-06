@@ -65,11 +65,10 @@ SIGNATURE_CANNY_THRESHOLD2 = 150
 AUDIO_TEMP_FOLDER = 'audio_tmp' # Relative to the backend directory
 
 # --- LLM Settings ---
-# IMPORTANT: Replace with the actual filename of your downloaded GGUF model
-# LLM_MODEL_FILENAME = "deepseek-llm-7b-chat.Q4_K_M.gguf"
-LLM_MODEL_FILENAME = ""
-LLM_MAX_TOKENS = 512 # Max tokens for LLM response
-LLM_TEMPERATURE = 0.3 # Temperature for LLM response
-LLM_N_CTX = 2048 # Context window size for the LLM
-LLM_N_GPU_LAYERS = 0 # Number of layers to offload to GPU. 0 for CPU only. 
-                     # If you have a compatible GPU and llama-cpp-python with GPU support, you can increase this.
+# IMPORTANT: Replace with the actual filename of your downloaded GGUF model.
+# The file should be placed inside the `backend/models/` directory.
+LLM_MODEL_FILENAME = "deepseek-llm-7b-chat.Q4_K_M.gguf" 
+LLM_MAX_TOKENS = 512
+LLM_TEMPERATURE = 0.3
+LLM_N_CTX = 2048
+LLM_N_GPU_LAYERS = 0 # Set to a number > 0 to offload layers to GPU. Requires compatible hardware and drivers.

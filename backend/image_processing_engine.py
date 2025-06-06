@@ -2,35 +2,31 @@
 import cv2
 import numpy as np
 import math
-import os # For path joining if saving temp edge images
-import config # Import our configuration
-import logging # Added for consistency
+import os 
+import config 
+import logging 
 
-# --- Helper Function (from original main.py) ---
 def calculate_distance(p1, p2):
     """Calculates Euclidean distance between two points (x, y)."""
     if p1 is None or p2 is None: return float('inf')
     return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
-# --- Core Image Processing Functions (adapted from original main.py) ---
-
 def get_canny_edges_array(image_path_or_array, threshold1, threshold2):
     """
     Generates a Canny edge detected image array.
-    :param image_path_or_array: Path to the input image or a pre-loaded cv2 image array (BGR or Grayscale).
-    :param threshold1: Lower threshold for Canny edge detection.
-    :param threshold2: Upper threshold for Canny edge detection.
-    :return: NumPy array of the Canny edges, or None on failure.
     """
     if isinstance(image_path_or_array, str):
+        # *** ADDED LOGGING ***
+        logging.info(f"Reading image for Canny from path: {image_path_or_array}")
         if not os.path.exists(image_path_or_array):
             logging.error(f"Image path does not exist: {image_path_or_array}")
             return None
         image = cv2.imread(image_path_or_array, cv2.IMREAD_GRAYSCALE)
         if image is None:
-            logging.error(f"Could not read image at {image_path_or_array}")
+            logging.error(f"cv2.imread failed to read image at {image_path_or_array}. Check file integrity and permissions.")
             return None
     elif isinstance(image_path_or_array, np.ndarray):
+        logging.info("Processing Canny on a pre-loaded numpy array.")
         if len(image_path_or_array.shape) == 3: # BGR
             image = cv2.cvtColor(image_path_or_array, cv2.COLOR_BGR2GRAY)
         elif len(image_path_or_array.shape) == 2: # Already Grayscale
@@ -56,33 +52,14 @@ def get_canny_edges_array(image_path_or_array, threshold1, threshold2):
 def get_image_contours(image_path, threshold1, threshold2, save_edge_path_prefix=None):
     """
     Convert image to contours using specific thresholds.
-    :param image_path: Path to the input image.
-    :param threshold1: Lower threshold for Canny edge detection.
-    :param threshold2: Upper threshold for Canny edge detection.
-    :param save_edge_path_prefix: Optional prefix to save the edge image for preview (e.g., "temp_edges").
-                                  If provided, the edge image from Canny will be saved.
-    :return: List of contours (pixel coordinates), image_width, image_height, or (None, 0, 0) on failure.
     """
     edges = get_canny_edges_array(image_path, threshold1, threshold2)
     if edges is None:
         return None, 0, 0
         
-    image_height, image_width = edges.shape[:2] # Get dimensions from the edges image
+    image_height, image_width = edges.shape[:2]
 
-    if save_edge_path_prefix:
-        try:
-            # Ensure the directory for saved edges exists if it's part of the prefix
-            edge_save_dir = os.path.dirname(save_edge_path_prefix)
-            if edge_save_dir and not os.path.exists(edge_save_dir):
-                os.makedirs(edge_save_dir, exist_ok=True)
-            
-            base, ext = os.path.splitext(os.path.basename(image_path))
-            edge_filename = f"{save_edge_path_prefix}_{base}_t{threshold1}-{threshold2}.png"
-            cv2.imwrite(edge_filename, edges)
-            logging.info(f"Edge image saved to {edge_filename} (from get_image_contours)")
-        except Exception as e:
-            logging.error(f"Failed to save edge image in get_image_contours: {e}")
-
+    # ... (rest of the function is unchanged) ...
     contours_cv, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
     contours_xy = []
@@ -124,8 +101,6 @@ def scale_contour_point(point_xy, image_width, image_height, target_width_mm, ta
 def generate_robot_drawing_commands(contours_xy, image_width, image_height, optimize_paths=True):
     """ 
     Takes list of contours (pixel coordinates), scales them, creates drawing paths (X_py, Z_depth_py, Y_py).
-    Z_py is the pen height (config.PEN_UP_Z_PY or config.PEN_DOWN_Z_PY).
-    X_py and Y_py are the planar coordinates for drawing.
     """
     if not contours_xy or image_width <= 0 or image_height <= 0:
         return []
@@ -208,63 +183,18 @@ def process_image_to_robot_commands_pipeline(image_filepath,
                                              optimize=True):
     """
     Main pipeline function to take an image path and return a list of robot drawing commands.
-    Each command is a tuple (X_py, Z_depth_py, Y_py).
     """
-    logging.info(f"Processing image: {image_filepath} with Canny thresholds: {canny_thresh1}, {canny_thresh2}")
+    logging.info(f"Pipeline started for image: {image_filepath} with Canny: {canny_thresh1}, {canny_thresh2}")
     
-    # The get_image_contours function now internally calls get_canny_edges_array
-    # and can save a preview if save_edge_path_prefix is set (though api_server handles preview separately now)
-    contours, img_w, img_h = get_image_contours(image_filepath, canny_thresh1, canny_thresh2, save_edge_path_prefix=None) # No separate save here
+    contours, img_w, img_h = get_image_contours(image_filepath, canny_thresh1, canny_thresh2)
 
     if contours is None or not contours:
         logging.warning("No contours found or error in contour extraction.")
         return []
 
-    logging.info(f"Found {len(contours)} contours. Image dimensions: {img_w}x{img_h}")
+    logging.info(f"Found {len(contours)} contours. Generating robot commands...")
     
     robot_drawing_cmds = generate_robot_drawing_commands(contours, img_w, img_h, optimize_paths=optimize)
     
     logging.info(f"Generated {len(robot_drawing_cmds)} robot drawing commands.")
     return robot_drawing_cmds
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO) # Ensure logging is configured for direct script run
-    
-    if not os.path.exists(config.QR_UPLOAD_FOLDER):
-        os.makedirs(config.QR_UPLOAD_FOLDER)
-
-    test_image_name = "test_square_preview.png"
-    test_image_path = os.path.join(config.QR_UPLOAD_FOLDER, test_image_name)
-    if not os.path.exists(test_image_path):
-        img_arr = np.zeros((200, 200, 1), dtype="uint8")
-        cv2.rectangle(img_arr, (50, 50), (150, 150), (255), thickness=3) 
-        cv2.imwrite(test_image_path, img_arr)
-        logging.info(f"Created dummy test image: {test_image_path}")
-
-    if os.path.exists(test_image_path):
-        logging.info(f"\n--- Testing Canny Edge Array Generation for {test_image_path} ---")
-        test_t1, test_t2 = 50, 150
-        edges = get_canny_edges_array(test_image_path, test_t1, test_t2)
-        if edges is not None:
-            logging.info(f"Canny edges array generated with shape: {edges.shape}")
-            preview_save_path = os.path.join(config.QR_UPLOAD_FOLDER, f"test_canny_preview_t{test_t1}_{test_t2}.png")
-            cv2.imwrite(preview_save_path, edges)
-            logging.info(f"Saved Canny edge preview to: {preview_save_path}")
-        else:
-            logging.error("Failed to generate Canny edges array.")
-
-        logging.info(f"\n--- Testing image processing pipeline with {test_image_path} ---")
-        commands = process_image_to_robot_commands_pipeline(test_image_path, canny_thresh1=test_t1, canny_thresh2=test_t2)
-        if commands:
-            logging.info(f"\nFirst 5 generated commands (X_py, Z_depth_py, Y_py):")
-            for cmd in commands[:5]:
-                print(cmd) # Using print for cleaner tuple output
-            if len(commands) > 5:
-                logging.info("...")
-                logging.info(f"Last 5 generated commands (X_py, Z_depth_py, Y_py):")
-                for cmd in commands[-5:]:
-                    print(cmd)
-        else:
-            logging.info("No commands generated by pipeline.")
-    else:
-        logging.warning(f"Test image not found: {test_image_path}. Skipping pipeline test.")
