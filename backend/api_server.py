@@ -29,14 +29,12 @@ ASSETS_DIR = os.path.join(BASE_DIR, config.ASSETS_FOLDER_NAME)
 for folder_path in [app.config['UPLOAD_FOLDER'], app.config['AUDIO_TEMP_FOLDER_PATH'], ASSETS_DIR]:
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
-        logging.info(f"Created folder at: {folder_path}")
 
 SIGNATURE_IMAGE_FULL_PATH = os.path.join(ASSETS_DIR, config.SIGNATURE_IMAGE_FILENAME)
 DRAWING_HISTORY_FILE = os.path.join(BASE_DIR, "drawing_history.json")
 MAX_DRAWING_HISTORY = 10
 
 # --- Global State and Thread Communication Queues ---
-# *** IMPORTANT: Changed async_mode to 'eventlet' ***
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', max_http_buffer_size=10 * 1024 * 1024)
 
 command_queue = queue.Queue()
@@ -57,26 +55,21 @@ logging.info("--- AI Model Initialization Complete ---")
 # --- History and Utility Functions (Managed by Fn1) ---
 def get_ui_history_summary(history_list):
     """Creates a simplified summary of drawing history for the frontend."""
-    ui_summary = []
-    for item in history_list:
-        total_commands = item.get('total_commands', 0)
-        ui_summary.append({
-            'drawing_id': item.get('drawing_id'),
-            'original_filename': item.get('original_filename'),
-            'status': item.get('status', 'unknown'),
-            'last_updated': item.get('last_updated'),
-            'total_commands': total_commands
-        })
-    return ui_summary
+    return [{
+        'drawing_id': item.get('drawing_id'),
+        'original_filename': item.get('original_filename'),
+        'status': item.get('status', 'unknown'),
+        'last_updated': item.get('last_updated'),
+        'total_commands': item.get('total_commands', 0)
+    } for item in history_list]
 
 def save_drawing_history():
     """Saves the current drawing history to a JSON file."""
     global drawing_history
-    with threading.Lock(): # Add lock for thread safety on file access
+    with threading.Lock():
         try:
             with open(DRAWING_HISTORY_FILE, 'w') as f:
                 json.dump(drawing_history, f, indent=4)
-            logging.info(f"Drawing history saved to {DRAWING_HISTORY_FILE}")
         except IOError as e:
             logging.error(f"Error saving drawing history: {e}")
 
@@ -105,7 +98,6 @@ def add_or_update_drawing_in_history(drawing_data):
     if 'drawing_id' not in drawing_data:
         drawing_data['drawing_id'] = f"draw_{int(datetime.now().timestamp())}"
     drawing_data['last_updated'] = datetime.now().isoformat()
-
     found_index = next((i for i, item in enumerate(drawing_history) if item.get('drawing_id') == drawing_data['drawing_id']), -1)
     if found_index != -1:
         drawing_history[found_index] = drawing_data
@@ -120,15 +112,13 @@ def get_drawing_from_history(drawing_id):
     global drawing_history
     return next((item for item in drawing_history if item.get('drawing_id') == drawing_id), None)
 
-def update_drawing_status_in_history(drawing_id, new_status, total_commands=None):
+def update_drawing_status_in_history(drawing_id, new_status):
     """Updates the status of a drawing in the history."""
     global drawing_history
     item = get_drawing_from_history(drawing_id)
     if item:
         item['status'] = new_status
         item['last_updated'] = datetime.now().isoformat()
-        if total_commands is not None:
-             item['total_commands'] = total_commands
         save_drawing_history()
         logging.info(f"Updated status of drawing '{drawing_id}' to '{new_status}'.")
         socketio.emit('drawing_history_updated', get_ui_history_summary(drawing_history))
@@ -138,10 +128,7 @@ def update_drawing_status_in_history(drawing_id, new_status, total_commands=None
 load_drawing_history()
 
 def result_processor_thread():
-    """
-    This thread function (part of Fn1) runs in the background.
-    It continuously checks the `result_queue` for messages from the RobotWorker (Fn2).
-    """
+    """This thread function handles results from the RobotWorker (Fn2)."""
     global is_drawing_flag_for_ui, active_drawing_session_id
     logging.info("Result processor thread started.")
     while True:
@@ -149,14 +136,30 @@ def result_processor_thread():
             result = result_queue.get()
             result_type = result.get('type')
             data = result.get('data', {})
-            logging.info(f"Fn1 (result_processor) received result from Fn2: Type='{result_type}', Data={data}")
+            # Don't log progress updates to avoid flooding the console
+            if result_type != 'drawing_progress':
+                logging.info(f"Fn1 received result from Fn2: Type='{result_type}'")
 
-            with app.app_context(): # Needed to emit from a background thread
+            with app.app_context():
                 if result_type == 'connection_status':
                     socketio.emit('robot_connection_status', data)
+
                 elif result_type == 'move_completed':
                     socketio.emit('command_response', data)
-                    socketio.emit('robot_connection_status', {'success': data['success'], 'message': data.get('final_status', data['message'])})
+                
+                # *** ADDED: Handler for new progress event ***
+                elif result_type == 'drawing_progress':
+                    progress = 0
+                    if data.get('total_commands', 0) > 0:
+                        progress = (data.get('current_command_index', 0) / data.get('total_commands')) * 100
+                    
+                    socketio.emit('drawing_status_update', {
+                        'active': True,
+                        'drawing_id': data.get('drawing_id'),
+                        'message': f"Drawing command {data.get('current_command_index')} of {data.get('total_commands')}",
+                        'progress': progress
+                    })
+
                 elif result_type == 'drawing_finished':
                     drawing_id = data.get('drawing_id')
                     if drawing_id:
@@ -164,18 +167,24 @@ def result_processor_thread():
                     socketio.emit('drawing_completed', {'drawing_id': drawing_id, 'message': data['message']})
                     is_drawing_flag_for_ui = False
                     active_drawing_session_id = None
+                
                 elif result_type == 'error':
                     socketio.emit('command_response', {'success': False, 'message': f"Robot Worker Error: {data.get('message')}"})
-                    socketio.emit('robot_connection_status', {'success': False, 'message': 'Disconnected due to error'})
-                    if data.get('drawing_id'):
-                        update_drawing_status_in_history(data['drawing_id'], 'interrupted_error')
+                    drawing_id = data.get('drawing_id')
+                    if drawing_id:
+                        update_drawing_status_in_history(drawing_id, 'interrupted_error')
+                        socketio.emit('drawing_aborted', {'drawing_id': drawing_id, 'message': f"Drawing interrupted: {data.get('message')}"})
                         is_drawing_flag_for_ui = False
                         active_drawing_session_id = None
+                
                 else:
-                    logging.warning(f"Received unknown result type from worker: {result_type}")
+                    if result_type != 'drawing_progress':
+                        logging.warning(f"Received unknown result type from worker: {result_type}")
+
         except Exception as e:
             logging.error(f"Error in result_processor_thread: {e}", exc_info=True)
 
+# --- QR Code and Static Routes ---
 current_upload_session_id = None
 UPLOAD_PAGE_TEMPLATE = """
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Upload Image</title><style>body{font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;background-color:#f0f0f0}.container{background-color:white;padding:20px;border-radius:8px;box-shadow:0 0 10px rgba(0,0,0,.1);text-align:center}input[type=file]{margin-bottom:15px;display:block;margin-left:auto;margin-right:auto}button{padding:10px 15px;background-color:#007bff;color:white;border:none;border-radius:4px;cursor:pointer;font-size:1em}button:hover{background-color:#0056b3}#message{margin-top:15px;font-weight:700}h2{margin-top:0}</style></head><body><div class=container><h2>Select Image to Upload</h2><form id=uploadForm method=post enctype=multipart/form-data><input type=file name=image id=imageFile accept=image/* required><button type=submit>Upload</button></form><div id=message></div></div><script>document.getElementById("uploadForm").addEventListener("submit",async function(e){e.preventDefault();const t=new FormData(this),s=document.getElementById("message"),a=this.querySelector('button[type="submit"]'),i=this.querySelector('input[type="file"]');s.textContent="Uploading...",a.disabled=!0,i.disabled=!0;try{const e=await fetch(window.location.href,{method:"POST",body:t}),n=await e.json();e.ok?(s.textContent="Success: "+n.message+". You can close this page.",s.style.color="green"):(s.textContent="Error: "+(n.error||"Upload failed. Please try again."),s.style.color="red",a.disabled=!1,i.disabled=!1)}catch(e){s.textContent="Network Error: "+e.message+". Please try again.",s.style.color="red",a.disabled=!1,i.disabled=!1}})</script></body></html>
@@ -209,6 +218,7 @@ def handle_qr_upload_page(session_id):
                 return jsonify({"error": "Failed to save file on server."}), 500
     return render_template_string(UPLOAD_PAGE_TEMPLATE)
 
+# --- SocketIO Event Handlers ---
 @socketio.on('connect')
 def handle_connect():
     logging.info(f"Client connected: {request.sid}")
@@ -290,7 +300,6 @@ def handle_process_image_for_drawing(data):
     original_filename = data.get('original_filename', os.path.basename(filepath or "unknown"))
     canny_t1, canny_t2 = data.get('canny_t1'), data.get('canny_t2')
     
-    # *** ADDED LOGGING ***
     logging.info(f"Processing image '{original_filename}' with Canny thresholds T1={canny_t1}, T2={canny_t2}")
 
     if not filepath or not os.path.exists(filepath):
@@ -312,17 +321,16 @@ def handle_process_image_for_drawing(data):
         total_commands = len(robot_commands)
         drawing_id = f"draw_{int(datetime.now().timestamp())}"
         active_drawing_session_id = drawing_id
+        is_drawing_flag_for_ui = True
+        
         add_or_update_drawing_in_history({
             'drawing_id': drawing_id, 'filepath_on_server': filepath, 'original_filename': original_filename,
             'status': 'in_progress', 'total_commands': total_commands, 'canny_t1': canny_t1, 'canny_t2': canny_t2,
         })
-
-        is_drawing_flag_for_ui = True
-        socketio.emit('drawing_started', {
-            'drawing_id': drawing_id, 'total_commands': total_commands,
-            'estimated_duration_ms': total_commands * 200
-        })
+        
+        # NOTE: We no longer send 'drawing_started'. The first 'drawing_status_update' from the worker will kick off the UI.
         command_queue.put({'action': 'draw', 'data': {'commands': robot_commands, 'drawing_id': drawing_id}})
+        
     except Exception as e:
         logging.error(f"Error processing image for drawing: {e}", exc_info=True)
         emit('command_response', {'success': False, 'message': f"Server error during image processing: {e}"})
@@ -397,4 +405,3 @@ def handle_submit_text_to_llm(data):
             emit('llm_response_chunk', llm_response_part)
     except Exception as e:
         logging.error(f"API Error in LLM handler: {e}", exc_info=True)
-

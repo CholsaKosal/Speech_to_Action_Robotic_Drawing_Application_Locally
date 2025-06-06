@@ -1,7 +1,7 @@
 // frontend/s2a-drawing-ui/src/App.tsx
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
-import './App.css'; // Ensure this file exists, even if minimal
+import './App.css'; 
 
 const PYTHON_BACKEND_URL = 'http://localhost:5555';
 
@@ -10,7 +10,6 @@ let mediaRecorder: MediaRecorder | null = null;
 let audioChunks: Blob[] = [];
 
 // --- Helper Components & Types ---
-
 const MicIcon = () => ( <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 16 16"> <path d="M5 3a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0V3z"/> <path d="M3.5 6.5A.5.5 0 0 1 4 7v1a4 4 0 0 0 8 0V7a.5.5 0 0 1 1 0v1a5 5 0 0 1-4.5 4.975V15h3a.5.5 0 0 1 0 1h-7a.5.5 0 0 1 0-1h3v-2.025A5 5 0 0 1 3 8V7a.5.5 0 0 1 .5-.5z"/> </svg> );
 const StopIcon = () => ( <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 16 16"> <path d="M5 3.5h6A1.5 1.5 0 0 1 12.5 5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5z"/> </svg> );
 
@@ -21,22 +20,18 @@ interface DrawingHistoryItem {
     drawing_id: string;
     original_filename: string;
     status: string;
-    progress: number;
     last_updated: string;
     total_commands?: number;
 }
 
 // --- Main App Component ---
-
 function App() {
-  // State Hooks
   const [isConnectedToBackend, setIsConnectedToBackend] = useState(false);
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [robotStatusMessage, setRobotStatusMessage] = useState('Robot: Not connected');
   const [lastCommandResponse, setLastCommandResponse] = useState('');
   const [useRealRobot, setUseRealRobot] = useState(false);
 
-  // Image & Upload State
   const [qrCodeImage, setQrCodeImage] = useState<string | null>(null);
   const [qrUploadUrl, setQrUploadUrl] = useState<string>('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -45,15 +40,12 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [lastUploadedImageInfo, setLastUploadedImageInfo] = useState<{message: string, filepath: string | null}>({message: '', filepath: null});
 
-  // Drawing State
   const [isDrawing, setIsDrawing] = useState(false);
   const [activeDrawingId, setActiveDrawingId] = useState<string | null>(null);
   const [drawingProgress, setDrawingProgress] = useState(0);
   const [drawingStatusText, setDrawingStatusText] = useState('Idle');
-  const drawingIntervalRef = useRef<number | null>(null);
   const [drawingHistory, setDrawingHistory] = useState<DrawingHistoryItem[]>([]);
 
-  // Voice & LLM State
   const [isRecording, setIsRecording] = useState(false);
   const [interactionStatus, setInteractionStatus] = useState('Tap mic or type command.');
   const [rawTranscribedText, setRawTranscribedText] = useState('');
@@ -61,55 +53,33 @@ function App() {
   const [llmResponse, setLlmResponse] = useState('');
   const audioStreamRef = useRef<MediaStream | null>(null);
 
-  // Manual Control State
   const [xCoord, setXCoord] = useState('');
-  const [yCoord, setYCoord] = useState(''); // Represents Depth (Z in Python)
-  const [zCoord, setZCoord] = useState(''); // Represents Side (Y in Python)
+  const [yCoord, setYCoord] = useState(''); 
+  const [zCoord, setZCoord] = useState('');
 
-  // Threshold Modal State
   const [showThresholdModal, setShowThresholdModal] = useState(false);
   const [selectedThresholdKey, setSelectedThresholdKey] = useState<string>(THRESHOLD_OPTIONS[2].key);
   const [thresholdPreviewImage, setThresholdPreviewImage] = useState<string | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
 
-
-  // --- Utility & Cleanup Callbacks ---
-  const stopDrawingSimulation = useCallback(() => {
-    if (drawingIntervalRef.current) {
-      clearInterval(drawingIntervalRef.current);
-      drawingIntervalRef.current = null;
-    }
-  }, []);
-
   const clearActiveDrawingState = useCallback(() => {
-    console.log("Clearing active drawing state.");
-    stopDrawingSimulation();
     setIsDrawing(false);
     setActiveDrawingId(null);
     setDrawingProgress(0);
     setDrawingStatusText('Idle');
-  }, [stopDrawingSimulation]);
+  }, []);
 
-
-  // --- Main useEffect for Socket.IO Communication ---
   useEffect(() => {
     socket = io(PYTHON_BACKEND_URL, { transports: ['websocket'] });
 
-    // --- Connection Events ---
-    socket.on('connect', () => {
-      console.log('Frontend: Connected to Python backend!');
-      setIsConnectedToBackend(true);
-    });
-
+    socket.on('connect', () => setIsConnectedToBackend(true));
     socket.on('disconnect', () => {
-      console.log('Frontend: Disconnected from Python backend.');
       setIsConnectedToBackend(false);
       setIsRobotConnected(false);
       setRobotStatusMessage('Robot: Disconnected');
-      clearActiveDrawingState(); // Stop any simulation on disconnect
+      clearActiveDrawingState();
     });
 
-    // --- Event Listeners ---
     socket.on('robot_connection_status', (data: { success: boolean, message: string }) => {
       setIsRobotConnected(data.success);
       setRobotStatusMessage(`Robot: ${data.message}`);
@@ -119,7 +89,6 @@ function App() {
       setLastCommandResponse(`Cmd: ${data.command_sent || 'N/A'} -> Resp: ${data.message}`);
     });
 
-    // --- Image Upload Handlers ---
     const handleImageUploadSuccess = (data: { success: boolean, message: string, original_filename?: string, filepath_on_server?: string}) => {
       if (data.success && data.filepath_on_server) {
         setLastUploadedImageInfo({ message: `Received: ${data.original_filename}. Ready.`, filepath: data.filepath_on_server });
@@ -139,82 +108,53 @@ function App() {
         }
     });
 
-    // --- Drawing Flow Handlers ---
-    socket.on('drawing_started', (data: { drawing_id: string, total_commands: number, estimated_duration_ms: number }) => {
-        console.log(`Frontend: Received 'drawing_started' for ID ${data.drawing_id}. Total commands: ${data.total_commands}`);
-        stopDrawingSimulation();
-        setIsDrawing(true);
-        setActiveDrawingId(data.drawing_id);
-        setDrawingProgress(0);
-        setDrawingStatusText(`Drawing in progress...`);
-
-        const totalDuration = data.estimated_duration_ms;
-        const startTime = Date.now();
-
-        drawingIntervalRef.current = window.setInterval(() => {
-            const elapsedTime = Date.now() - startTime;
-            const progress = Math.min((elapsedTime / totalDuration) * 100, 100);
-            setDrawingProgress(progress);
-
-            if (progress >= 100) {
-                 // The simulation is done, but we wait for backend confirmation
-                 setDrawingStatusText('Finalizing...');
-                 stopDrawingSimulation();
-            }
-        }, 100); // Update progress bar frequently
+    socket.on('drawing_status_update', (data: { active: boolean, message: string, progress?: number, drawing_id?: string }) => {
+      console.log("FRONTEND: drawing_status_update received:", data);
+      setIsDrawing(data.active);
+      setDrawingStatusText(data.message);
+      if (data.drawing_id) {
+          setActiveDrawingId(data.drawing_id);
+      }
+      if (typeof data.progress === 'number') {
+          setDrawingProgress(data.progress);
+      }
     });
 
     socket.on('drawing_completed', (data: { drawing_id: string, message: string }) => {
         console.log(`Frontend: Received 'drawing_completed' for ID ${data.drawing_id}`);
-        if (data.drawing_id === activeDrawingId) {
-            stopDrawingSimulation();
-            setDrawingProgress(100);
-            setDrawingStatusText(data.message || 'Drawing complete!');
-            // After a delay, reset the state
-            setTimeout(() => {
-                clearActiveDrawingState();
-            }, 3000);
-        }
+        // *** REMOVED activeDrawingId CHECK ***
+        setIsDrawing(false);
+        setDrawingProgress(100);
+        setDrawingStatusText(data.message || 'Drawing complete!');
+        setTimeout(clearActiveDrawingState, 3000);
     });
     
     socket.on('drawing_aborted', (data: { drawing_id: string, message: string }) => {
         console.log(`Frontend: Received 'drawing_aborted' for ID ${data.drawing_id}`);
-        if(data.drawing_id === activeDrawingId || activeDrawingId === null) {
-            clearActiveDrawingState();
-            setDrawingStatusText(data.message || 'Drawing aborted.');
-        }
+        // *** REMOVED activeDrawingId CHECK ***
+        clearActiveDrawingState();
+        setDrawingStatusText(data.message || 'Drawing aborted.');
     });
 
     socket.on('drawing_history_updated', (history: DrawingHistoryItem[]) => {
-        console.log("Frontend: Received drawing_history_updated:", history);
         setDrawingHistory(history || []);
     });
 
     socket.on('transcription_result', (data: { text?: string, error?: string }) => {
-        if (data.error) {
-            setInteractionStatus(`Transcription Error: ${data.error}`);
-        } else if (data.text) {
+        if (data.error) setInteractionStatus(`Transcription Error: ${data.error}`);
+        else if (data.text) {
             setRawTranscribedText(data.text);
             setEditableCommandText(data.text);
             setLlmResponse('');
-            setInteractionStatus('Edit command below or send to Robotist.');
+            setInteractionStatus('Edit command or send to Robotist.');
         }
     });
 
     socket.on('llm_response_chunk', (data: { chunk?: string, error?: string, done: boolean, final_message?: string }) => {
-        if (data.error) {
-            setLlmResponse(p => p + `\n[Error: ${data.error}]`);
-            setInteractionStatus('LLM processing error.');
-        } else if (data.chunk) {
-            setLlmResponse(p => p + data.chunk);
-            if (!data.done) {
-              setInteractionStatus('Robotist is typing...');
-            }
-        }
+        if (data.error) { setLlmResponse(p => p + `\n[Error: ${data.error}]`); setInteractionStatus('LLM error.'); }
+        else if (data.chunk) { setLlmResponse(p => p + data.chunk); if (!data.done) setInteractionStatus('Robotist is typing...'); }
         if (data.done) {
-            if (data.final_message) {
-                setLlmResponse(data.final_message);
-            }
+            if (data.final_message) setLlmResponse(data.final_message);
             setInteractionStatus('Ready for next command.');
         }
     });
@@ -222,7 +162,6 @@ function App() {
     socket.on('threshold_preview_image_response', (data: { image_base64?: string, error?: string }) => {
         setIsPreviewLoading(false);
         if (data.error) {
-            console.error("Error getting threshold preview:", data.error);
             setThresholdPreviewImage(null);
             alert(`Error generating preview: ${data.error}`);
         } else if (data.image_base64) {
@@ -230,20 +169,16 @@ function App() {
         }
     });
 
-
-    // --- Cleanup ---
     return () => {
         socket.disconnect();
-        stopDrawingSimulation();
         if (audioStreamRef.current) {
             audioStreamRef.current.getTracks().forEach(track => track.stop());
         }
     };
-  }, [activeDrawingId, clearActiveDrawingState, stopDrawingSimulation]);
+  }, [clearActiveDrawingState]);
 
 
   // --- Event Handler Functions ---
-
   const handleConnectRobot = () => {
     if (isDrawing) { alert("Cannot change connection while drawing."); return; }
     if (socket) socket.emit('robot_connect_request', { use_real_robot: useRealRobot });
@@ -259,8 +194,7 @@ function App() {
   };
   
   const handleSendCustomCoordinates = () => {
-    if (isDrawing) { alert("Cannot move robot while drawing."); return; }
-    if (!isRobotConnected) { alert("Robot not connected."); return; }
+    if (isDrawing || !isRobotConnected) { alert("Cannot move: drawing is active or robot is disconnected."); return; }
     const [x, y, z] = [parseFloat(xCoord), parseFloat(yCoord), parseFloat(zCoord)];
     if (isNaN(x) || isNaN(y) || isNaN(z)) { alert("Invalid coordinates."); return; }
     socket.emit('send_custom_coordinates', { x_py: x, z_py: y, y_py: z });
@@ -322,6 +256,11 @@ function App() {
     
     const originalFilename = lastUploadedImageInfo.message.includes("Received: ") ? lastUploadedImageInfo.message.split("Received: ")[1].split(".")[0] : "uploaded_image";
 
+    setIsDrawing(true);
+    setActiveDrawingId(null); // Will be set by backend
+    setDrawingStatusText(`Processing image: ${originalFilename}...`);
+    setDrawingProgress(0);
+
     socket.emit('process_image_for_drawing', {
         filepath: lastUploadedImageInfo.filepath,
         original_filename: originalFilename,
@@ -331,20 +270,16 @@ function App() {
     
     setShowThresholdModal(false);
   };
-
+  
   const handleResumeDrawingFromHistory = (drawingId: string) => {
-    // This functionality would need backend support to resume a specific drawing by ID
-    alert(`Resume requested for ${drawingId}. (Functionality pending full implementation)`);
-    // Example emit: socket.emit('resume_drawing_request', { drawing_id: drawingId });
+    alert(`Resume requested for ${drawingId}. (Functionality pending)`);
   };
   
   const handleRestartDrawingFromHistory = (drawingId: string) => {
-    // This functionality would need backend support to re-process and start a drawing by ID
-    alert(`Restart requested for ${drawingId}. (Functionality pending full implementation)`);
-     // Example emit: socket.emit('restart_drawing_request', { drawing_id: drawingId });
+    alert(`Restart requested for ${drawingId}. (Functionality pending)`);
   };
   
-  const startRecording = async () => {
+  const startRecording = async () => { 
     if (isDrawing || !isConnectedToBackend) {
       alert("Cannot record voice while drawing or disconnected.");
       return;
@@ -380,19 +315,14 @@ function App() {
       setInteractionStatus('Microphone access denied.');
     }
   };
-
-  const stopRecording = () => {
-    if (mediaRecorder && isRecording) {
+  const stopRecording = () => { 
+      if (mediaRecorder && isRecording) {
       mediaRecorder.stop();
       setIsRecording(false);
     }
   };
-
-  const handleMicButtonClick = () => {
-    isRecording ? stopRecording() : startRecording();
-  };
-
-  const submitTextToLLM = (text: string) => {
+  const handleMicButtonClick = () => { isRecording ? stopRecording() : startRecording(); };
+  const submitTextToLLM = (text: string) => { 
     if (!text.trim()) {
       alert("Command cannot be empty.");
       return;
@@ -403,9 +333,7 @@ function App() {
       setInteractionStatus('Robotist is thinking...');
     }
   };
-  
   const handleSendEditableCommand = () => { submitTextToLLM(editableCommandText); };
-
 
   const requestThresholdPreview = useCallback((key: string) => {
     const selectedOpt = THRESHOLD_OPTIONS.find(opt => opt.key === key);
@@ -427,7 +355,6 @@ function App() {
   }, [selectedThresholdKey, showThresholdModal, lastUploadedImageInfo.filepath, requestThresholdPreview]);
 
 
-  // --- Render Method ---
   const styles: { [key: string]: React.CSSProperties } = {
      appContainer: { maxWidth: '1400px', margin: '0 auto', padding: '20px', fontFamily: 'Arial, sans-serif', color: '#e0e0e0', backgroundColor: '#1e1e1e' },
     header: { textAlign: 'center' as const, marginBottom: '30px', borderBottom: '1px solid #444', paddingBottom: '20px' },
