@@ -37,8 +37,11 @@ A4_DRAWING_AREA_HEIGHT_MM = 217 # Effective drawing height for scaling image con
 
 # Python Z-values for pen height, these will be sent as the 'Z' in the "X,Z,Y" string
 # which corresponds to the 'y' offset in the RAPID MoveL Offs(WorkSpaceCenter1, x, y, z)
-PEN_UP_Z_PY = -15.0  # Pen up position (e.g., -15mm from WorkSpaceCenter1's XY plane along its Y-axis)
-PEN_DOWN_Z_PY = -7.0 # Pen down position (e.g., -7mm from WorkSpaceCenter1's XY plane along its Y-axis)
+
+PEN_UP_Z_PY = -16.0  # Pen up position (e.g., -15mm from WorkSpaceCenter1's XY plane along its Y-axis)
+
+# *** MODIFIED: Renamed to DEFAULT_PEN_DOWN_Z_PY to indicate it's a fallback ***
+DEFAULT_PEN_DOWN_Z_PY = -7.0 # Pen down position (e.g., -7mm from WorkSpaceCenter1's XY plane along its Y-axis)
 
 MIN_CONTOUR_LENGTH_PX = 50 # Minimum contour length in pixels to consider from image processing
 

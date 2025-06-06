@@ -98,9 +98,11 @@ def scale_contour_point(point_xy, image_width, image_height, target_width_mm, ta
     return (x_py_offset, y_py_offset)
 
 
-def generate_robot_drawing_commands(contours_xy, image_width, image_height, optimize_paths=True):
+# *** MODIFIED: Accept pen_down_z as a parameter ***
+def generate_robot_drawing_commands(contours_xy, image_width, image_height, pen_down_z, optimize_paths=True):
     """ 
     Takes list of contours (pixel coordinates), scales them, creates drawing paths (X_py, Z_depth_py, Y_py).
+    :param pen_down_z: The Z-coordinate for the pen when it is drawing.
     """
     if not contours_xy or image_width <= 0 or image_height <= 0:
         return []
@@ -163,28 +165,33 @@ def generate_robot_drawing_commands(contours_xy, image_width, image_height, opti
         if not contour_points: continue
         
         start_x_py, start_y_py = contour_points[0]
+        # Use PEN_UP_Z from config for moving between paths
         robot_commands_xyz_py.append((start_x_py, config.PEN_UP_Z_PY, start_y_py))
-        robot_commands_xyz_py.append((start_x_py, config.PEN_DOWN_Z_PY, start_y_py))
+        # Use the user-defined pen_down_z for the first drawing point
+        robot_commands_xyz_py.append((start_x_py, pen_down_z, start_y_py))
 
         for i in range(len(contour_points)): 
             pt_x_py, pt_y_py = contour_points[i]
             if i > 0 or len(contour_points) == 1: 
-                 robot_commands_xyz_py.append((pt_x_py, config.PEN_DOWN_Z_PY, pt_y_py))
+                 # Use the user-defined pen_down_z for all subsequent drawing points
+                 robot_commands_xyz_py.append((pt_x_py, pen_down_z, pt_y_py))
 
         end_x_py, end_y_py = contour_points[-1]
+        # Use PEN_UP_Z from config to lift the pen
         robot_commands_xyz_py.append((end_x_py, config.PEN_UP_Z_PY, end_y_py))
         
     return robot_commands_xyz_py
 
-
+# *** MODIFIED: Accept pen_down_z and pass it down ***
 def process_image_to_robot_commands_pipeline(image_filepath, 
                                              canny_thresh1=config.DEFAULT_CANNY_THRESHOLD1, 
                                              canny_thresh2=config.DEFAULT_CANNY_THRESHOLD2,
+                                             pen_down_z=config.DEFAULT_PEN_DOWN_Z_PY,
                                              optimize=True):
     """
     Main pipeline function to take an image path and return a list of robot drawing commands.
     """
-    logging.info(f"Pipeline started for image: {image_filepath} with Canny: {canny_thresh1}, {canny_thresh2}")
+    logging.info(f"Pipeline started for image: {image_filepath} with Canny: {canny_thresh1}, {canny_thresh2}, Pen-Z: {pen_down_z}")
     
     contours, img_w, img_h = get_image_contours(image_filepath, canny_thresh1, canny_thresh2)
 
@@ -194,7 +201,8 @@ def process_image_to_robot_commands_pipeline(image_filepath,
 
     logging.info(f"Found {len(contours)} contours. Generating robot commands...")
     
-    robot_drawing_cmds = generate_robot_drawing_commands(contours, img_w, img_h, optimize_paths=optimize)
+    # Pass the pen_down_z to the command generation function
+    robot_drawing_cmds = generate_robot_drawing_commands(contours, img_w, img_h, pen_down_z, optimize_paths=optimize)
     
     logging.info(f"Generated {len(robot_drawing_cmds)} robot drawing commands.")
     return robot_drawing_cmds
