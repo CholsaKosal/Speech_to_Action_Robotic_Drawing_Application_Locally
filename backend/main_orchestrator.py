@@ -1,26 +1,42 @@
 # backend/main_orchestrator.py
-from api_server import app, socketio # app is the Flask app instance
+import threading
+import logging
+import eventlet # Import eventlet
+eventlet.monkey_patch() # Patch standard libraries for async compatibility
+
+# Import the app and socketio instances, and the queues/result processor
+from api_server import app, socketio, command_queue, result_queue, result_processor_thread
+from robot_worker import RobotWorker
+import config
 
 if __name__ == '__main__':
-    server_port = 5555 # Define the port
-    # It's good practice to ensure app config is set before running.
-    # This is already done in api_server.py when it's imported, 
-    # but explicitly setting it here or ensuring it's set in app object is fine.
+    # Configure basic logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(name)s - %(module)s - %(funcName)s - %(lineno)d - %(message)s'
+    )
+
+    # 1. Start the RobotWorker thread (Fn2)
+    robot_worker = RobotWorker(command_queue, result_queue)
+    worker_thread = threading.Thread(target=robot_worker.run, daemon=True)
+    worker_thread.start()
+    logging.info("Fn2 (RobotWorker) thread started.")
+
+    # 2. Start the Result Processor thread (part of Fn1)
+    result_thread = threading.Thread(target=result_processor_thread, daemon=True)
+    result_thread.start()
+    logging.info("Fn1 (Result Processor) thread started.")
+
+    # 3. Start the Flask-SocketIO server using eventlet
+    server_port = 5555
     if 'SERVER_PORT' not in app.config:
         app.config['SERVER_PORT'] = server_port
 
-    print(f"Starting Python backend server (SocketIO with Flask) on port {server_port}...")
-    print(f"Frontend should connect to ws://localhost:{server_port} (or your machine's IP on the network)")
+    logging.info(f"Starting Fn1 (Flask-SocketIO server with eventlet) on port {server_port}...")
     
-    # Construct the QR code upload page URL for the print message
-    # This logic is similar to what's in api_server.py for determining host_ip
-    # For simplicity in this print, we'll just remind the user it's their local IP.
-    print(f"QR code upload page will be accessible via http://<YOUR_LOCAL_IP>:{server_port}/qr_upload_page/<session_id>")
+    # Use socketio.run which will now use eventlet due to the monkey_patch and async_mode setting in api_server.py
+    socketio.run(app,
+                 host='0.0.0.0',
+                 port=server_port,
+                 debug=False) # Debug mode is not recommended with eventlet in this setup
 
-    # The async_mode='eventlet' should be set during SocketIO instantiation in api_server.py
-    # The use_reloader=False is important when debug=True with eventlet.
-    socketio.run(app, 
-                 host='0.0.0.0', 
-                 port=server_port, 
-                 debug=True, 
-                 use_reloader=False) # Removed async_mode='eventlet' from here
