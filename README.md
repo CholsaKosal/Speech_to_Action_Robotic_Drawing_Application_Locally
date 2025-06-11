@@ -321,5 +321,3 @@ When you scan the QR code now, the URL will be `https://...`. Your phone's brows
   * webapp should optimize the user input images, operator need to change the paper and start writing, also restarting the robot controller if there are issues. There is a robotworker.py that handles it remotely. 
     * robotworker.py should run on emmbedded device or a spare laptop/desktop that is always on. We need it to update to the viewer on the progress and offer interaction. 
 ---
-#   S p e e c h _ t o _ A c t i o n _ R o b o t i c _ D r a w i n g _ A p p l i c a t i o n _ - C h a t G P T _ A P I -  
- 
