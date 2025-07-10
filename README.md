@@ -309,4 +309,15 @@ When you scan the QR code now, the URL will be `https://...`. Your phone's brows
       * Check backend logs for Python errors.
       * Use browser developer tools in Electron (usually `Ctrl+Shift+I` or via the View menu) to debug frontend JavaScript/TypeScript and inspect network requests.
       * Monitor system resource usage (CPU, RAM, VRAM) using Task Manager (Windows) or equivalent tools.
+
+
+## 5. How to make robot drawing process faster and the roadshow to work smoothly? 
+  * increase to vmax, and do not waste any millisecond on processing command by sending the batch command to the robot directly. 
+    * How to sent all the point directly to rapid? 
+    * How can we dump all the points to the robot controller?
+  
+
+  
+  * webapp should optimize the user input images, operator need to change the paper and start writing, also restarting the robot controller if there are issues. There is a robotworker.py that handles it remotely. 
+    * robotworker.py should run on emmbedded device or a spare laptop/desktop that is always on. We need it to update to the viewer on the progress and offer interaction. 
 ---
