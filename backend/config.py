@@ -43,7 +43,7 @@ A4_DRAWING_AREA_HEIGHT_MM = 212 # Effective drawing height for scaling image con
 DEFAULT_PEN_DOWN_Z_PY = -15 # Pen down position (e.g., -7mm from WorkSpaceCenter1's XY plane along its Y-axis)
 PEN_UP_Z_PY = 1.2 * DEFAULT_PEN_DOWN_Z_PY  # Pen up position (e.g., -15mm from WorkSpaceCenter1's XY plane along its Y-axis)
 
-MIN_CONTOUR_LENGTH_PX = 20# Minimum contour length in pixels to consider from image processing
+MIN_CONTOUR_LENGTH_PX = 20 # Minimum contour length in pixels to consider from image processing
 
 DEFAULT_CANNY_THRESHOLD1 = 50
 DEFAULT_CANNY_THRESHOLD2 = 150
