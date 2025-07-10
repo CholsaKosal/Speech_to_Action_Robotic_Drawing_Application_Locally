@@ -79,9 +79,11 @@ class RobotWorker:
             self.robot_socket.sendall(command_str.encode('utf-8'))
             
             # *** REDUCED TIMEOUT for better stall detection ***
-            self.robot_socket.settimeout(25) 
+            self.robot_socket.settimeout(None) 
             response_r = self.robot_socket.recv(1024).decode('utf-8').strip()
             if response_r.upper() != "R":
+            # if response_r.upper() == "R" or "RD":
+
                 return False, f"Protocol Error: Expected 'R', got '{response_r}'"
             
             response_d = self.robot_socket.recv(1024).decode('utf-8').strip()

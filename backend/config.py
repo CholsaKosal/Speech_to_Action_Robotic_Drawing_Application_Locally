@@ -32,18 +32,18 @@ SAFE_ABOVE_CENTER_PY = (0.00, -150.0, 0.00)
 # The Python (X_py, Y_py) from image processing will map to RAPID (x_offset, z_offset).
 # The Python Z_py (pen height) will map to RAPID y_offset.
 
-A4_DRAWING_AREA_WIDTH_MM = 180  # Effective drawing width for scaling image contours
-A4_DRAWING_AREA_HEIGHT_MM = 217 # Effective drawing height for scaling image contours
+A4_DRAWING_AREA_WIDTH_MM = 320  # Effective drawing width for scaling image contours
+A4_DRAWING_AREA_HEIGHT_MM = 212 # Effective drawing height for scaling image contours
 
 # Python Z-values for pen height, these will be sent as the 'Z' in the "X,Z,Y" string
 # which corresponds to the 'y' offset in the RAPID MoveL Offs(WorkSpaceCenter1, x, y, z)
 
-PEN_UP_Z_PY = -16.0  # Pen up position (e.g., -15mm from WorkSpaceCenter1's XY plane along its Y-axis)
 
 # *** MODIFIED: Renamed to DEFAULT_PEN_DOWN_Z_PY to indicate it's a fallback ***
-DEFAULT_PEN_DOWN_Z_PY = -7.0 # Pen down position (e.g., -7mm from WorkSpaceCenter1's XY plane along its Y-axis)
+DEFAULT_PEN_DOWN_Z_PY = -15 # Pen down position (e.g., -7mm from WorkSpaceCenter1's XY plane along its Y-axis)
+PEN_UP_Z_PY = 1.2 * DEFAULT_PEN_DOWN_Z_PY  # Pen up position (e.g., -15mm from WorkSpaceCenter1's XY plane along its Y-axis)
 
-MIN_CONTOUR_LENGTH_PX = 50 # Minimum contour length in pixels to consider from image processing
+MIN_CONTOUR_LENGTH_PX = 20# Minimum contour length in pixels to consider from image processing
 
 DEFAULT_CANNY_THRESHOLD1 = 50
 DEFAULT_CANNY_THRESHOLD2 = 150
@@ -70,7 +70,9 @@ AUDIO_TEMP_FOLDER = 'audio_tmp' # Relative to the backend directory
 # --- LLM Settings ---
 # IMPORTANT: Replace with the actual filename of your downloaded GGUF model.
 # The file should be placed inside the `backend/models/` directory.
-LLM_MODEL_FILENAME = "deepseek-llm-7b-chat.Q4_K_M.gguf" 
+# LLM_MODEL_FILENAME = "deepseek-llm-7b-chat.Q4_K_M.gguf" 
+LLM_MODEL_FILENAME = " " 
+
 LLM_MAX_TOKENS = 512
 LLM_TEMPERATURE = 0.3
 LLM_N_CTX = 2048

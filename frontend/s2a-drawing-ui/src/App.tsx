@@ -40,7 +40,7 @@ function App() {
   const [useRealRobot, setUseRealRobot] = useState(false);
 
   // *** NEW: State for pen down depth ***
-  const [penDownZ, setPenDownZ] = useState<number>(-7.0);
+  const [penDownZ, setPenDownZ] = useState<number>(-14.0);
 
   const [qrCodeImage, setQrCodeImage] = useState<string | null>(null);
   const [qrUploadUrl, setQrUploadUrl] = useState<string>('');

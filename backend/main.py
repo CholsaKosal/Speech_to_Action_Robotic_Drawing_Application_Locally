@@ -37,8 +37,8 @@ SIMULATION_PORT = 55000
 FINAL_ROBOT_POSITION = (0, -350, 0) # Use X, Z, Y format (X, Depth, Y) - NOTE: Z is depth here
 A4_WIDTH_MM = 180  # Drawing area width
 A4_HEIGHT_MM = 217 # Drawing area height
-PEN_UP_Z = -15     # Pen up position (depth)
-PEN_DOWN_Z = -7   # Pen down position (depth)
+PEN_UP_Z = -18     # Pen up position (depth)
+PEN_DOWN_Z = -15   # Pen down position (depth)
 MIN_CONTOUR_LENGTH_PX = 50 # Minimum contour length in pixels to consider
 
 # Threshold options
