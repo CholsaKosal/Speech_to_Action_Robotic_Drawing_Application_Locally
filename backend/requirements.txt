@@ -12,8 +12,8 @@ opencv-python
 Pillow
 qrcode[pil]
 numpy
-openai-whisper
-llama-cpp-python
+# openai-whisper
+# llama-cpp-python
 
 # Add other AI/ML libraries later, e.g.:
 # transformers
