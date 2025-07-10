@@ -38,8 +38,7 @@ FINAL_ROBOT_POSITION = (0, -350, 0) # Use X, Z, Y format (X, Depth, Y) - NOTE: Z
 A4_WIDTH_MM = 180  # Drawing area width
 A4_HEIGHT_MM = 217 # Drawing area height
 PEN_DOWN_Z = -14   # Pen down position (depth)
-PEN_UP_Z = 1.3 * (PEN_DOWN_Z)     # Pen up position (depth)
-INITIAL_SINGNITURE_POINT = 1.3 * PEN_UP_Z
+# PEN_UP_Z is now calculated dynamically based on PEN_DOWN_Z
 MIN_CONTOUR_LENGTH_PX = 10 # Minimum contour length in pixels to consider
 
 # Threshold options
@@ -50,18 +49,25 @@ THRESHOLD_OPTIONS = [
 # Time estimation factor
 TIME_ESTIMATE_FACTOR = 0.018 # seconds per command estimated
 
-SIGNATURE_POINTS = ((0, INITIAL_SINGNITURE_POINT, 0), (0, -70, 0))
+# SIGNATURE_POINTS will now be generated dynamically
+def get_signature_points(pen_down_z):
+    """Generates signature points based on the current pen_down_z."""
+    pen_up_z = 1.3 * pen_down_z
+    initial_signature_point = 1.3 * pen_up_z
+    return ((0, initial_signature_point, 0), (0, -70, 0))
 
 
-def create_signature_commands(points):
+def create_signature_commands(points, pen_down_z):
     """Converts raw signature points (X, Z, Y) into robot commands."""
     commands = []
     if not points:
         return commands
 
+    pen_up_z = 1.3 * pen_down_z
+
     # 1. Move to the start of the signature with Pen Up
     start_x, _, start_y = points[0] # Use X, Y from the first point
-    commands.append((start_x, PEN_UP_Z, start_y)) # Ensure pen is up
+    commands.append((start_x, pen_up_z, start_y)) # Ensure pen is up
 
     # 2. Add all signature points as commands (using their specified Z)
     for point in points:
@@ -70,7 +76,7 @@ def create_signature_commands(points):
     # 3. Lift pen after the last point
     if commands:
         last_x, _, last_y = points[-1]
-        commands.append((last_x, PEN_UP_Z, last_y)) # Lift pen at the end
+        commands.append((last_x, pen_up_z, last_y)) # Lift pen at the end
 
     return commands
 
@@ -150,10 +156,16 @@ def scale_point_to_a4(point_xy, image_width, image_height, scale_factor):
     y_mm = y_centered_pixel * scale_factor
     return (x_mm, y_mm)
 
-def create_drawing_paths(contours_xy, image_width, image_height, optimize_paths=True):
-    """ Takes list of contours (pixel coordinates), scales them, creates drawing paths."""
+def create_drawing_paths(contours_xy, image_width, image_height, pen_down_z, optimize_paths=True):
+    """
+    Takes list of contours, scales them, creates drawing paths.
+    :param pen_down_z: The Z coordinate for the pen when drawing.
+    """
     if not contours_xy or image_width <= 0 or image_height <= 0:
         return []
+
+    # *** NEW: Calculate pen_up_z dynamically ***
+    pen_up_z = 1.3 * pen_down_z
 
     scale_x = A4_WIDTH_MM / image_width
     scale_y = A4_HEIGHT_MM / image_height
@@ -217,27 +229,25 @@ def create_drawing_paths(contours_xy, image_width, image_height, optimize_paths=
                    logging.warning("Path optimization loop finished unexpectedly.")
                    break # Avoid infinite loop if something goes wrong
         scaled_contours = ordered_contours # Use the optimized order
-        # logging.info(f"Optimized contour drawing order.") # Reduce noise
     else:
-         # If not optimizing, just use the original order
-         scaled_contours = [c for c in scaled_contours] # Ensure it's a list copy if needed
+         scaled_contours = [c for c in scaled_contours]
 
 
     robot_commands = []
     for contour in scaled_contours:
-        if not contour: continue # Should not happen, but safe check
+        if not contour: continue
         start_point = contour[0]
-        robot_commands.append((start_point[0], PEN_UP_Z, start_point[1])) # Move pen up to start X, Y
-        robot_commands.append((start_point[0], PEN_DOWN_Z, start_point[1])) # Move pen down at start X, Y
+        # *** Use dynamic pen up/down z values ***
+        robot_commands.append((start_point[0], pen_up_z, start_point[1]))
+        robot_commands.append((start_point[0], pen_down_z, start_point[1]))
 
         for i in range(len(contour) - 1):
             end_point = contour[i+1]
-            # Avoid duplicate commands for single-point contours handled earlier
             if end_point != contour[i]:
-                robot_commands.append((end_point[0], PEN_DOWN_Z, end_point[1])) # Draw to next point
+                robot_commands.append((end_point[0], pen_down_z, end_point[1]))
 
         final_point = contour[-1]
-        robot_commands.append((final_point[0], PEN_UP_Z, final_point[1])) # Lift pen at the end of contour
+        robot_commands.append((final_point[0], pen_up_z, final_point[1]))
 
     return robot_commands
 
@@ -256,38 +266,40 @@ class RUNME_GUI:
         self.socket = None
         self.connected = False
         self.connection_established = False
-        # self.positions = [] # Removed, not used for drawing 
 
         # Camera related variables
         self.cap = None
         self.camera_running = False
-        self.camera_frame_label = None # Label to display camera feed 
+        self.camera_frame_label = None
         self.capture_button = None
         self.camera_back_button = None
 
         # Drawing process related
-        self.current_image_path = None # Path to the image being processed
-        self.threshold_options_data = {} # Store commands for each threshold choice
+        self.current_image_path = None
+        self.threshold_options_data = {}
         self.selected_commands = None
         self.drawing_in_progress = False
-        self.cancel_requested = False # *** NEW: Flag for cancellation ***
+        self.cancel_requested = False
         self.progress_bar = None
         self.status_label = None
-        self.cancel_button = None # *** NEW: Reference to cancel button ***
-        self.reconnect_button = None # *** NEW: Reference to reconnect button ***
+        self.cancel_button = None
+        self.reconnect_button = None
+        
+        # *** NEW: Variable for PEN_DOWN_Z input ***
+        self.pen_down_z_var = tk.StringVar(value=str(PEN_DOWN_Z))
 
         self.last_drawing_status = {
             "total_commands": 0,
             "completed_commands": 0,
-            "status": "None",  # e.g., "Completed", "Cancelled", "Connection Lost", "Protocol Error", "Failed to Resume"
+            "status": "None",
             "error_message": ""
         }
         
         # Resume related variables
-        self.resume_needed = False # *** NEW: Flag indicating connection was lost during drawing ***
-        self.resume_commands = None # *** NEW: Store remaining commands ***
-        self.resume_total_original_commands = 0 # *** NEW: Store original total for progress bar ***
-        self.resume_start_index_global = 0 # *** NEW: Store the global index to resume from ***
+        self.resume_needed = False
+        self.resume_commands = None
+        self.resume_total_original_commands = 0
+        self.resume_start_index_global = 0
 
         self.main_page()
 
@@ -298,15 +310,11 @@ class RUNME_GUI:
         tk.Label(self.main_frame, text="Robotics Drawing System", font=("Arial", 16)).pack(pady=10)
         tk.Button(self.main_frame, text="Setup Connection & Draw",
                   command=self.connection_setup_page, width=30).pack(pady=5)
-        # tk.Button(self.main_frame, text="Camera Calibration", # Keep if needed 
-        #           command=self.calibration_page, width=30).pack(pady=5) 
         tk.Button(self.main_frame, text="Exit",
-                  command=self.on_window_close, width=30).pack(pady=5) # Call proper close handler
+                  command=self.on_window_close, width=30).pack(pady=5)
 
     def connection_setup_page(self):
         """Page for setting up robot connection."""
-        # Simplified - remove radio buttons if only one target is needed often
-        # Or keep as is 
         self.clear_frame()
         tk.Label(self.main_frame, text="Robot Connection Setup", font=("Arial", 16)).pack(pady=10)
 
@@ -317,9 +325,8 @@ class RUNME_GUI:
         tk.Radiobutton(connection_frame, text=f"Real Robot: {REAL_ROBOT_HOST}:{REAL_ROBOT_PORT}",
                        variable=self.connection_var, value="real").pack(anchor='w')
 
-        # *** NEW: Conditionally show Connect or Reconnect & Resume button ***
         self.connect_button = tk.Button(self.main_frame, text="Connect", command=self.establish_connection, width=20)
-        self.reconnect_button = tk.Button(self.main_frame, text="Reconnect & Resume", command=self.establish_connection, width=20) # Same command
+        self.reconnect_button = tk.Button(self.main_frame, text="Reconnect & Resume", command=self.establish_connection, width=20)
 
         if self.resume_needed:
             self.reconnect_button.pack(pady=5)
@@ -327,7 +334,7 @@ class RUNME_GUI:
         else:
             self.connect_button.pack(pady=5)
 
-        tk.Button(self.main_frame, text="Back", command=self.main_page, width=20).pack(pady=5) # Go back to main page
+        tk.Button(self.main_frame, text="Back", command=self.main_page, width=20).pack(pady=5)
 
     def drawing_options_page(self):
         """Page shown after successful connection."""
@@ -339,7 +346,8 @@ class RUNME_GUI:
         self.clear_frame()
         tk.Label(self.main_frame, text="Robot Drawing Options", font=("Arial", 16)).pack(pady=10)
         conn_type = "Simulation" if self.connection_var.get() == "simulation" else "Real Robot"
-        tk.Label(self.main_frame, text=f"Connected to: {conn_type}", fg="green").pack(pady=5)
+        tk.Label(self.main_frame, text=f"Connected to: {conn_type}", fg="green").pack()
+
         last_status = self.last_drawing_status["status"]
         if last_status not in ["None", "Completed"]:
             status_frame = tk.Frame(self.main_frame, relief=tk.RIDGE, borderwidth=2)
@@ -352,14 +360,80 @@ class RUNME_GUI:
             tk.Label(status_frame, text=status_text).pack(anchor='w', padx=5)
             if self.last_drawing_status["error_message"]:
                 tk.Label(status_frame, text=f"Details: {self.last_drawing_status['error_message']}", wraplength=400).pack(anchor='w', padx=5)
+        
+        # --- NEW: PEN_DOWN_Z modification field and button ---
+        pen_z_frame = tk.Frame(self.main_frame)
+        pen_z_frame.pack(pady=10)
 
+        tk.Label(pen_z_frame, text="PEN_DOWN_Z:").pack(side=tk.LEFT, padx=5)
+        pen_z_entry = tk.Entry(pen_z_frame, textvariable=self.pen_down_z_var, width=10)
+        pen_z_entry.pack(side=tk.LEFT)
+        
+        # Add a new button to send the robot to this specific Z
+        self.send_z_button = tk.Button(pen_z_frame, text="Send to (0, PEN_DOWN_Z, 0)", command=self.send_to_pen_down_action)
+        self.send_z_button.pack(side=tk.LEFT, padx=10)
+        # --- End of NEW section ---
 
         tk.Button(self.main_frame, text="Capture Image to Draw",
-                  command=self.capture_image_page, width=30).pack(pady=5) # Changed command
+                  command=self.capture_image_page, width=30).pack(pady=5)
         tk.Button(self.main_frame, text="Input Image to Draw",
-                  command=self.input_image_page, width=30).pack(pady=5) # Changed command
+                  command=self.input_image_page, width=30).pack(pady=5)
         tk.Button(self.main_frame, text="Disconnect",
                   command=self.close_and_return_main, width=30).pack(pady=5)
+
+    # --- NEW: Action for the "Send to PEN_DOWN_Z" button ---
+    def send_to_pen_down_action(self):
+        """Reads PEN_DOWN_Z from the entry and sends the robot to (0, Z, 0)."""
+        try:
+            pen_z = float(self.pen_down_z_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "PEN_DOWN_Z must be a valid number.")
+            return
+
+        # Disable button to prevent multiple clicks
+        self.send_z_button.config(state=tk.DISABLED)
+
+        # Run the robot command in a background thread to not freeze the GUI
+        threading.Thread(target=self._send_single_command_thread, args=(0.0, pen_z, 0.0), daemon=True).start()
+
+    def _send_single_command_thread(self, x, z, y):
+        """Thread worker to send one command and wait for response."""
+        command_str = f"{x:.3f},{z:.3f},{y:.3f}"
+        logging.info(f"Sending single command: {command_str}")
+        success = False
+        error_msg = ""
+
+        if self.send_message_internal(command_str):
+            response_r = self.receive_message_internal(timeout=20.0)
+            if response_r == "R":
+                response_d = self.receive_message_internal(timeout=30.0)
+                if response_d == "D":
+                    success = True
+                    logging.info("Single command successful.")
+                else:
+                    error_msg = f"Robot did not confirm completion (D), got '{response_d}'"
+            else:
+                error_msg = f"Robot did not confirm receipt (R), got '{response_r}'"
+        else:
+            error_msg = "Failed to send command. Connection may be lost."
+        
+        if error_msg:
+            logging.error(error_msg)
+
+        # Safely update GUI from the main thread
+        self.window.after(0, self._on_single_command_done, success, error_msg)
+
+    def _on_single_command_done(self, success, error_msg):
+        """Callback to re-enable button and show result message."""
+        if success:
+            messagebox.showinfo("Success", "Robot has moved to the specified position.")
+        else:
+            messagebox.showerror("Command Failed", f"Could not move robot.\nDetails: {error_msg}")
+        
+        # Re-enable the button if it still exists
+        if self.send_z_button and self.send_z_button.winfo_exists():
+            self.send_z_button.config(state=tk.NORMAL)
+
 
     # --- Capture Image Workflow ---
     def capture_image_page(self):
@@ -378,24 +452,23 @@ class RUNME_GUI:
         self.camera_back_button = tk.Button(button_frame, text="Back", command=self.stop_camera_and_go_back)
         self.camera_back_button.pack(side=tk.LEFT, padx=5)
 
-        # Bind 's' key
         self.window.bind('s', self.capture_action_event)
-        self.window.bind('S', self.capture_action_event) # Also capital S
+        self.window.bind('S', self.capture_action_event)
 
         self.start_camera_feed()
 
     def start_camera_feed(self):
         """Starts displaying the camera feed."""
-        if self.camera_running: return # Already running
+        if self.camera_running: return
 
         try:
-            self.cap = cv2.VideoCapture(0) # Use default camera 
+            self.cap = cv2.VideoCapture(0)
             if not self.cap.isOpened():
                 messagebox.showerror("Camera Error", "Could not open camera.")
                 self.stop_camera_and_go_back()
                 return
             self.camera_running = True
-            self._update_camera_frame() # Start the update loop
+            self._update_camera_frame()
         except Exception as e:
              messagebox.showerror("Camera Error", f"Error initializing camera: {e}")
              self.stop_camera_and_go_back()
@@ -408,43 +481,33 @@ class RUNME_GUI:
 
         ret, frame = self.cap.read()
         if ret:
-            # Convert frame for Tkinter
             cv_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(cv_image)
-            # Resize image to fit nicely (optional)
-            # aspect_ratio = pil_image.width / pil_image.height 
-            # new_height = 300
-            # new_width = int(aspect_ratio * new_height) 
-            # pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS) 
-
             imgtk = ImageTk.PhotoImage(image=pil_image)
 
-            if self.camera_frame_label: # Check if label still exists
+            if self.camera_frame_label:
                 self.camera_frame_label.imgtk = imgtk
                 self.camera_frame_label.configure(image=imgtk)
         else:
             logging.warning("Failed to grab frame from camera.")
-            # Optionally try to reopen or show error after multiple failures
 
-        # Schedule the next update
         if self.camera_running:
-            self.window.after(30, self._update_camera_frame) # Update ~30fps
+            self.window.after(30, self._update_camera_frame)
 
     def stop_camera_feed(self):
          """Stops the camera feed and releases resources."""
-         self.camera_running = False # Signal the loop to stop
-         time.sleep(0.1) # Give the loop a moment to exit
+         self.camera_running = False
+         time.sleep(0.1)
          if self.cap:
               self.cap.release()
               self.cap = None
-         # cv2.destroyAllWindows() # Don't destroy all, might affect other CV windows if used 
 
     def stop_camera_and_go_back(self):
         """Stops camera and returns to drawing options page."""
         self.stop_camera_feed()
-        self.window.unbind('s') # Unbind keys
+        self.window.unbind('s')
         self.window.unbind('S')
-        self.drawing_options_page() # Go back
+        self.drawing_options_page()
 
     def capture_action_event(self, event=None):
          """Wrapper for key press event."""
@@ -457,26 +520,24 @@ class RUNME_GUI:
             return
 
         ret, frame = self.cap.read()
-        self.stop_camera_feed() # Stop feed after capture
-        self.window.unbind('s') # Unbind keys
+        self.stop_camera_feed()
+        self.window.unbind('s')
         self.window.unbind('S')
 
 
         if ret:
             try:
-                # Ensure DATA_DIR exists
                 os.makedirs(DATA_DIR, exist_ok=True)
                 cv2.imwrite(TMP_CAPTURE_PATH, frame)
                 logging.info(f"Image captured and saved to {TMP_CAPTURE_PATH}")
                 self.current_image_path = TMP_CAPTURE_PATH
-                # Proceed to threshold selection
                 self.show_threshold_options(self.current_image_path)
             except Exception as e:
                 messagebox.showerror("Save Error", f"Could not save captured image: {e}")
-                self.drawing_options_page() # Go back on error
+                self.drawing_options_page()
         else:
             messagebox.showerror("Capture Error", "Failed to capture frame from camera.")
-            self.drawing_options_page() # Go back on error
+            self.drawing_options_page()
 
 
     # --- Input Image Workflow ---
@@ -493,12 +554,6 @@ class RUNME_GUI:
         path_entry.pack(side=tk.LEFT, fill='x', expand=True, padx=5)
         tk.Button(entry_frame, text="Browse...", command=self.browse_image_file).pack(side=tk.LEFT)
 
-        # Placeholder for drag-and-drop - requires tkinterdnd2
-        # drop_target = tk.Label(self.main_frame, text="Or Drag and Drop Image Here", relief="ridge", height=5, width=60) 
-        # drop_target.pack(pady=10)
-        # drop_target.drop_target_register(DND_FILES) 
-        # drop_target.dnd_bind('<<Drop>>', self.handle_drop) 
-
         tk.Button(self.main_frame, text="Process Image", command=self.process_input_image, width=20).pack(pady=10)
         tk.Button(self.main_frame, text="Back", command=self.drawing_options_page, width=20).pack(pady=10)
 
@@ -510,15 +565,6 @@ class RUNME_GUI:
         )
         if filepath:
             self.image_path_var.set(filepath)
-
-    # def handle_drop(self, event): # Requires tkinterdnd2 
-    #     """Handles file drop event.""" 
-    #     filepath = event.data.strip('{}') # Clean up path if needed 
-    #     if os.path.isfile(filepath):
-    #          self.image_path_var.set(filepath) 
-    #     else: 
-    #          messagebox.showwarning("Drop Error", f"Invalid file dropped: {filepath}") 
-
 
     def process_input_image(self):
         """Validates path and proceeds to threshold selection."""
@@ -536,39 +582,46 @@ class RUNME_GUI:
         self.clear_frame()
         tk.Label(self.main_frame, text="Select Drawing Style (Thresholds)", font=("Arial", 16)).pack(pady=10)
 
-        self.threshold_options_data = {} # Clear previous results
-        self.selected_threshold_option = tk.StringVar(value=None) # Variable for Radiobuttons
-        self.preview_label = tk.Label(self.main_frame) # For showing edge previews
+        self.threshold_options_data = {}
+        self.selected_threshold_option = tk.StringVar(value=None)
+        self.preview_label = tk.Label(self.main_frame)
         self.preview_label.pack(pady=5)
 
         options_frame = tk.Frame(self.main_frame)
         options_frame.pack(pady=5)
 
-        # Process each option in background to avoid freezing GUI
         loading_label = tk.Label(options_frame, text="Processing options...")
         loading_label.pack()
-        self.window.update() # Show loading message 
+        self.window.update()
 
         threading.Thread(target=self._process_threshold_options_thread, args=(image_path, options_frame, loading_label), daemon=True).start()
 
 
     def _process_threshold_options_thread(self, image_path, options_frame, loading_label):
         """Background thread to generate commands for each threshold option."""
+        # *** NEW: Get the current PEN_DOWN_Z value from the GUI var ***
+        try:
+            current_pen_down_z = float(self.pen_down_z_var.get())
+        except (ValueError, tk.TclError): # Handle invalid input or GUI closure
+            logging.warning(f"Invalid PEN_DOWN_Z value. Using default: {PEN_DOWN_Z}")
+            current_pen_down_z = PEN_DOWN_Z
+
         results = {}
-        preview_paths = {} # Store paths to preview images
+        preview_paths = {}
 
         for i, (label, t1, t2) in enumerate(THRESHOLD_OPTIONS):
             logging.info(f"Processing option: {label} (t1={t1}, t2={t2})")
-            preview_path = TMP_EDGE_OUTPUT_PATH.format(i) # Unique path for preview
+            preview_path = TMP_EDGE_OUTPUT_PATH.format(i)
             contours_xy, w, h = image_to_contours_internal(image_path, t1, t2, save_edge_path=preview_path)
 
             if contours_xy is None or w == 0 or h == 0:
                  logging.warning(f"Failed to process contours for option {label}")
-                 results[label] = None # Indicate failure 
+                 results[label] = None
                  preview_paths[label] = None
                  continue
 
-            commands = create_drawing_paths(contours_xy, w, h, optimize_paths=True)
+            # *** Pass the current_pen_down_z to the command creation function ***
+            commands = create_drawing_paths(contours_xy, w, h, current_pen_down_z, optimize_paths=True)
             if commands:
                 num_commands = len(commands)
                 est_time_sec = num_commands * TIME_ESTIMATE_FACTOR
@@ -578,24 +631,25 @@ class RUNME_GUI:
                     "count": num_commands,
                     "time_str": f"{est_time_min:.1f} min",
                     "t1": t1,
-                    "t2": t2
+                    "t2": t2,
+                    # Store the z value used for these commands
+                    "pen_down_z": current_pen_down_z 
                 }
                 preview_paths[label] = preview_path if os.path.exists(preview_path) else None
             else:
-                 results[label] = None # No commands generated
+                 results[label] = None
                  preview_paths[label] = None
                  logging.warning(f"No commands generated for option {label}")
 
-        # Update GUI from the main thread
         self.window.after(0, lambda: self._display_threshold_options(options_frame, loading_label, results, preview_paths))
 
 
     def _display_threshold_options(self, options_frame, loading_label, results, preview_paths):
          """Updates the GUI with the processed threshold options."""
-         loading_label.destroy() # Remove loading message
+         loading_label.destroy()
 
-         self.threshold_options_data = results # Store results
-         self.edge_preview_paths = preview_paths # Store preview paths
+         self.threshold_options_data = results
+         self.edge_preview_paths = preview_paths
 
          default_selected = False
          for i, (label, t1, t2) in enumerate(THRESHOLD_OPTIONS):
@@ -609,23 +663,19 @@ class RUNME_GUI:
                  text=radio_text,
                  variable=self.selected_threshold_option,
                  value=label,
-                 command=lambda l=label: self.show_edge_preview(l) # Show preview on select
+                 command=lambda l=label: self.show_edge_preview(l)
                  )
                  rb.pack(anchor='w')
-                 # Select the first valid option by default
                  if not default_selected:
                       self.selected_threshold_option.set(label)
-                      self.show_edge_preview(label) # Show its preview
+                      self.show_edge_preview(label)
                       default_selected = True
              else:
-                 # Option failed or produced no commands
                  tk.Label(options_frame, text=f"{label} (t1={t1}, t2={t2}) - No drawing generated", fg="gray").pack(anchor='w')
 
-         # Add Confirm and Back buttons below the options
          button_frame = tk.Frame(self.main_frame)
          button_frame.pack(pady=10)
          tk.Button(button_frame, text="Confirm and Draw", command=self.confirm_and_start_drawing, width=20).pack(side=tk.LEFT, padx=5)
-         # Back button should go back to the drawing options page (Capture/Input)
          tk.Button(button_frame, text="Back", command=self.drawing_options_page, width=20).pack(side=tk.LEFT, padx=5)
 
     def show_edge_preview(self, option_label):
@@ -634,16 +684,15 @@ class RUNME_GUI:
          if preview_path and os.path.exists(preview_path):
               try:
                    img = Image.open(preview_path)
-                   # Resize for display
-                   img.thumbnail((300, 300)) # Max width/height 300px
+                   img.thumbnail((300, 300))
                    imgtk = ImageTk.PhotoImage(image=img)
                    self.preview_label.imgtk = imgtk
                    self.preview_label.configure(image=imgtk)
               except Exception as e:
                    logging.error(f"Error loading preview image {preview_path}: {e}")
-                   self.preview_label.configure(image=None, text="Preview error") # Clear preview
+                   self.preview_label.configure(image=None, text="Preview error")
          else:
-              self.preview_label.configure(image=None, text="No Preview") # Clear preview
+              self.preview_label.configure(image=None, text="No Preview")
 
 
     def confirm_and_start_drawing(self):
@@ -659,16 +708,18 @@ class RUNME_GUI:
              return
 
         self.selected_commands = option_data["commands"]
+        # *** Get the pen_down_z that was used to generate these commands ***
+        pen_down_z_for_drawing = option_data["pen_down_z"]
 
-        # Start drawing in a background thread
         if not self.drawing_in_progress:
              self.drawing_in_progress = True
-             self.cancel_requested = False # Ensure cancel flag is reset
-             self.resume_needed = False # Reset resume flag
-             # *** Pass the full command list including signature ***
-             full_command_list = self.selected_commands + create_signature_commands(SIGNATURE_POINTS)
+             self.cancel_requested = False
+             self.resume_needed = False
+             # *** Generate signature commands using the correct pen_down_z ***
+             signature_cmds = create_signature_commands(get_signature_points(pen_down_z_for_drawing), pen_down_z_for_drawing)
+             full_command_list = self.selected_commands + signature_cmds
              threading.Thread(target=self.run_drawing_loop, args=(full_command_list,), daemon=True).start()
-             self.show_drawing_progress_page(len(full_command_list)) # Show progress UI with total commands
+             self.show_drawing_progress_page(len(full_command_list))
         else:
             messagebox.showwarning("Busy", "Drawing already in progress.")
 
@@ -685,7 +736,6 @@ class RUNME_GUI:
          self.progress_bar = ttk.Progressbar(self.main_frame, orient="horizontal", length=300, mode="determinate", maximum=total_commands, value=current_progress)
          self.progress_bar.pack(pady=10)
 
-         # *** NEW: Add Cancel Button ***
          self.cancel_button = tk.Button(self.main_frame, text="Cancel Drawing", command=self.request_cancel_drawing)
          self.cancel_button.pack(pady=5)
 
@@ -699,7 +749,6 @@ class RUNME_GUI:
             if message:
                  status_text += f" ({message})"
             self.status_label.config(text=status_text)
-            # self.window.update_idletasks() # Force update if needed, but 'after' usually handles it 
 
     def request_cancel_drawing(self):
         """Sets the cancellation flag when the Cancel button is pressed."""
@@ -715,63 +764,57 @@ class RUNME_GUI:
         """Sends the robot to the final position and cleans up state. Runs in drawing thread."""
         logging.info("Attempting to move robot to final position.")
         final_x, final_z, final_y = FINAL_ROBOT_POSITION
-        command_str_final = f"{final_x:.3f},{final_z:.3f},{final_y:.3f}" # Format final command 
+        command_str_final = f"{final_x:.3f},{final_z:.3f},{final_y:.3f}"
 
         move_ok = False
         if self.connected and self.socket:
             if self.send_message_internal(command_str_final):
                 response_r_final = self.receive_message_internal(timeout=20.0)
                 if response_r_final == "R":
-                    response_d_final = self.receive_message_internal(timeout=30.0) # Longer timeout for final move
+                    response_d_final = self.receive_message_internal(timeout=30.0)
                     if response_d_final == "D":
-                        logging.info("Robot reached final position.") #
+                        logging.info("Robot reached final position.")
                         move_ok = True
                     else:
-                        logging.error(f"Robot didn't confirm final move completion (D), got '{response_d_final}'") #
+                        logging.error(f"Robot didn't confirm final move completion (D), got '{response_d_final}'")
                 else:
-                    logging.error(f"Robot didn't confirm final move receipt (R), got '{response_r_final}'") #
+                    logging.error(f"Robot didn't confirm final move receipt (R), got '{response_r_final}'")
             else:
-                logging.error("Failed to send final position command.") #
+                logging.error("Failed to send final position command.")
 
-        # Update GUI status based on move success/failure and original reason
         final_status = ""
         if move_ok:
             final_status = f"{success_message} Robot at final position."
         else:
             final_status = f"{failure_message} Failed to reach final position."
 
-        self.last_drawing_status["status"] = success_message # Use the original reason (Completed, Cancelled, etc.)
+        self.last_drawing_status["status"] = success_message
         self.last_drawing_status["error_message"] = "" if move_ok else "Failed to reach final position."
 
         self.window.after(0, lambda fs=final_status: self.update_final_status(fs))
 
-        # --- Final Cleanup ---
         self.drawing_in_progress = False
         self.selected_commands = None
         self.cancel_requested = False
-        # Reset resume state ONLY if the process finished (successfully or cancelled), not on disconnect
-        if not self.resume_needed: # Don't clear resume state if we dropped connection
+        if not self.resume_needed:
             self.resume_commands = None
             self.resume_total_original_commands = 0
             self.resume_start_index_global = 0
 
-        # Go back to the drawing options page after a short delay
-        self.window.after(2000, self.drawing_options_page) # Wait 2s before going back 
+        self.window.after(2000, self.drawing_options_page)
 
     def update_final_status(self, message):
         """Updates the status label safely from the main thread."""
         if self.status_label and self.status_label.winfo_exists():
             self.status_label.config(text=message)
         if self.cancel_button and self.cancel_button.winfo_exists():
-            self.cancel_button.pack_forget() # Remove cancel button
+            self.cancel_button.pack_forget()
 
     def run_drawing_loop(self, commands_to_send: List[Tuple], start_index=0):
         """Sends drawing commands sequentially (RUNS IN THREAD). Handles cancel and resume."""
-        total_commands = len(commands_to_send) + start_index # Total original commands for progress bar max
-        current_command_global_index = start_index # Start from the correct global index
-        commands_processed_in_this_run = 0
+        total_commands = len(commands_to_send) + start_index if start_index > 0 else len(commands_to_send)
+        current_command_global_index = start_index
 
-        # If resuming, ensure progress page reflects original total and current progress
         if start_index > 0:
             self.window.after(0, lambda: self.show_drawing_progress_page(total_commands, current_command_global_index, "Resuming drawing..."))
             self.window.after(0, lambda: self.update_drawing_status(current_command_global_index, total_commands, "Resuming..."))
@@ -779,131 +822,101 @@ class RUNME_GUI:
             self.window.after(0, lambda: self.update_drawing_status(0, total_commands, "Starting..."))
 
         try:
-            # Iterate through the commands *starting from the correct index*
             for i, (x, z, y) in enumerate(commands_to_send[start_index:], start=start_index):
-                current_command_global_index = i + 1 # Overall progress index (1-based)
+                current_command_global_index = i + 1
 
-                # *** NEW: Check for cancellation before sending ***
                 if self.cancel_requested:
                     logging.info(f"Cancellation detected at command {current_command_global_index}.")
                     self.window.after(0, lambda idx=i: self.update_drawing_status(idx, total_commands, "Cancelling..."))
                     self._send_final_position_and_cleanup("Drawing Cancelled.", "Drawing Cancelled.")
-                    return # Exit the thread
+                    return
 
-                # Format command
-                command_str = f"{x:.2f},{z},{y:.2f}" # Format for robot 
+                command_str = f"{x:.2f},{z},{y:.2f}"
                 logging.debug(f"Sending command {current_command_global_index}/{total_commands}: {command_str}")
 
-                # --- Robot Communication Protocol ---
-                # 1. Send Command
-                if not self.send_message_internal(command_str): # If send fails...
-                    # *** NEW: Handle connection loss ***
+                if not self.send_message_internal(command_str):
                     logging.error(f"Connection lost while sending command {current_command_global_index}. Preparing to resume.")
                     self.resume_needed = True
-                    # Save state relative to the *original full list*
-                    self.resume_commands = commands_to_send # Keep the full list
-                    self.resume_start_index_global = i # Save the index of the command that failed (0-based)
+                    self.resume_commands = commands_to_send
+                    self.resume_start_index_global = i
                     self.resume_total_original_commands = total_commands
-                    
                     self.last_drawing_status["total_commands"] = total_commands
-                    self.last_drawing_status["completed_commands"] = i # Command i failed
+                    self.last_drawing_status["completed_commands"] = i
                     self.last_drawing_status["status"] = "Connection Lost"
                     self.last_drawing_status["error_message"] = f"Lost connection before sending command {i+1}"
-                    
                     self.window.after(0, lambda idx=i: self.update_drawing_status(idx, total_commands, "Connection Lost!"))
-                    self.window.after(1000, self.connection_setup_page) # Go to connection page to allow reconnect
-                    self.drawing_in_progress = False # Allow reconnect button to work
-                    return # Exit thread
+                    self.window.after(1000, self.connection_setup_page)
+                    self.drawing_in_progress = False
+                    return
 
-                # 2. Wait for Receipt 'R'
-                response_r = self.receive_message_internal(timeout=20.0) # If receive fails...
-                if response_r is None: # Check for None indicating socket error/timeout
-                    # *** NEW: Handle connection loss ***
+                response_r = self.receive_message_internal(timeout=20.0)
+                if response_r is None:
                     logging.error(f"Connection lost while waiting for 'R' after command {current_command_global_index}. Preparing to resume.")
                     self.resume_needed = True
                     self.resume_commands = commands_to_send
-                    self.resume_start_index_global = i # Resume from the command that wasn't fully confirmed
+                    self.resume_start_index_global = i
                     self.resume_total_original_commands = total_commands
                     self.window.after(0, lambda idx=i: self.update_drawing_status(idx, total_commands, "Connection Lost! (No 'R')"))
                     self.window.after(1000, self.connection_setup_page)
                     self.drawing_in_progress = False
-                    return # Exit thread
+                    return
                 elif response_r != "R":
                     error_msg = f"Robot did not confirm receipt (R) for command {current_command_global_index}, got '{response_r}'."
-                    logging.error(error_msg + " Preparing to resume.") # Changed log message
-                    # *** NEW: Prepare for resume on 'R' error ***
+                    logging.error(error_msg + " Preparing to resume.")
                     self.resume_needed = True
                     self.resume_commands = commands_to_send
-                    self.resume_start_index_global = i # Resume from the command that failed confirmation
+                    self.resume_start_index_global = i
                     self.resume_total_original_commands = total_commands
-                    # Update last status
                     self.last_drawing_status["total_commands"] = total_commands
                     self.last_drawing_status["completed_commands"] = i
                     self.last_drawing_status["status"] = "Protocol Error (R)"
                     self.last_drawing_status["error_message"] = error_msg
-                    # *** End NEW ***
                     self.window.after(0, lambda idx=i, r=response_r: self.update_drawing_status(idx, total_commands, f"Error: No 'R' (Got {r}). Reconnect to resume."))
-                    # *** NEW: Go to connection page instead of cleanup ***
                     self.window.after(1000, self.connection_setup_page)
                     self.drawing_in_progress = False
-                    return # Exit thread
+                    return
 
-                # 3. Wait for Done 'D'
-                response_d = self.receive_message_internal(timeout=30.0) # Longer timeout for move completion 
-                if response_d is None: # Check for None indicating socket error/timeout
-                    # *** NEW: Handle connection loss ***
+                response_d = self.receive_message_internal(timeout=30.0)
+                if response_d is None:
                     logging.error(f"Connection lost while waiting for 'D' after command {current_command_global_index}. Preparing to resume.")
                     self.resume_needed = True
                     self.resume_commands = commands_to_send
-                    # Resume from the *next* command since this one completed movement but confirmation failed
                     self.resume_start_index_global = i + 1
                     self.resume_total_original_commands = total_commands
-                    self.window.after(0, lambda idx=i: self.update_drawing_status(idx + 1, total_commands, "Connection Lost! (No 'D')")) # Show progress for completed command
+                    self.window.after(0, lambda idx=i: self.update_drawing_status(idx + 1, total_commands, "Connection Lost! (No 'D')"))
                     self.window.after(1000, self.connection_setup_page)
                     self.drawing_in_progress = False
-                    return # Exit thread
+                    return
                 elif response_d != "D":
                     error_msg = f"Robot did not confirm completion (D) for command {current_command_global_index}, got '{response_d}'."
-                    logging.error(error_msg + " Preparing to resume.") # Changed log message
-                    # *** NEW: Prepare for resume on 'D' error ***
+                    logging.error(error_msg + " Preparing to resume.")
                     self.resume_needed = True
                     self.resume_commands = commands_to_send
-                    # Resume from the *next* command since 'R' was received, but 'D' failed
                     self.resume_start_index_global = i + 1
                     self.resume_total_original_commands = total_commands
-                    # Update last status
                     self.last_drawing_status["total_commands"] = total_commands
-                    self.last_drawing_status["completed_commands"] = i + 1 # Command i movement likely completed
+                    self.last_drawing_status["completed_commands"] = i + 1
                     self.last_drawing_status["status"] = "Protocol Error (D)"
                     self.last_drawing_status["error_message"] = error_msg
-                    # *** End NEW ***
                     self.window.after(0, lambda idx=i, d=response_d: self.update_drawing_status(idx + 1, total_commands, f"Error: No 'D' (Got {d}). Reconnect to resume."))
-                    # *** NEW: Go to connection page instead of cleanup ***
                     self.window.after(1000, self.connection_setup_page)
                     self.drawing_in_progress = False
-                    return # Exit thread
+                    return
 
-                commands_processed_in_this_run += 1
-                # Update GUI progress
-                self.window.after(0, lambda idx=current_command_global_index: self.update_drawing_status(idx, total_commands)) # 
+                self.window.after(0, lambda idx=current_command_global_index: self.update_drawing_status(idx, total_commands))
 
-            # If the loop completes without cancellation or error
             logging.info("All drawing commands sent successfully.")
             self.window.after(0, lambda: self.update_drawing_status(total_commands, total_commands, "Drawing Complete."))
             self._send_final_position_and_cleanup("Drawing Complete.", "Drawing Complete.")
 
         except Exception as e:
-            logging.error(f"Unexpected error during drawing process: {e}", exc_info=True) # 
-            # Attempt to update status, but might fail if GUI is gone
+            logging.error(f"Unexpected error during drawing process: {e}", exc_info=True)
             try:
-                self.window.after(0, lambda idx=current_command_global_index: self.update_drawing_status(idx, total_commands, f"Runtime Error: {e}")) # 
+                self.window.after(0, lambda idx=current_command_global_index: self.update_drawing_status(idx, total_commands, f"Runtime Error: {e}"))
             except tk.TclError:
                 logging.error("GUI already closed during error handling.")
-            # Don't try to move robot here, connection state unknown
             self.drawing_in_progress = False
             self.cancel_requested = False
-            # Keep resume state in case it was a connection error leading to this exception
-            # self.window.after(2000, self.drawing_options_page) # Don't automatically go back on unexpected error
 
 
     # --- Internal Socket Methods (without GUI popups) ---
@@ -914,9 +927,9 @@ class RUNME_GUI:
             self.socket.sendall(message.encode('utf-8'))
             logging.debug(f"Sent (internal): {message}")
             return True
-        except (socket.error, ConnectionResetError, BrokenPipeError, socket.timeout) as e: # Added BrokenPipeError
+        except (socket.error, ConnectionResetError, BrokenPipeError, socket.timeout) as e:
             logging.error(f"Send error (internal): {e}")
-            self.handle_connection_loss() # Use centralized handler
+            self.handle_connection_loss()
             return False
 
     def receive_message_internal(self, timeout=20.0) -> Optional[str]:
@@ -925,8 +938,8 @@ class RUNME_GUI:
          try:
              self.socket.settimeout(timeout)
              data = self.socket.recv(1024)
-             self.socket.settimeout(None) # Reset timeout
-             if not data: # Socket closed gracefully by peer
+             self.socket.settimeout(None)
+             if not data:
                  logging.warning("Receive error (internal): Connection closed by peer.")
                  self.handle_connection_loss()
                  return None
@@ -935,30 +948,19 @@ class RUNME_GUI:
              return decoded_data
          except socket.timeout:
              logging.error(f"Timeout receiving message (internal)")
-             # Don't necessarily close socket on timeout, maybe robot is just slow
-             # Consider if timeout should also trigger resume logic if it happens during drawing
-             # For now, returning None might lead to connection loss handling higher up if expected msg isn't received.
-             return None # Indicate timeout specifically? For now, None leads to resume check.
-         except (socket.error, ConnectionResetError, BrokenPipeError) as e: # Added BrokenPipeError
+             return None
+         except (socket.error, ConnectionResetError, BrokenPipeError) as e:
              logging.error(f"Receive error (internal): {e}")
-             self.handle_connection_loss() # Use centralized handler
+             self.handle_connection_loss()
              return None
 
     def handle_connection_loss(self):
         """Centralized handling of connection loss detection."""
         logging.warning("Connection lost detected.")
         was_connected = self.connected
-        self.close_socket() # Close the broken socket and update flags
-        # *** If connection lost DURING drawing, set resume flag ***
-        # The resume flag is set higher up in the run_drawing_loop when errors occur
-        # Here, we just ensure the socket is closed.
-        # If we weren't drawing, we don't need to set resume_needed.
-        # We might need to inform the user if they were connected but not drawing.
+        self.close_socket()
         if was_connected and not self.drawing_in_progress and not self.resume_needed:
-             # Use 'after' to schedule GUI updates from the main thread
             self.window.after(0, lambda: messagebox.showinfo("Connection Lost", "Robot connection lost."))
-            # Potentially navigate back to connection page if not already there
-            # Check current page? For simplicity, assume user might need to reconnect manually.
 
 
     # --- Connection Handling ---
@@ -971,27 +973,24 @@ class RUNME_GUI:
 
         def connection_attempt():
             try:
-                self.close_socket() # Ensure clean start
+                self.close_socket()
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.socket.settimeout(5)
                 self.socket.connect((host, port))
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                self.socket.settimeout(None) # Default to blocking for operations
+                self.socket.settimeout(None)
                 logging.info(f"Connected to {host}:{port}")
                 self.connected = True
-                # *** Call handle_connection_result via 'after' ***
                 self.window.after(0, lambda: self.handle_connection_result(True))
             except (socket.error, socket.timeout, ConnectionRefusedError) as e:
                 logging.error(f"Connection error: {e}")
-                self.connected = False # Ensure flag is false before calling handler
-                self.close_socket() # Clean up socket if connection failed
-                # *** Call handle_connection_result via 'after' ***
+                self.connected = False
+                self.close_socket()
                 self.window.after(0, lambda: self.handle_connection_result(False))
         threading.Thread(target=connection_attempt, daemon=True).start()
 
     def handle_connection_result(self, connected):
         """Handle connection result and trigger resume if needed."""
-        # Re-enable buttons safely
         if hasattr(self, 'connect_button') and self.connect_button.winfo_exists():
             self.connect_button.config(state=tk.NORMAL)
         if hasattr(self, 'reconnect_button') and self.reconnect_button.winfo_exists():
@@ -999,30 +998,24 @@ class RUNME_GUI:
 
         if connected:
             self.connection_established = True
-            # *** NEW: Check if resume is needed ***
             if self.resume_needed and self.resume_commands is not None:
                 logging.info("Reconnection successful. Preparing to resume drawing.")
-                # Move to final position BEFORE resuming
-                self.move_to_final_before_resume() # This will start resume loop after move
+                self.move_to_final_before_resume()
             else:
-                # Normal connection, go to drawing options
-                self.drawing_options_page() # Go to drawing options
+                self.drawing_options_page()
         else:
             if self.resume_needed:
                 messagebox.showerror("Reconnection Failed", "Failed to reconnect. Cannot resume the previous drawing.")
-                # Reset resume state as we can't continue
                 self.resume_needed = False
                 self.resume_commands = None
                 self.resume_total_original_commands = 0
                 self.resume_start_index_global = 0
-                # Update last status to reflect the failed resume attempt
                 self.last_drawing_status["status"] = "Resume Failed"
                 self.last_drawing_status["error_message"] = "Could not reconnect to robot."
-                # Go back to drawing options page after acknowledging the error
                 self.drawing_options_page()
             else:
                 messagebox.showerror("Connection Failed", "Failed to establish connection.")
-            # Stay on connection page if it was a normal connection attempt that failed
+                
     def move_to_final_before_resume(self):
         """Sends robot to FINAL_ROBOT_POSITION and then starts resume. Runs in thread."""
         def move_and_resume_thread():
@@ -1045,31 +1038,19 @@ class RUNME_GUI:
                 else: logging.error("Failed to send pre-resume move command.")
 
             if move_ok:
-                 # *** Start the drawing loop from the resume point ***
                  logging.info(f"Starting resume from command index {self.resume_start_index_global}")
-                 self.drawing_in_progress = True # Set flag before starting thread
-                 self.cancel_requested = False # Ensure cancel flag is reset
-                 # We don't reset resume_needed here, it's reset on completion/cancel
-                 # Use the stored remaining commands and start index
-                 # NOTE: run_drawing_loop expects the FULL command list and the start_index
+                 self.drawing_in_progress = True
+                 self.cancel_requested = False
                  self.run_drawing_loop(self.resume_commands, self.resume_start_index_global)
-                 # The run_drawing_loop itself now handles progress updates etc.
-            else: # if move_ok is False
+            else:
                 error_msg = "Failed to move robot to safe resume position."
                 logging.error(error_msg + " Cannot resume automatically, but allowing retry.")
-                # *** NEW: Update status but keep resume state ***
                 self.last_drawing_status["status"] = "Resume Failed (Pre-move)"
                 self.last_drawing_status["error_message"] = error_msg
-                # Keep previous command counts if available
-                # Ensure resume_needed remains True, DO NOT reset resume variables here
-                # *** End NEW ***
                 self.window.after(0, lambda: messagebox.showwarning("Resume Warning", error_msg + "\nConnection might be unstable. You can try 'Reconnect & Resume' again."))
-                # Reset drawing flag
                 self.drawing_in_progress = False
-                # *** NEW: Go back to connection page to allow retry ***
                 self.window.after(1000, self.connection_setup_page)
 
-        # Start the move and potential resume in a new thread
         threading.Thread(target=move_and_resume_thread, daemon=True).start()
 
 
@@ -1078,24 +1059,18 @@ class RUNME_GUI:
         if self.socket:
             try:
                 self.socket.shutdown(socket.SHUT_RDWR)
-            except (socket.error, OSError): pass # Ignore errors if already closed
+            except (socket.error, OSError): pass
             finally:
                 try: self.socket.close()
                 except (socket.error, OSError): pass
                 self.socket = None
                 logging.info("Socket closed")
-        # Always update flags when this is called
         self.connected = False
         self.connection_established = False
-        # Do NOT reset drawing_in_progress or resume flags here,
-        # they are managed by the drawing loop and connection loss handler
 
     def close_and_return_main(self):
          """Close connection and go to main page."""
-         # If drawing was in progress, should we cancel it first?
-         # For simplicity now, just close the socket. Active drawing will fail.
          self.close_socket()
-         # Reset any pending resume state if user explicitly disconnects
          self.resume_needed = False
          self.resume_commands = None
          self.resume_total_original_commands = 0
@@ -1105,13 +1080,10 @@ class RUNME_GUI:
     # --- Utility Methods ---
     def clear_frame(self):
         """Clear all widgets from the main frame."""
-        # Stop camera if running when clearing frame
         if self.camera_running:
             self.stop_camera_feed()
-        # Destroy widgets
         for widget in self.main_frame.winfo_children():
             widget.destroy()
-        # Reset references to GUI elements that are destroyed
         self.camera_frame_label = None
         self.capture_button = None
         self.camera_back_button = None
@@ -1126,7 +1098,6 @@ class RUNME_GUI:
     @staticmethod
     def run_script(script_path: str) -> bool:
         """Run a Python script (kept for calibration)."""
-        # (Implementation remains the same) 
         if not os.path.exists(script_path):
              logging.error(f"Script not found: {script_path}")
              return False
@@ -1142,17 +1113,15 @@ class RUNME_GUI:
     def on_window_close(self):
         """Handle window close event."""
         logging.info("Window close requested.")
-        self.cancel_requested = True # Signal drawing thread to stop if running
-        self.stop_camera_feed() # Ensure camera stops
-        self.close_socket()     # Ensure socket closes
-        # Give threads a moment to potentially react to cancel_requested or socket closure
+        self.cancel_requested = True
+        self.stop_camera_feed()
+        self.close_socket()
         time.sleep(0.2)
         self.window.destroy()
 
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    # Create DATA_DIR if it doesn't exist 
     os.makedirs(DATA_DIR, exist_ok=True)
 
     app = RUNME_GUI()
